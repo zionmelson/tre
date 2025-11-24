@@ -1,0 +1,8 @@
+{
+  "address": "corecast.bitquery.io",
+  "authorization": "ory_at_qIIU-Aztys6PVE02iK28x34o1TClSKfMGlW-Cj8pPog.miGOHTaT58yxqEBMzPO-Wq-OTw7RdoTc2CT_OpZiwbE",
+  "cache": {
+    "warm_capacity": 32,
+    "channel_capacity": 512
+  }
+}
