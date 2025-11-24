@@ -6,6 +6,7 @@ mod corecast;
 mod idl;
 mod notifier;
 mod proto;
+mod protocol;
 mod runtime;
 mod stages;
 mod strategy;

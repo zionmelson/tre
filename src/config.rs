@@ -36,9 +36,18 @@ pub struct FlashLoanConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CorecastConfig {
+    pub endpoint: String,
+    pub api_key: String,
+    #[serde(default)]
+    pub program_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub wallets: WalletsConfig,
     pub jito: JitoConfig,
+    pub corecast: CorecastConfig,
     pub tokens: HashMap<String, String>,
     pub flash_loan: FlashLoanConfig,
     #[serde(default)]

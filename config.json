@@ -22,6 +22,17 @@
     "tip_floor_url": "https://bundles.jito.wtf/api/v1/bundles/tip_floor",
     "tip_stream_url": "wss://bundles.jito.wtf/api/v1/bundles/tip_stream"
   },
+  "corecast": {
+    "endpoint": "corecast.bitquery.io",
+    "api_key": "ory_at_nrMfwmMqHc5ziCwxzDdJZ4BFVoP3MWeH577-bgFtdAs.cIca8pi5ewUhSFfc3YuXUtlubFTUEyxiVNKfPm9D5dw",
+    "program_addresses": [
+      "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+      "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+      "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+      "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
+      "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+    ]
+  },
   "tokens": {
     "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",

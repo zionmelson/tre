@@ -21,11 +21,12 @@ tokio-stream = "0.1"
 tonic = { version = "0.11", default-features = false, features = ["transport", "gzip", "codegen", "prost"] }
 prost = "0.12"
 prost-types = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "blocking"] }
 tokio-native-tls = "0.3"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["native-tls"] }
 solana-sdk = { version = "1.18", features = ["program"] }
 bs58 = "0.5"
+base64 = "0.22"
 url = "2"
 tower = { version = "0.4", features = ["util"] }
 http = "0.2"

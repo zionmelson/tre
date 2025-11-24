@@ -8,6 +8,7 @@ This repository currently provides:
 
 - Cargo project scaffolding with Tokio/tonic/prost wiring
 - Proto compilation for Bitquery CoreCast and Jito MEV endpoints
+- Live CoreCast ingestion over DexTrades gRPC (Bitquery API key required)
 - A flat SPSC runtime with lock-free rings, slab allocators, and CPU-affine stages (`runtime.rs`, `core/`, `stages/`)
 - Module skeletons for config management, IDL caching, CoreCast ingestion, bundle submission, Gmail-style notifications, and generated instruction templates
 - Documentation of the target architecture and deployment assumptions (see `docs/architecture.md`)
@@ -33,6 +34,10 @@ Environment variables:
 - `ARBITRAGE_CONFIG`: optional path override for `config.json` (defaults to repo root).
 - `RUST_LOG`: set to control tracing verbosity (defaults to `warn,tre-arb-bot=info`).
 
+### CoreCast credentials
+
+The Bitquery endpoint (`corecast.endpoint`), API key (`corecast.api_key`), and program allowlist (`corecast.program_addresses`) live in `config.json`. If the program list is empty the feed is unfiltered, so populate it with the protocol program IDs you actually want to watch (e.g., Raydium CLMM, Orca Whirlpool).
+
 ## Directory Layout
 
 ```
@@ -45,7 +50,7 @@ src/
   codegen/              # Generated instruction templates (include! at build time)
   runtime.rs            # Flat executor wiring + graceful shutdown
   config.rs             # Config loader + validation
-  corecast.rs           # CoreCast stream subscriber placeholder
+  corecast.rs           # Bitquery CoreCast DexTrades subscriber
   strategy.rs           # Opportunity evaluation stub
   bundle.rs             # Bundle submission stub
   notifier.rs           # Gmail notification skeleton
@@ -59,9 +64,8 @@ src/
 
 ## Next Steps
 
-1. Fill in the CoreCast stream loop to decode parsed pool events into the `Opportunity` struct and feed the SPSC ring directly.
-2. Implement the strategy module to stitch cached instructions and compute dynamic tips using the Jito tip floor/stream endpoints.
-3. Flesh out the bundle client to send signed bundles, poll status streams, and forward success events to Gmail via OAuth service credentials.
-4. Harden deployment (Dockerfile, CI, perf counters, health probes) while keeping the hot path logging-free.
+1. Implement the strategy module to stitch cached instructions and compute dynamic tips using the Jito tip floor/stream endpoints.
+2. Flesh out the bundle client to send signed bundles, poll status streams, and forward success events to Gmail via OAuth service credentials.
+3. Harden CoreCast ingest (multi-stream subscriptions, metrics, auth refresh) and deployment (Dockerfile, CI, perf counters, health probes) while keeping the hot path logging-free.
 
 For a deeper look at the intended architecture and latency goals, read `docs/architecture.md`.

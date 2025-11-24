@@ -21,7 +21,7 @@
 - `idl` – Reads all pool IDLs once so codegen can emit const instruction bytes consumed by the runtime.
 - `core` – Lock-free primitives (`core::ring`, `core::slab`) shared by every stage.
 - `codegen` – Build-time generated `pools_static.rs` that exposes `PoolTemplate` slices without runtime JSON parsing.
-- `corecast` – Holds tonic clients + streaming logic; publishes `Opportunity` structs directly into the Stage 0 slab.
+- `corecast` – Owns the Bitquery DexTrades gRPC client, applies the program allowlist configured in `config.json`, and publishes `Opportunity` structs directly into the Stage 0 slab.
 - `stages` – `stage0_ingest`, `stage1_eval`, and `stage2_submit`, each owning a dedicated thread/core and communicating via SPSC rings.
 - `runtime` – Wires slabs, rings, and stages together, handles ctrl-c shutdown, and guarantees deterministic teardown.
 - `strategy` – Stateless engine that consumes opportunities, references cached IDLs, runs risk checks, and emits `BundleRequest`s.
@@ -31,6 +31,7 @@
 ## Runtime Practices
 
 - **Tokio Runtime:** Restrict Tokio to orchestration (ctrl-c handling, async gRPC). The data plane uses standard threads managed by `runtime.rs`.
+- **Stage 0 micro-runtime:** The ingest stage spins its own single-threaded Tokio runtime to drive the CoreCast stream and reconnect with bounded backoff without blocking other stages.
 - **Stages & Pinning:** Each stage runs on a named OS thread and optionally pins to a dedicated core via `core_affinity`. Avoid migrating stages across cores to limit cache thrash.
 - **Rings:** Communication happens through lock-free SPSC rings sized via `config.perf.ring_capacity`. Busy wait with exponential backoff, yielding when needed to keep latency predictable.
 - **Slabs:** `SlabPool` owns fixed-size arenas for opportunities and bundles so no `Vec`/`Arc` allocations happen in the hot path. Size via config and watch saturation metrics.
@@ -46,7 +47,7 @@
 
 ## Future Work
 
-1. Implement the actual CoreCast stream decode and integrate Bitquery credentials.
+1. Add CoreCast resiliency (multi-stream subscriptions, metrics, auth refresh) on top of the live DexTrades feed.
 2. Flesh out strategy heuristics (pool graph, reserve depth, risk caps) now that slabs expose reusable objects.
 3. Build bundle submission, polling, and failover across multiple Jito regions with dynamic tip estimation.
 4. Wire Gmail OAuth service account + email templating for bundle successes.

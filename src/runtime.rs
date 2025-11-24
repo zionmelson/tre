@@ -9,6 +9,7 @@ use crate::core::{spsc_ring, SlabPool};
 use crate::corecast::CorecastSubscriber;
 use crate::idl::IdlCache;
 use crate::notifier::Notifier;
+use crate::protocol::ProtocolRegistry;
 use crate::stages::{
     stage0_ingest::OpportunityLease, stage1_eval::BundleLease, Stage0Ingest, Stage1Eval,
     Stage2Submit,
@@ -20,6 +21,7 @@ pub struct Executor {
     handles: Vec<std::thread::JoinHandle<()>>,
     _config: Arc<AppConfig>,
     _idl_cache: Arc<IdlCache>,
+    _protocols: Arc<ProtocolRegistry>,
 }
 
 impl Executor {
@@ -27,6 +29,7 @@ impl Executor {
         let config = Arc::new(config);
         let perf = config.perf.clone();
         let idl_cache = Arc::new(IdlCache::bootstrap()?);
+        let protocols = Arc::new(ProtocolRegistry::bootstrap(&idl_cache)?);
         let running = Arc::new(AtomicBool::new(true));
 
         let (opp_tx, opp_rx) = spsc_ring::<OpportunityLease>(perf.sanitized_ring_capacity());
@@ -36,7 +39,7 @@ impl Executor {
         let bundle_pool = SlabPool::new(perf.bundle_capacity());
 
         let corecast = CorecastSubscriber::new(config.clone());
-        let strategy = StrategyEngine::new(config.clone());
+        let strategy = StrategyEngine::new(config.clone(), protocols.clone(), idl_cache.clone())?;
         let bundle_client = BundleClient::new(config.clone());
         let notifier = Notifier::new(config.clone());
 
@@ -51,6 +54,7 @@ impl Executor {
         let mut handles = Vec::with_capacity(3);
         handles.push(Stage0Ingest::spawn(
             corecast,
+            protocols.clone(),
             opp_pool.clone(),
             opp_tx,
             running.clone(),
@@ -77,6 +81,7 @@ impl Executor {
             handles,
             _config: config,
             _idl_cache: idl_cache,
+            _protocols: protocols,
         })
     }
 
