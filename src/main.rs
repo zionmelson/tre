@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,tre-arb-bot=info"));
+        .unwrap_or_else(|_| EnvFilter::new("warn,tre-arb-bot=info,stage0=info,corecast=info"));
 
     fmt()
         .with_env_filter(filter)

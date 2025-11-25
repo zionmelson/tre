@@ -35,6 +35,7 @@ impl ExecutorRuntime {
         handles.push(stages::spawn_ingest_stage(
             stop.clone(),
             Some(config.perf.ingest_core),
+            config.clone(),
             trade_pool.clone(),
             trade_tx,
             pool_update_pool.clone(),
@@ -43,6 +44,7 @@ impl ExecutorRuntime {
         handles.push(stages::spawn_eval_stage(
             stop.clone(),
             Some(config.perf.eval_core),
+            config.clone(),
             trade_rx,
             pool_rx,
             bundle_tx,

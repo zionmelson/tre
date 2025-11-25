@@ -1,6 +1,6 @@
 cargo:rerun-if-changed=bitquery
 cargo:rerun-if-changed=jito
-cargo:rerun-if-changed=idls/pools
+cargo:rerun-if-changed=protocol/pools
 cargo:rerun-if-changed=bitquery/solana/block_message.proto
 cargo:rerun-if-changed=bitquery/solana/dex_block_message.proto
 cargo:rerun-if-changed=bitquery/solana/parsed_idl_block_message.proto

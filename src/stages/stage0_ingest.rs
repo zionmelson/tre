@@ -5,16 +5,21 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
-use tracing::{info, warn};
+use anyhow::{Context, Result};
+use tokio::runtime::Builder as TokioRuntime;
+use tokio::time::sleep;
+use tracing::{debug, info, warn};
 
+use crate::config::AppConfig;
 use crate::core::{pin_current_thread, Lease, RingProducer, SlabPool};
+use crate::corecast::CoreCastClient;
 
 use super::types::{PoolUpdate, TradeUpdate};
 
 pub fn spawn_ingest_stage(
     stop: Arc<AtomicBool>,
     core_id: Option<usize>,
+    config: Arc<AppConfig>,
     trade_pool: SlabPool<TradeUpdate>,
     trade_producer: RingProducer<Lease<TradeUpdate>>,
     pool_pool: SlabPool<PoolUpdate>,
@@ -26,6 +31,7 @@ pub fn spawn_ingest_stage(
             run(
                 stop,
                 core_id,
+                config,
                 trade_pool,
                 trade_producer,
                 pool_pool,
@@ -38,6 +44,7 @@ pub fn spawn_ingest_stage(
 fn run(
     stop: Arc<AtomicBool>,
     core_id: Option<usize>,
+    config: Arc<AppConfig>,
     trade_pool: SlabPool<TradeUpdate>,
     trade_producer: RingProducer<Lease<TradeUpdate>>,
     pool_pool: SlabPool<PoolUpdate>,
@@ -47,31 +54,157 @@ fn run(
         let _ = pin_current_thread(core);
     }
 
+    info!(target = "stage0", "ingest online");
+
+    let client = CoreCastClient::new(config).context("failed to initialize CoreCast client")?;
+    let runtime = TokioRuntime::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build stage0 runtime")?;
+
+    runtime.block_on(async move {
+        tokio::try_join!(
+            pump_trade_stream(stop.clone(), client.clone(), trade_pool, trade_producer,),
+            pump_pool_stream(stop, client, pool_pool, pool_producer)
+        )
+    })?;
+
+    info!(target = "stage0", "ingest shutting down");
+    Ok(())
+}
+
+async fn pump_trade_stream(
+    stop: Arc<AtomicBool>,
+    client: CoreCastClient,
+    pool: SlabPool<TradeUpdate>,
+    producer: RingProducer<Lease<TradeUpdate>>,
+) -> Result<()> {
     let mut seq = 0u64;
-    info!("stage0 ingest online");
+    let mut retry = Duration::from_millis(250);
+    let max_retry = Duration::from_secs(5);
+
     while !stop.load(Ordering::Relaxed) {
-        let pool_id = format!("pool-{}", seq % 5);
-
-        if let Some(lease) =
-            pool_pool.try_acquire_with(|| PoolUpdate::synthetic(seq, pool_id.clone()))
-        {
-            if let Err(err) = pool_producer.push(lease) {
-                warn!(%err, "failed to enqueue pool update");
+        match client.trade_stream().await {
+            Ok(mut stream) => {
+                info!(target = "stage0", "CoreCast trade stream subscribed");
+                retry = Duration::from_millis(250);
+                while !stop.load(Ordering::Relaxed) {
+                    match stream.message().await {
+                        Ok(Some(message)) => {
+                            if let Some(update) = TradeUpdate::from_corecast(seq, &message) {
+                                seq = seq.wrapping_add(1);
+                                dispatch_trade_update(&pool, &producer, update);
+                            } else {
+                                debug!(target = "stage0", "dropped malformed trade update");
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(target = "stage0", "trade stream closed by server");
+                            break;
+                        }
+                        Err(status) => {
+                            warn!(target = "stage0", %status, "trade stream error");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(target = "stage0", %err, "failed to subscribe to trade stream");
+                info!(target = "stage0", error = ?err, "trade stream subscription error detail");
             }
         }
 
-        if let Some(lease) =
-            trade_pool.try_acquire_with(|| TradeUpdate::synthetic(seq, pool_id.clone()))
-        {
-            if let Err(err) = trade_producer.push(lease) {
-                warn!(%err, "failed to enqueue trade update");
-            }
+        if stop.load(Ordering::Relaxed) {
+            break;
         }
 
-        seq = seq.wrapping_add(1);
-        thread::sleep(Duration::from_millis(10));
+        sleep(retry).await;
+        retry = (retry * 2).min(max_retry);
     }
 
-    info!("stage0 ingest shutting down");
     Ok(())
+}
+
+async fn pump_pool_stream(
+    stop: Arc<AtomicBool>,
+    client: CoreCastClient,
+    pool: SlabPool<PoolUpdate>,
+    producer: RingProducer<Lease<PoolUpdate>>,
+) -> Result<()> {
+    let mut seq = 0u64;
+    let mut retry = Duration::from_millis(250);
+    let max_retry = Duration::from_secs(5);
+
+    while !stop.load(Ordering::Relaxed) {
+        match client.pool_stream().await {
+            Ok(mut stream) => {
+                info!(target = "stage0", "CoreCast pool stream subscribed");
+                retry = Duration::from_millis(250);
+                while !stop.load(Ordering::Relaxed) {
+                    match stream.message().await {
+                        Ok(Some(message)) => {
+                            if let Some(update) = PoolUpdate::from_corecast(seq, &message) {
+                                seq = seq.wrapping_add(1);
+                                dispatch_pool_update(&pool, &producer, update);
+                            } else {
+                                debug!(target = "stage0", "dropped malformed pool update");
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(target = "stage0", "pool stream closed by server");
+                            break;
+                        }
+                        Err(status) => {
+                            warn!(target = "stage0", %status, "pool stream error");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(target = "stage0", %err, "failed to subscribe to pool stream");
+                info!(target = "stage0", error = ?err, "pool stream subscription error detail");
+            }
+        }
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        sleep(retry).await;
+        retry = (retry * 2).min(max_retry);
+    }
+
+    Ok(())
+}
+
+fn dispatch_trade_update(
+    pool: &SlabPool<TradeUpdate>,
+    producer: &RingProducer<Lease<TradeUpdate>>,
+    update: TradeUpdate,
+) {
+    if let Some(lease) = pool.try_acquire(update) {
+        if let Err(lease) = producer.push(lease) {
+            warn!(target = "stage0", "trade ring saturated; dropping update");
+            drop(lease);
+        }
+    } else {
+        warn!(target = "stage0", "trade slab saturated; dropping update");
+    }
+}
+
+fn dispatch_pool_update(
+    pool: &SlabPool<PoolUpdate>,
+    producer: &RingProducer<Lease<PoolUpdate>>,
+    update: PoolUpdate,
+) {
+    if let Some(lease) = pool.try_acquire(update) {
+        if let Err(lease) = producer.push(lease) {
+            warn!(target = "stage0", "pool ring saturated; dropping update");
+            drop(lease);
+        }
+    } else {
+        warn!(target = "stage0", "pool slab saturated; dropping update");
+    }
 }

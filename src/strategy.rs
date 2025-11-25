@@ -9,8 +9,6 @@ impl StrategyEngine {
 
     pub fn evaluate(&self, opportunity: &Opportunity) -> Option<BundleCandidate> {
         // TODO: implement real heuristics.
-        let mut candidate = BundleCandidate::from_opportunity(opportunity.seq);
-        candidate.seq = opportunity.seq;
-        Some(candidate)
+        Some(BundleCandidate::from_opportunity(opportunity))
     }
 }

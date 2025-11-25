@@ -19,6 +19,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub quicknode_rpcs: Vec<String>,
     #[serde(default)]
+    pub protocols: HashMap<String, ProtocolConfig>,
+    #[serde(default)]
     pub perf: PerfTuning,
 }
 
@@ -26,10 +28,33 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("failed reading config file {}", path.display()))?;
-        let config: AppConfig = serde_json::from_str(&contents)
+        let mut config: AppConfig = serde_json::from_str(&contents)
             .with_context(|| format!("failed parsing config file {}", path.display()))?;
+        config.apply_protocol_defaults();
         config.validate()?;
         Ok(config)
+    }
+
+    fn apply_protocol_defaults(&mut self) {
+        for protocol in KNOWN_PROTOCOLS {
+            self.protocols
+                .entry((*protocol).to_string())
+                .or_insert_with(ProtocolConfig::default);
+        }
+
+        for entry in self.protocols.values_mut() {
+            if entry.rpc_endpoints.is_empty() {
+                entry.rpc_endpoints = self.quicknode_rpcs.clone();
+            }
+        }
+    }
+
+    pub fn protocol_rpc_endpoints(&self, protocol: &str) -> Vec<String> {
+        self.protocols
+            .get(protocol)
+            .map(|entry| entry.rpc_endpoints.clone())
+            .filter(|endpoints| !endpoints.is_empty())
+            .unwrap_or_else(|| self.quicknode_rpcs.clone())
     }
 
     fn validate(&self) -> Result<()> {
@@ -95,6 +120,8 @@ pub struct FlashLoanConfig {
 pub struct CoreCastConfig {
     pub address: String,
     pub authorization: String,
+    #[serde(default, deserialize_with = "deserialize_optional_path")]
+    pub ca_pem: Option<PathBuf>,
     #[serde(default)]
     pub cache: CoreCastCache,
 }
@@ -126,6 +153,20 @@ pub struct PerfTuning {
     pub bundle_slab: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProtocolConfig {
+    #[serde(default)]
+    pub rpc_endpoints: Vec<String>,
+}
+
+const KNOWN_PROTOCOLS: &[&str] = &[
+    "raydium_v3",
+    "cp_amm",
+    "lb_clmm",
+    "lifinity_v2",
+    "whirlpool",
+];
+
 impl Default for PerfTuning {
     fn default() -> Self {
         Self {
@@ -145,6 +186,16 @@ where
 {
     let raw = String::deserialize(deserializer)?;
     Ok(expand_tilde(&raw))
+}
+
+fn deserialize_optional_path<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.map(|raw| expand_tilde(&raw)))
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
