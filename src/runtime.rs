@@ -1,98 +1,96 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-use anyhow::Result;
-
-use crate::bundle::BundleClient;
-use crate::config::AppConfig;
-use crate::core::{spsc_ring, SlabPool};
-use crate::corecast::CorecastSubscriber;
-use crate::idl::IdlCache;
-use crate::notifier::Notifier;
-use crate::protocol::ProtocolRegistry;
-use crate::stages::{
-    stage0_ingest::OpportunityLease, stage1_eval::BundleLease, Stage0Ingest, Stage1Eval,
-    Stage2Submit,
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
-use crate::strategy::StrategyEngine;
+use std::thread;
 
-pub struct Executor {
-    running: Arc<AtomicBool>,
-    handles: Vec<std::thread::JoinHandle<()>>,
+use anyhow::{anyhow, Result};
+
+use crate::config::AppConfig;
+use crate::core::{Lease, SlabPool, SpscRing};
+use crate::stages::{self, BundleCandidate, PoolUpdate, TradeUpdate};
+
+pub struct ExecutorRuntime {
+    stop: Arc<AtomicBool>,
+    handles: Vec<thread::JoinHandle<Result<()>>>,
     _config: Arc<AppConfig>,
-    _idl_cache: Arc<IdlCache>,
-    _protocols: Arc<ProtocolRegistry>,
 }
 
-impl Executor {
-    pub fn build(config: AppConfig) -> Result<Self> {
-        let config = Arc::new(config);
-        let perf = config.perf.clone();
-        let idl_cache = Arc::new(IdlCache::bootstrap()?);
-        let protocols = Arc::new(ProtocolRegistry::bootstrap(&idl_cache)?);
-        let running = Arc::new(AtomicBool::new(true));
+impl ExecutorRuntime {
+    pub fn spawn(config: Arc<AppConfig>) -> Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
 
-        let (opp_tx, opp_rx) = spsc_ring::<OpportunityLease>(perf.sanitized_ring_capacity());
-        let (bundle_tx, bundle_rx) = spsc_ring::<BundleLease>(perf.sanitized_ring_capacity());
+        let trade_pool = SlabPool::new(config.perf.opportunity_slab);
+        let pool_update_pool = SlabPool::new(config.perf.opportunity_slab);
+        let bundle_pool = SlabPool::new(config.perf.bundle_slab);
+        let (trade_tx, trade_rx) =
+            SpscRing::<Lease<TradeUpdate>>::with_capacity(config.perf.ring_capacity).into_split();
+        let (pool_tx, pool_rx) =
+            SpscRing::<Lease<PoolUpdate>>::with_capacity(config.perf.ring_capacity).into_split();
+        let (bundle_tx, bundle_rx) =
+            SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
+                .into_split();
 
-        let opp_pool = SlabPool::new(perf.opportunity_capacity());
-        let bundle_pool = SlabPool::new(perf.bundle_capacity());
-
-        let corecast = CorecastSubscriber::new(config.clone());
-        let strategy = StrategyEngine::new(config.clone(), protocols.clone(), idl_cache.clone())?;
-        let bundle_client = BundleClient::new(config.clone());
-        let notifier = Notifier::new(config.clone());
-
-        tracing::info!(
-            target = "runtime",
-            opp_slab = opp_pool.capacity(),
-            bundle_slab = bundle_pool.capacity(),
-            ring_capacity = perf.sanitized_ring_capacity(),
-            "flat executor booting"
-        );
-
-        let mut handles = Vec::with_capacity(3);
-        handles.push(Stage0Ingest::spawn(
-            corecast,
-            protocols.clone(),
-            opp_pool.clone(),
-            opp_tx,
-            running.clone(),
-            perf.ingest_core,
-        ));
-        handles.push(Stage1Eval::spawn(
-            opp_rx,
+        let mut handles = Vec::new();
+        handles.push(stages::spawn_ingest_stage(
+            stop.clone(),
+            Some(config.perf.ingest_core),
+            trade_pool.clone(),
+            trade_tx,
+            pool_update_pool.clone(),
+            pool_tx,
+        )?);
+        handles.push(stages::spawn_eval_stage(
+            stop.clone(),
+            Some(config.perf.eval_core),
+            trade_rx,
+            pool_rx,
             bundle_tx,
             bundle_pool.clone(),
-            strategy,
-            running.clone(),
-            perf.eval_core,
-        ));
-        handles.push(Stage2Submit::spawn(
+        )?);
+        handles.push(stages::spawn_submit_stage(
+            stop.clone(),
+            Some(config.perf.submit_core),
             bundle_rx,
-            bundle_client,
-            notifier,
-            running.clone(),
-            perf.submit_core,
-        ));
+        )?);
 
         Ok(Self {
-            running,
+            stop,
             handles,
             _config: config,
-            _idl_cache: idl_cache,
-            _protocols: protocols,
         })
     }
 
-    pub async fn run(self) -> Result<()> {
-        tracing::info!(target = "runtime", "executor online; awaiting ctrl+c");
-        tokio::signal::ctrl_c().await?;
-        tracing::info!(target = "runtime", "shutdown signal received");
-        self.running.store(false, Ordering::Release);
+    pub fn request_shutdown(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    pub fn join(self) -> Result<()> {
         for handle in self.handles {
-            let _ = handle.join();
+            match handle.join() {
+                Ok(result) => result?,
+                Err(panic) => {
+                    return Err(anyhow!("stage thread panicked: {}", describe_panic(panic)))
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn describe_panic(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        msg.to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+pub async fn run(config: Arc<AppConfig>) -> Result<()> {
+    let runtime = ExecutorRuntime::spawn(config)?;
+    tokio::signal::ctrl_c().await?;
+    runtime.request_shutdown();
+    runtime.join()
 }

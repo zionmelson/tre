@@ -1,20 +1,76 @@
-use std::{collections::HashMap, env, fs, path::Path};
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
+use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
-use thiserror::Error;
-
-const DEFAULT_CONFIG: &str = "config.json";
-const CONFIG_ENV_KEY: &str = "ARBITRAGE_CONFIG";
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct WalletConfig {
-    pub path: String,
+pub struct AppConfig {
+    pub wallets: Wallets,
+    pub jito: JitoConfig,
+    pub corecast: CoreCastConfig,
+    pub tokens: HashMap<String, String>,
+    #[serde(default)]
+    pub program_addresses: Vec<String>,
+    pub flash_loan: FlashLoanConfig,
+    #[serde(default)]
+    pub quicknode_rpcs: Vec<String>,
+    #[serde(default)]
+    pub perf: PerfTuning,
+}
+
+impl AppConfig {
+    pub fn load(path: &Path) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed reading config file {}", path.display()))?;
+        let config: AppConfig = serde_json::from_str(&contents)
+            .with_context(|| format!("failed parsing config file {}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.jito.endpoints.is_empty(),
+            "at least one Jito endpoint is required"
+        );
+        ensure!(
+            self.perf.ring_capacity > 0,
+            "perf.ring_capacity must be greater than zero"
+        );
+        ensure!(
+            self.perf.opportunity_slab > 0,
+            "perf.opportunity_slab must be greater than zero"
+        );
+        ensure!(
+            self.perf.bundle_slab > 0,
+            "perf.bundle_slab must be greater than zero"
+        );
+        ensure!(
+            !self.corecast.address.trim().is_empty(),
+            "corecast.address must be set"
+        );
+        ensure!(
+            !self.corecast.authorization.trim().is_empty(),
+            "corecast.authorization must be set"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct WalletsConfig {
-    pub auth: WalletConfig,
-    pub payer: WalletConfig,
+pub struct Wallets {
+    pub auth: WalletPath,
+    pub payer: WalletPath,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WalletPath {
+    #[serde(deserialize_with = "deserialize_path")]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,122 +92,85 @@ pub struct FlashLoanConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CorecastConfig {
-    pub endpoint: String,
-    pub api_key: String,
+pub struct CoreCastConfig {
+    pub address: String,
+    pub authorization: String,
     #[serde(default)]
-    pub program_addresses: Vec<String>,
+    pub cache: CoreCastCache,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AppConfig {
-    pub wallets: WalletsConfig,
-    pub jito: JitoConfig,
-    pub corecast: CorecastConfig,
-    pub tokens: HashMap<String, String>,
-    pub flash_loan: FlashLoanConfig,
-    #[serde(default)]
-    pub quicknode_rpcs: Vec<String>,
-    #[serde(default)]
-    pub perf: PerfConfig,
+#[serde(default)]
+pub struct CoreCastCache {
+    pub warm_capacity: usize,
+    pub channel_capacity: usize,
+}
+
+impl Default for CoreCastCache {
+    fn default() -> Self {
+        Self {
+            warm_capacity: 32,
+            channel_capacity: 512,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PerfConfig {
-    #[serde(default)]
-    pub ingest_core: Option<usize>,
-    #[serde(default)]
-    pub eval_core: Option<usize>,
-    #[serde(default)]
-    pub submit_core: Option<usize>,
-    #[serde(default = "PerfConfig::default_ring_capacity")]
+#[serde(default)]
+pub struct PerfTuning {
+    pub ingest_core: usize,
+    pub eval_core: usize,
+    pub submit_core: usize,
     pub ring_capacity: usize,
-    #[serde(default = "PerfConfig::default_opportunity_slab")]
     pub opportunity_slab: usize,
-    #[serde(default = "PerfConfig::default_bundle_slab")]
     pub bundle_slab: usize,
 }
 
-impl Default for PerfConfig {
+impl Default for PerfTuning {
     fn default() -> Self {
         Self {
-            ingest_core: None,
-            eval_core: None,
-            submit_core: None,
-            ring_capacity: Self::default_ring_capacity(),
-            opportunity_slab: Self::default_opportunity_slab(),
-            bundle_slab: Self::default_bundle_slab(),
+            ingest_core: 0,
+            eval_core: 1,
+            submit_core: 2,
+            ring_capacity: 1024,
+            opportunity_slab: 2048,
+            bundle_slab: 512,
         }
     }
 }
 
-impl PerfConfig {
-    const fn default_ring_capacity() -> usize {
-        2048
-    }
-
-    const fn default_opportunity_slab() -> usize {
-        4096
-    }
-
-    const fn default_bundle_slab() -> usize {
-        1024
-    }
-
-    pub fn sanitized_ring_capacity(&self) -> usize {
-        let candidate = self.ring_capacity.max(2);
-        candidate.next_power_of_two()
-    }
-
-    pub fn opportunity_capacity(&self) -> usize {
-        self.opportunity_slab.max(64)
-    }
-
-    pub fn bundle_capacity(&self) -> usize {
-        self.bundle_slab.max(64)
-    }
+fn deserialize_path<'de, D>(deserializer: D) -> std::result::Result<PathBuf, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(expand_tilde(&raw))
 }
 
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    #[error("unable to read config at {path}: {source}")]
-    Io {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[error("failed to parse config json: {0}")]
-    Parse(#[from] serde_json::Error),
-}
-
-impl AppConfig {
-    pub fn load() -> Result<Self, ConfigError> {
-        let path = env::var(CONFIG_ENV_KEY).unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
-        Self::from_path(path)
-    }
-
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let path_ref = path.as_ref();
-        let data = fs::read_to_string(path_ref).map_err(|source| ConfigError::Io {
-            path: path_ref.display().to_string(),
-            source,
-        })?;
-        let mut cfg: AppConfig = serde_json::from_str(&data)?;
-        cfg.expand_tilde_paths();
-        Ok(cfg)
-    }
-
-    fn expand_tilde_paths(&mut self) {
-        self.wallets.auth.path = expand_home(&self.wallets.auth.path);
-        self.wallets.payer.path = expand_home(&self.wallets.payer.path);
-    }
-}
-
-fn expand_home(input: &str) -> String {
-    if let Some(stripped) = input.strip_prefix("~/") {
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
         if let Ok(home) = env::var("HOME") {
-            return Path::new(&home).join(stripped).display().to_string();
+            return PathBuf::from(home).join(stripped);
+        }
+    } else if path == "~" {
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home);
         }
     }
-    input.to_string()
+
+    PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use super::expand_tilde;
+
+    #[test]
+    fn expands_home_prefix() {
+        env::set_var("HOME", "/tmp/home");
+        let path = expand_tilde("~/keys.json");
+        assert_eq!(path, std::path::PathBuf::from("/tmp/home/keys.json"));
+    }
 }

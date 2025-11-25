@@ -1,12 +1,46 @@
-   0.157307375s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint: stale: changed "/Users/ye/tre/src/strategy/amm_v3.rs"
-   0.157323083s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:           (vs) "/Users/ye/tre/target/debug/.fingerprint/tre-arb-bot-d24e943274ae476c/dep-bin-tre-arb-bot"
-   0.157325375s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1764028139, nanos: 934390547 } < FileTime { seconds: 1764028201, nanos: 60200419 }
-   0.157793916s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: false }/TargetInner { name: "tre-arb-bot", doc: true, ..: with_path("/Users/ye/tre/src/main.rs", Edition2021) }
-   0.158098375s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/ye/tre/target/debug/.fingerprint/tre-arb-bot-d24e943274ae476c/dep-bin-tre-arb-bot", reference_mtime: FileTime { seconds: 1764028139, nanos: 934390547 }, stale: "/Users/ye/tre/src/strategy/amm_v3.rs", stale_mtime: FileTime { seconds: 1764028201, nanos: 60200419 } }))
-   0.219106291s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint: stale: changed "/Users/ye/tre/src/strategy/mod.rs"
-   0.219117375s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:           (vs) "/Users/ye/tre/target/debug/.fingerprint/tre-arb-bot-af1d0114eaa3dc9d/dep-test-bin-tre-arb-bot"
-   0.219119250s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1764028125, nanos: 973230263 } < FileTime { seconds: 1764028201, nanos: 39376883 }
-   0.219834500s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { name: "tre-arb-bot", doc: true, ..: with_path("/Users/ye/tre/src/main.rs", Edition2021) }
-   0.219847583s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/ye/tre/target/debug/.fingerprint/tre-arb-bot-af1d0114eaa3dc9d/dep-test-bin-tre-arb-bot", reference_mtime: FileTime { seconds: 1764028125, nanos: 973230263 }, stale: "/Users/ye/tre/src/strategy/mod.rs", stale_mtime: FileTime { seconds: 1764028201, nanos: 39376883 } }))
-    Checking tre-arb-bot v0.1.0 (/Users/ye/tre)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.55s
+   0.776853375s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint: stale: missing "/Users/ye/tre/idls/pools"
+   0.778127291s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("tre_arb_bot", ["lib"], "/Users/ye/tre/src/lib.rs", Edition2021) }
+   0.778320500s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "build_script_build" })
+   0.867944583s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/RunCustomBuild/TargetInner { ..: custom_build_target("build-script-build", "/Users/ye/tre/build.rs", Edition2021) }
+   0.867957916s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="build-script-build"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(MissingFile("/Users/ye/tre/idls/pools")))
+   0.870728500s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("tre_arb_bot", ["lib"], "/Users/ye/tre/src/lib.rs", Edition2021) }
+   0.870735208s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "build_script_build" })
+   0.872516833s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: false }/TargetInner { name: "tre-arb-bot", doc: true, ..: with_path("/Users/ye/tre/src/main.rs", Edition2021) }
+   0.872522125s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tre_arb_bot" })
+   0.874052083s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { name: "tre-arb-bot", doc: true, ..: with_path("/Users/ye/tre/src/main.rs", Edition2021) }
+   0.874059041s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tre_arb_bot" })
+   0.875602500s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="corecast_connect"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { kind: "test", name: "corecast_connect", benched: false, ..: with_path("/Users/ye/tre/tests/corecast_connect.rs", Edition2021) }
+   0.875610500s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="corecast_connect"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tre_arb_bot" })
+   Compiling tre-arb-bot v0.1.0 (/Users/ye/tre)
+error: failed to run custom build command for `tre-arb-bot v0.1.0 (/Users/ye/tre)`
+note: To improve backtraces for build dependencies, set the CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=true environment variable to enable debug information generation.
+
+Caused by:
+  process didn't exit successfully: `/Users/ye/tre/target/debug/build/tre-arb-bot-6d5c800ac343dd5e/build-script-build` (exit status: 1)
+  --- stdout
+  cargo:rerun-if-changed=bitquery
+  cargo:rerun-if-changed=jito
+  cargo:rerun-if-changed=idls/pools
+  cargo:rerun-if-changed=bitquery/solana/block_message.proto
+  cargo:rerun-if-changed=bitquery/solana/dex_block_message.proto
+  cargo:rerun-if-changed=bitquery/solana/parsed_idl_block_message.proto
+  cargo:rerun-if-changed=bitquery/solana/token_block_message.proto
+  cargo:rerun-if-changed=bitquery/solana/corecast/corecast.proto
+  cargo:rerun-if-changed=bitquery/solana/corecast/request.proto
+  cargo:rerun-if-changed=bitquery/solana/corecast/stream_message.proto
+  cargo:rerun-if-changed=jito/auth.proto
+  cargo:rerun-if-changed=jito/block_engine.proto
+  cargo:rerun-if-changed=jito/block.proto
+  cargo:rerun-if-changed=jito/bundle.proto
+  cargo:rerun-if-changed=jito/packet.proto
+  cargo:rerun-if-changed=jito/relayer.proto
+  cargo:rerun-if-changed=jito/searcher.proto
+  cargo:rerun-if-changed=jito/shared.proto
+  cargo:rerun-if-changed=jito/shredstream.proto
+  cargo:rerun-if-changed=bitquery
+  cargo:rerun-if-changed=bitquery/solana
+  cargo:rerun-if-changed=bitquery/solana/corecast
+  cargo:rerun-if-changed=jito
+
+  --- stderr
+  Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }

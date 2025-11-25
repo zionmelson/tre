@@ -1,39 +1,17 @@
-use std::sync::Arc;
-
 use anyhow::Result;
-use tonic::transport::{Channel, Endpoint};
 
-use crate::{config::AppConfig, proto::searcher::searcher_service_client::SearcherServiceClient};
+use crate::stages::BundleCandidate;
 
-#[derive(Clone)]
-pub struct BundleClient {
-    config: Arc<AppConfig>,
-}
+pub struct BundleClient;
 
 impl BundleClient {
-    pub fn new(config: Arc<AppConfig>) -> Self {
-        Self { config }
+    pub fn new() -> Self {
+        Self
     }
 
-    pub async fn connect(&self) -> Result<SearcherServiceClient<Channel>> {
-        let endpoint = self
-            .config
-            .jito
-            .endpoints
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "https://mainnet.block-engine.jito.wtf".to_string());
-        let channel = Endpoint::from_shared(endpoint)?.connect().await?;
-        Ok(SearcherServiceClient::new(channel))
-    }
-
-    pub fn submit_bundle(&self, bundle: &BundleRequest) -> Result<()> {
-        tracing::debug!(target = "bundle", uuid = %bundle.uuid, "would submit bundle to Jito");
+    pub fn submit(&self, candidate: &BundleCandidate) -> Result<()> {
+        // TODO: implement Jito submission flow.
+        tracing::info!(seq = candidate.seq, "stub bundle submission");
         Ok(())
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct BundleRequest {
-    pub uuid: String,
 }

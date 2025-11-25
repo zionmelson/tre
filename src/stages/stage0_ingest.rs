@@ -1,130 +1,77 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::runtime::Builder as TokioRuntime;
-use tokio::time::sleep;
-use tracing::{error, info, trace, warn};
+use tracing::{info, warn};
 
-use crate::core::{RingSender, SlabPool, SlabRef};
-use crate::corecast::{CorecastSubscriber, Opportunity, OpportunityError};
-use crate::protocol::ProtocolRegistry;
+use crate::core::{pin_current_thread, Lease, RingProducer, SlabPool};
 
-use super::spawn_stage_thread;
+use super::types::{PoolUpdate, TradeUpdate};
 
-pub type OpportunityLease = SlabRef<Opportunity>;
-
-pub struct Stage0Ingest;
-
-impl Stage0Ingest {
-    pub fn spawn(
-        corecast: CorecastSubscriber,
-        protocols: Arc<ProtocolRegistry>,
-        pool: SlabPool<Opportunity>,
-        tx: RingSender<OpportunityLease>,
-        running: Arc<AtomicBool>,
-        core_index: Option<usize>,
-    ) -> std::thread::JoinHandle<()> {
-        spawn_stage_thread("stage0-ingest", core_index, move || {
-            info!(target = "stage0", cap = pool.capacity(), "ingest online");
-            Self::run(corecast, protocols.clone(), pool, tx, running);
+pub fn spawn_ingest_stage(
+    stop: Arc<AtomicBool>,
+    core_id: Option<usize>,
+    trade_pool: SlabPool<TradeUpdate>,
+    trade_producer: RingProducer<Lease<TradeUpdate>>,
+    pool_pool: SlabPool<PoolUpdate>,
+    pool_producer: RingProducer<Lease<PoolUpdate>>,
+) -> Result<thread::JoinHandle<Result<()>>> {
+    thread::Builder::new()
+        .name("stage0_ingest".into())
+        .spawn(move || {
+            run(
+                stop,
+                core_id,
+                trade_pool,
+                trade_producer,
+                pool_pool,
+                pool_producer,
+            )
         })
+        .map_err(Into::into)
+}
+
+fn run(
+    stop: Arc<AtomicBool>,
+    core_id: Option<usize>,
+    trade_pool: SlabPool<TradeUpdate>,
+    trade_producer: RingProducer<Lease<TradeUpdate>>,
+    pool_pool: SlabPool<PoolUpdate>,
+    pool_producer: RingProducer<Lease<PoolUpdate>>,
+) -> Result<()> {
+    if let Some(core) = core_id {
+        let _ = pin_current_thread(core);
     }
 
-    fn run(
-        corecast: CorecastSubscriber,
-        protocols: Arc<ProtocolRegistry>,
-        pool: SlabPool<Opportunity>,
-        tx: RingSender<OpportunityLease>,
-        running: Arc<AtomicBool>,
-    ) {
-        let runtime = TokioRuntime::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("stage0 runtime");
+    let mut seq = 0u64;
+    info!("stage0 ingest online");
+    while !stop.load(Ordering::Relaxed) {
+        let pool_id = format!("pool-{}", seq % 5);
 
-        if let Err(err) =
-            runtime.block_on(Self::pump(corecast, protocols, pool, tx, running.clone()))
+        if let Some(lease) =
+            pool_pool.try_acquire_with(|| PoolUpdate::synthetic(seq, pool_id.clone()))
         {
-            error!(target = "stage0", error = %err, "ingest loop exited with error");
+            if let Err(err) = pool_producer.push(lease) {
+                warn!(%err, "failed to enqueue pool update");
+            }
         }
 
-        info!(target = "stage0", "ingest shutdown");
-    }
-
-    async fn pump(
-        corecast: CorecastSubscriber,
-        protocols: Arc<ProtocolRegistry>,
-        pool: SlabPool<Opportunity>,
-        tx: RingSender<OpportunityLease>,
-        running: Arc<AtomicBool>,
-    ) -> Result<()> {
-        let mut retry_delay = Duration::from_millis(250);
-        let max_delay = Duration::from_secs(5);
-
-        while running.load(Ordering::Acquire) {
-            match corecast.subscribe_trades().await {
-                Ok(mut stream) => {
-                    info!(target = "stage0", "CoreCast trade stream subscribed");
-                    retry_delay = Duration::from_millis(250);
-                    while running.load(Ordering::Acquire) {
-                        match stream.message().await {
-                            Ok(Some(message)) => {
-                                match Opportunity::from_trade(message, &protocols) {
-                                    Ok(opportunity) => {
-                                        if let Some(slot) = pool.try_insert(opportunity) {
-                                            if !tx.spin_push(slot, &running) {
-                                                break;
-                                            }
-                                        } else {
-                                            warn!(
-                                                target = "stage0",
-                                                "opportunity slab saturated; dropping event"
-                                            );
-                                        }
-                                    }
-                                    Err(OpportunityError::UnknownProtocol(program)) => {
-                                        warn!(
-                                            target = "stage0",
-                                            program = %program,
-                                            "dropping trade for unmapped protocol"
-                                        );
-                                    }
-                                    Err(err) => {
-                                        trace!(
-                                            target = "stage0",
-                                            error = %err,
-                                            "dropping malformed trade message"
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                warn!(target = "stage0", "CoreCast closed trade stream");
-                                break;
-                            }
-                            Err(status) => {
-                                warn!(target = "stage0", status = %status, "CoreCast stream error");
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(target = "stage0", error = %err, "failed to subscribe to CoreCast trades");
-                }
+        if let Some(lease) =
+            trade_pool.try_acquire_with(|| TradeUpdate::synthetic(seq, pool_id.clone()))
+        {
+            if let Err(err) = trade_producer.push(lease) {
+                warn!(%err, "failed to enqueue trade update");
             }
-
-            if !running.load(Ordering::Acquire) {
-                break;
-            }
-
-            sleep(retry_delay).await;
-            retry_delay = (retry_delay * 2).min(max_delay);
-            info!(target = "stage0", "retrying CoreCast subscription");
         }
 
-        Ok(())
+        seq = seq.wrapping_add(1);
+        thread::sleep(Duration::from_millis(10));
     }
+
+    info!("stage0 ingest shutting down");
+    Ok(())
 }

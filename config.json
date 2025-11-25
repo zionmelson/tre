@@ -22,17 +22,6 @@
     "tip_floor_url": "https://bundles.jito.wtf/api/v1/bundles/tip_floor",
     "tip_stream_url": "wss://bundles.jito.wtf/api/v1/bundles/tip_stream"
   },
-  "corecast": {
-    "endpoint": "corecast.bitquery.io",
-    "api_key": "ory_at_nrMfwmMqHc5ziCwxzDdJZ4BFVoP3MWeH577-bgFtdAs.cIca8pi5ewUhSFfc3YuXUtlubFTUEyxiVNKfPm9D5dw",
-    "program_addresses": [
-      "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
-      "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
-      "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
-      "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
-      "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
-    ]
-  },
   "tokens": {
     "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
@@ -42,6 +31,13 @@
     "WETH": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
     "WBTC": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
   },
+  "program_addresses": [
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+    "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+    "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+  ],
   "flash_loan": {
     "program_id": "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
     "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
@@ -56,6 +52,14 @@
     "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
     "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
   ],
+  "corecast": {
+    "address": "corecast.bitquery.io",
+    "authorization": "ory_at_qIIU-Aztys6PVE02iK28x34o1TClSKfMGlW-Cj8pPog.miGOHTaT58yxqEBMzPO-Wq-OTw7RdoTc2CT_OpZiwbE",
+    "cache": {
+      "warm_capacity": 32,
+      "channel_capacity": 512
+    }
+  },
   "perf": {
     "ingest_core": 0,
     "eval_core": 1,

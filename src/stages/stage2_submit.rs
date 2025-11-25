@@ -1,50 +1,52 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::Duration;
 
-use tracing::{error, info, trace, warn};
+use anyhow::Result;
+use tracing::info;
 
-use crate::bundle::BundleClient;
-use crate::core::RingReceiver;
-use crate::notifier::Notifier;
+use crate::core::{pin_current_thread, Lease, RingConsumer};
 
-use super::spawn_stage_thread;
-use super::stage1_eval::BundleLease;
+use super::types::BundleCandidate;
 
-pub struct Stage2Submit;
+pub fn spawn_submit_stage(
+    stop: Arc<AtomicBool>,
+    core_id: Option<usize>,
+    consumer: RingConsumer<Lease<BundleCandidate>>,
+) -> Result<thread::JoinHandle<Result<()>>> {
+    thread::Builder::new()
+        .name("stage2_submit".into())
+        .spawn(move || run(stop, core_id, consumer))
+        .map_err(Into::into)
+}
 
-impl Stage2Submit {
-    pub fn spawn(
-        rx: RingReceiver<BundleLease>,
-        client: BundleClient,
-        notifier: Notifier,
-        running: Arc<AtomicBool>,
-        core_index: Option<usize>,
-    ) -> std::thread::JoinHandle<()> {
-        spawn_stage_thread("stage2-submit", core_index, move || {
-            info!(target = "stage2", "submitter online");
-            Self::run(rx, client, notifier, running);
-        })
+fn run(
+    stop: Arc<AtomicBool>,
+    core_id: Option<usize>,
+    consumer: RingConsumer<Lease<BundleCandidate>>,
+) -> Result<()> {
+    if let Some(core) = core_id {
+        let _ = pin_current_thread(core);
     }
 
-    fn run(
-        rx: RingReceiver<BundleLease>,
-        client: BundleClient,
-        notifier: Notifier,
-        running: Arc<AtomicBool>,
-    ) {
-        while running.load(Ordering::Acquire) {
-            match rx.spin_pop(&running) {
-                Some(bundle) => {
-                    trace!(target = "stage2", uuid = %bundle.uuid, "submitting bundle");
-                    if let Err(err) = client.submit_bundle(&bundle) {
-                        error!(target = "stage2", error = %err, "bundle submission failed");
-                    } else if let Err(err) = notifier.bundle_success(&bundle.uuid) {
-                        warn!(target = "stage2", error = %err, "notifier failed");
-                    }
-                }
-                None => break,
-            }
+    info!("stage2 submit online");
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(bundle) = consumer.pop() {
+            info!(
+                seq = bundle.seq,
+                pool = %bundle.pool_id,
+                edge_bps = bundle.estimated_edge_bps,
+                "pretending to submit bundle"
+            );
+            drop(bundle);
+        } else {
+            thread::yield_now();
+            thread::sleep(Duration::from_millis(10));
         }
-        info!(target = "stage2", "submitter shutdown");
     }
+    info!("stage2 submit shutting down");
+    Ok(())
 }

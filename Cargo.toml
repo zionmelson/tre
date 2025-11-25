@@ -25,6 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "nat
 tokio-native-tls = "0.3"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["native-tls"] }
 solana-sdk = { version = "1.18", features = ["program"] }
+solana-client = "1.18"
 bs58 = "0.5"
 base64 = "0.22"
 url = "2"
@@ -35,6 +36,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 core_affinity = "0.8"
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
+clap = { version = "4", features = ["derive"] }
 
 [build-dependencies]
 prost-build = "0.12"
@@ -52,4 +54,5 @@ strip = true
 
 [profile.dev]
 incremental = true
+
 

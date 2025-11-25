@@ -1,100 +1,186 @@
 use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use crossbeam_queue::ArrayQueue;
+use crossbeam_queue::SegQueue;
 
 pub struct SlabPool<T> {
     inner: Arc<SlabInner<T>>,
 }
 
-struct SlabInner<T> {
-    slots: Vec<UnsafeCell<MaybeUninit<T>>>,
-    free: ArrayQueue<usize>,
-}
-
-pub struct SlabRef<T> {
-    inner: Arc<SlabInner<T>>,
-    index: usize,
-    occupied: bool,
+impl<T> Clone for SlabPool<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<T> SlabPool<T> {
     pub fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
-        let slots = (0..capacity)
-            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
-            .collect();
-        let free = ArrayQueue::new(capacity);
-        for idx in 0..capacity {
-            free.push(idx).expect("initial freelist push");
-        }
+        assert!(capacity > 0, "slab capacity must be positive");
         Self {
-            inner: Arc::new(SlabInner { slots, free }),
+            inner: Arc::new(SlabInner::new(capacity)),
         }
     }
 
     pub fn capacity(&self) -> usize {
-        self.inner.slots.len()
+        self.inner.capacity
     }
 
-    pub fn try_insert(&self, value: T) -> Option<SlabRef<T>> {
-        let idx = self.inner.free.pop()?;
-        unsafe {
-            (*self.inner.slots[idx].get()).write(value);
+    pub fn available(&self) -> usize {
+        self.inner.free_len()
+    }
+
+    pub fn try_acquire(&self, value: T) -> Option<Lease<T>> {
+        self.try_acquire_with(|| value)
+    }
+
+    pub fn try_acquire_with<F>(&self, init: F) -> Option<Lease<T>>
+    where
+        F: FnOnce() -> T,
+    {
+        SlabInner::acquire_with(&self.inner, init)
+    }
+}
+
+pub struct Lease<T> {
+    inner: Arc<SlabInner<T>>,
+    index: usize,
+    released: bool,
+}
+
+unsafe impl<T: Send> Send for Lease<T> {}
+unsafe impl<T: Sync> Sync for Lease<T> {}
+
+impl<T> Lease<T> {
+    pub fn into_inner(mut self) -> T {
+        let value = self
+            .inner
+            .clear(self.index)
+            .expect("lease should contain value");
+        self.released = true;
+        value
+    }
+
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if !self.released {
+            let _ = self.inner.clear(self.index);
+            self.released = true;
         }
-        Some(SlabRef {
-            inner: self.inner.clone(),
-            index: idx,
-            occupied: true,
-        })
     }
 }
 
-impl<T> Clone for SlabPool<T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<T> SlabInner<T> {
-    fn release(&self, index: usize) {
-        self.free
-            .push(index)
-            .expect("slab freelist should never overflow");
-    }
-}
-
-impl<T> Deref for SlabRef<T> {
+impl<T> Deref for Lease<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { (*self.inner.slots[self.index].get()).assume_init_ref() }
+        self.inner.get(self.index)
     }
 }
 
-impl<T> DerefMut for SlabRef<T> {
+impl<T> DerefMut for Lease<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { (*self.inner.slots[self.index].get()).assume_init_mut() }
+        self.inner.get_mut(self.index)
     }
 }
 
-impl<T> Drop for SlabRef<T> {
+impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
-        if !self.occupied {
-            return;
-        }
-        unsafe {
-            (*self.inner.slots[self.index].get()).assume_init_drop();
-        }
-        self.inner.release(self.index);
-        self.occupied = false;
+        self.release_inner();
     }
 }
 
-unsafe impl<T: Send> Send for SlabRef<T> {}
-unsafe impl<T: Send> Send for SlabPool<T> {}
-unsafe impl<T: Send> Sync for SlabPool<T> {}
+struct SlabInner<T> {
+    entries: Vec<UnsafeCell<Option<T>>>,
+    free: SegQueue<usize>,
+    capacity: usize,
+}
+
+unsafe impl<T: Send> Send for SlabInner<T> {}
+unsafe impl<T: Send> Sync for SlabInner<T> {}
+
+impl<T> SlabInner<T> {
+    fn new(capacity: usize) -> Self {
+        let entries = (0..capacity)
+            .map(|_| UnsafeCell::new(None))
+            .collect::<Vec<_>>();
+        let free = SegQueue::new();
+        for idx in 0..capacity {
+            free.push(idx);
+        }
+        Self {
+            entries,
+            free,
+            capacity,
+        }
+    }
+
+    fn acquire_with<F>(inner: &Arc<Self>, init: F) -> Option<Lease<T>>
+    where
+        F: FnOnce() -> T,
+    {
+        inner.free.pop().map(|index| {
+            let value = init();
+            inner.write(index, value);
+            Lease {
+                inner: Arc::clone(inner),
+                index,
+                released: false,
+            }
+        })
+    }
+
+    fn write(&self, index: usize, value: T) {
+        unsafe {
+            let slot = self.entries[index].get();
+            (*slot) = Some(value);
+        }
+    }
+
+    fn clear(&self, index: usize) -> Option<T> {
+        unsafe {
+            let slot = self.entries[index].get();
+            let value = (*slot).take();
+            self.free.push(index);
+            value
+        }
+    }
+
+    fn get(&self, index: usize) -> &T {
+        unsafe {
+            let slot = self.entries[index].get();
+            (*slot).as_ref().expect("lease should contain value")
+        }
+    }
+
+    fn get_mut(&self, index: usize) -> &mut T {
+        unsafe {
+            let slot = self.entries[index].get();
+            (*slot).as_mut().expect("lease should contain value")
+        }
+    }
+
+    fn free_len(&self) -> usize {
+        self.free.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SlabPool;
+
+    #[test]
+    fn acquires_and_releases_slots() {
+        let pool = SlabPool::new(1);
+        let lease = pool.try_acquire(42).expect("slot available");
+        assert_eq!(*lease, 42);
+        let value = lease.into_inner();
+        assert_eq!(value, 42);
+        assert!(pool.try_acquire(7).is_some());
+    }
+}

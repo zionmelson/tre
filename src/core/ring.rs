@@ -1,137 +1,146 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crossbeam_utils::{Backoff, CachePadded};
+/// Lock-free single-producer/single-consumer ring buffer.
+pub struct SpscRing<T> {
+    inner: Arc<RingInner<T>>,
+}
 
-pub fn spsc_ring<T>(capacity: usize) -> (RingSender<T>, RingReceiver<T>) {
-    let bounded = capacity.next_power_of_two().max(2);
-    let inner = Arc::new(RingInner::new(bounded));
-    (
-        RingSender {
-            inner: inner.clone(),
-        },
-        RingReceiver { inner },
-    )
+impl<T> SpscRing<T> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(RingInner::new(capacity)),
+        }
+    }
+
+    pub fn into_split(self) -> (RingProducer<T>, RingConsumer<T>) {
+        let producer = RingProducer {
+            inner: Arc::clone(&self.inner),
+        };
+        let consumer = RingConsumer { inner: self.inner };
+        (producer, consumer)
+    }
+}
+
+pub struct RingProducer<T> {
+    inner: Arc<RingInner<T>>,
+}
+
+impl<T> RingProducer<T> {
+    pub fn push(&self, item: T) -> Result<(), T> {
+        self.inner.push(item)
+    }
+}
+
+pub struct RingConsumer<T> {
+    inner: Arc<RingInner<T>>,
+}
+
+impl<T> RingConsumer<T> {
+    pub fn pop(&self) -> Option<T> {
+        self.inner.pop()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 }
 
 struct RingInner<T> {
-    mask: usize,
-    capacity: usize,
     buffer: Vec<UnsafeCell<MaybeUninit<T>>>,
-    head: CachePadded<AtomicUsize>,
-    tail: CachePadded<AtomicUsize>,
-}
-
-impl<T> RingInner<T> {
-    fn new(capacity: usize) -> Self {
-        assert!(capacity.is_power_of_two(), "capacity must be power of two");
-        let buffer = (0..capacity)
-            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
-            .collect();
-        Self {
-            mask: capacity - 1,
-            capacity,
-            buffer,
-            head: CachePadded::new(AtomicUsize::new(0)),
-            tail: CachePadded::new(AtomicUsize::new(0)),
-        }
-    }
-
-    #[inline(always)]
-    fn slot(&self, index: usize) -> &UnsafeCell<MaybeUninit<T>> {
-        &self.buffer[index & self.mask]
-    }
-}
-
-impl<T> Drop for RingInner<T> {
-    fn drop(&mut self) {
-        let mut tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Relaxed);
-        while tail != head {
-            let slot = self.slot(tail);
-            unsafe {
-                (*slot.get()).assume_init_drop();
-            }
-            tail = tail.wrapping_add(1);
-        }
-    }
+    mask: usize,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    capacity: usize,
 }
 
 unsafe impl<T: Send> Send for RingInner<T> {}
 unsafe impl<T: Send> Sync for RingInner<T> {}
 
-pub struct RingSender<T> {
-    inner: Arc<RingInner<T>>,
-}
-
-pub struct RingReceiver<T> {
-    inner: Arc<RingInner<T>>,
-}
-
-impl<T: Send> RingSender<T> {
-    pub fn try_push(&self, value: T) -> Result<(), T> {
-        let head = self.inner.head.load(Ordering::Relaxed);
-        let tail = self.inner.tail.load(Ordering::Acquire);
-        if head.wrapping_sub(tail) == self.inner.capacity {
-            return Err(value);
+impl<T> RingInner<T> {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "ring capacity must be positive");
+        let cap = capacity.next_power_of_two();
+        let buffer = (0..cap)
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+            .collect();
+        Self {
+            buffer,
+            mask: cap - 1,
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            capacity: cap,
         }
-        let slot = self.inner.slot(head);
+    }
+
+    fn push(&self, item: T) -> Result<(), T> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head - tail == self.capacity {
+            return Err(item);
+        }
+
+        let index = head & self.mask;
         unsafe {
-            (*slot.get()).write(value);
+            (*self.buffer[index].get()).write(item);
         }
-        self.inner
-            .head
-            .store(head.wrapping_add(1), Ordering::Release);
+        self.head.store(head + 1, Ordering::Release);
         Ok(())
     }
 
-    pub fn spin_push(&self, value: T, running: &AtomicBool) -> bool {
-        let mut item = value;
-        let backoff = Backoff::new();
-        loop {
-            match self.try_push(item) {
-                Ok(()) => return true,
-                Err(v) => {
-                    if !running.load(Ordering::Acquire) {
-                        drop(v);
-                        return false;
-                    }
-                    item = v;
-                    backoff.snooze();
-                    continue;
-                }
+    fn pop(&self) -> Option<T> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+
+        let index = tail & self.mask;
+        let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
+        self.tail.store(tail + 1, Ordering::Release);
+        Some(value)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tail.load(Ordering::Acquire) == self.head.load(Ordering::Acquire)
+    }
+}
+
+impl<T> Drop for RingInner<T> {
+    fn drop(&mut self) {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Relaxed);
+        for idx in tail..head {
+            let slot = idx & self.mask;
+            unsafe {
+                let _ = (*self.buffer[slot].get()).assume_init_read();
             }
         }
     }
 }
 
-impl<T: Send> RingReceiver<T> {
-    pub fn try_pop(&self) -> Option<T> {
-        let tail = self.inner.tail.load(Ordering::Relaxed);
-        let head = self.inner.head.load(Ordering::Acquire);
-        if head == tail {
-            return None;
-        }
-        let slot = self.inner.slot(tail);
-        let value = unsafe { (*slot.get()).assume_init_read() };
-        self.inner
-            .tail
-            .store(tail.wrapping_add(1), Ordering::Release);
-        Some(value)
-    }
+unsafe impl<T: Send> Send for RingProducer<T> {}
+unsafe impl<T: Send> Send for RingConsumer<T> {}
+unsafe impl<T: Send> Sync for RingProducer<T> {}
+unsafe impl<T: Send> Sync for RingConsumer<T> {}
 
-    pub fn spin_pop(&self, running: &AtomicBool) -> Option<T> {
-        let backoff = Backoff::new();
-        loop {
-            if let Some(value) = self.try_pop() {
-                return Some(value);
-            }
-            if !running.load(Ordering::Acquire) {
-                return self.try_pop();
-            }
-            backoff.snooze();
+#[cfg(test)]
+mod tests {
+    use super::SpscRing;
+
+    #[test]
+    fn pushes_and_pops_in_order() {
+        let ring = SpscRing::with_capacity(4);
+        let (producer, consumer) = ring.into_split();
+        for value in 0..4 {
+            producer.push(value).unwrap();
         }
+        assert!(producer.push(99).is_err());
+        for expected in 0..4 {
+            assert_eq!(consumer.pop(), Some(expected));
+        }
+        assert!(consumer.pop().is_none());
     }
 }
