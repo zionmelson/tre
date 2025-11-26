@@ -1,6 +1,6 @@
 # cp_amm Swap Guide
 
-This document distills the Anchor IDL at `protocol/pools/cp_amm.json` (program version 0.1.5) into a practical guide for executing swaps against cp_amm pools.
+This document distills the Anchor IDL at `idls/pools/cp_amm.json` (program version 0.1.5) into a practical guide for executing swaps against cp_amm pools.
 
 ## Instruction Overview
 
@@ -11,24 +11,24 @@ Both instructions share the same account set and differ only in the argument str
 
 ## Required Accounts
 
-| Account                  | Writable | Signer | Notes from IDL                                                                                                                                                                                                  |
-| ------------------------ | -------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pool_authority`         | ✗        | ✗      | Must be the fixed authority `HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC` baked into the program. Used to validate the CPI signer seeds for pool vaults.                                                       |
-| `pool`                   | ✓        | ✗      | cp_amm pool state account. Determines vaults, fee config, and pool status (`PoolDisabled` will abort with error 6003).                                                                                          |
-| `input_token_account`    | ✓        | ✗      | User-owned SPL token account that holds the asset you are selling. Must match the mint passed as `token_a_mint` for this instruction invocation.                                                                |
-| `output_token_account`   | ✓        | ✗      | User-owned SPL token account that receives the asset you are buying. Must match `token_b_mint` for this invocation.                                                                                             |
-| `token_a_vault`          | ✓        | ✗      | Pool vault that currently treats its mint as the _input_ side for this swap. Swap direction is enforced by how you order the vaults (`token_a_vault` == input vault, `token_b_vault` == output vault) per call. |
-| `token_b_vault`          | ✓        | ✗      | Pool vault that releases the output tokens.                                                                                                                                                                     |
-| `token_a_mint`           | ✗        | ✗      | Mint of the asset flowing from the user into the pool for this swap.                                                                                                                                            |
-| `token_b_mint`           | ✗        | ✗      | Mint of the asset flowing from the pool back to the user.                                                                                                                                                       |
-| `payer`                  | ✗        | ✓      | User or program authority executing the swap. Pays rent/fees and authorizes token transfers.                                                                                                                    |
-| `token_a_program`        | ✗        | ✗      | SPL Token program ID that owns `token_a_mint`. Use `spl-token-2022` when interacting with Token-2022 mints, otherwise `spl-token`.                                                                              |
-| `token_b_program`        | ✗        | ✗      | SPL Token program ID that owns `token_b_mint`.                                                                                                                                                                  |
-| `referral_token_account` | ✓        | ✗      | Optional account that receives referral fees when the pool is configured with a referral share. Omit or pass `None` if you do not use referrals.                                                                |
-| `event_authority`        | ✗        | ✗      | PDA derived from the literal seed `"__event_authority"`. Required so the program can emit Anchor events (`EvtSwap`, `EvtSwap2`).                                                                                |
-| `program`                | ✗        | ✗      | cp_amm program ID.                                                                                                                                                                                              |
+| Account                  | Writable | Signer | Notes from IDL                                                                                                                                                                                                 |
+| ------------------------ | -------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pool_authority`         | ✗        | ✗      | Must be the fixed authority `HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC` baked into the program. Used to validate the CPI signer seeds for pool vaults.                                                      |
+| `pool`                   | ✓        | ✗      | cp_amm pool state account. Determines vaults, fee config, and pool status (`PoolDisabled` will abort with error 6003).                                                                                         |
+| `input_token_account`    | ✓        | ✗      | User-owned SPL token account that holds the asset you are selling. Must match the mint passed as `token_a_mint` for this instruction invocation.                                                               |
+| `output_token_account`   | ✓        | ✗      | User-owned SPL token account that receives the asset you are buying. Must match `token_b_mint` for this invocation.                                                                                            |
+| `token_a_vault`          | ✓        | ✗      | Pool vault that currently treats its mint as the*input* side for this swap. Swap direction is enforced by how you order the vaults (`token_a_vault` == input vault, `token_b_vault` == output vault) per call. |
+| `token_b_vault`          | ✓        | ✗      | Pool vault that releases the output tokens.                                                                                                                                                                    |
+| `token_a_mint`           | ✗        | ✗      | Mint of the asset flowing from the user into the pool for this swap.                                                                                                                                           |
+| `token_b_mint`           | ✗        | ✗      | Mint of the asset flowing from the pool back to the user.                                                                                                                                                      |
+| `payer`                  | ✗        | ✓      | User or program authority executing the swap. Pays rent/fees and authorizes token transfers.                                                                                                                   |
+| `token_a_program`        | ✗        | ✗      | SPL Token program ID that owns `token_a_mint`. Use `spl-token-2022` when interacting with Token-2022 mints, otherwise `spl-token`.                                                                             |
+| `token_b_program`        | ✗        | ✗      | SPL Token program ID that owns `token_b_mint`.                                                                                                                                                                 |
+| `referral_token_account` | ✓        | ✗      | Optional account that receives referral fees when the pool is configured with a referral share. Omit or pass `None` if you do not use referrals.                                                               |
+| `event_authority`        | ✗        | ✗      | PDA derived from the literal seed `"__event_authority"`. Required so the program can emit Anchor events (`EvtSwap`, `EvtSwap2`).                                                                               |
+| `program`                | ✗        | ✗      | cp_amm program ID.                                                                                                                                                                                             |
 
-> **Directionality reminder:** cp_amm does not infer direction from the pool state. The caller decides which vault/mint pair is `token_a` (input) or `token_b` (output) _per swap_. Always align the four accounts (`input_token_account`, `token_a_vault`, `token_a_mint`, `token_a_program`) with the asset you are sending in.
+> **Directionality reminder:** cp*amm does not infer direction from the pool state. The caller decides which vault/mint pair is `token_a` (input) or `token_b` (output) \_per swap*. Always align the four accounts (`input_token_account`, `token_a_vault`, `token_a_mint`, `token_a_program`) with the asset you are sending in.
 
 ## Argument Layouts
 

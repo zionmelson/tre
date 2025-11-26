@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -13,6 +14,7 @@ use tracing::{debug, info, warn};
 use crate::config::AppConfig;
 use crate::core::{pin_current_thread, Lease, RingProducer, SlabPool};
 use crate::corecast::CoreCastClient;
+use crate::token_pair::TokenPair;
 
 use super::types::{PoolUpdate, TradeUpdate};
 
@@ -54,7 +56,12 @@ fn run(
         let _ = pin_current_thread(core);
     }
 
-    info!(target = "stage0", "ingest online");
+    let pair_allowlist = Arc::new(config.token_pair_allowlist());
+    info!(
+        target = "stage0",
+        pairs = pair_allowlist.len(),
+        "ingest online"
+    );
 
     let client = CoreCastClient::new(config).context("failed to initialize CoreCast client")?;
     let runtime = TokioRuntime::new_current_thread()
@@ -64,8 +71,14 @@ fn run(
 
     runtime.block_on(async move {
         tokio::try_join!(
-            pump_trade_stream(stop.clone(), client.clone(), trade_pool, trade_producer,),
-            pump_pool_stream(stop, client, pool_pool, pool_producer)
+            pump_trade_stream(
+                stop.clone(),
+                client.clone(),
+                trade_pool,
+                trade_producer,
+                pair_allowlist.clone(),
+            ),
+            pump_pool_stream(stop, client, pool_pool, pool_producer, pair_allowlist,)
         )
     })?;
 
@@ -78,6 +91,7 @@ async fn pump_trade_stream(
     client: CoreCastClient,
     pool: SlabPool<TradeUpdate>,
     producer: RingProducer<Lease<TradeUpdate>>,
+    allowlist: Arc<HashSet<TokenPair>>,
 ) -> Result<()> {
     let mut seq = 0u64;
     let mut retry = Duration::from_millis(250);
@@ -93,7 +107,11 @@ async fn pump_trade_stream(
                         Ok(Some(message)) => {
                             if let Some(update) = TradeUpdate::from_corecast(seq, &message) {
                                 seq = seq.wrapping_add(1);
-                                dispatch_trade_update(&pool, &producer, update);
+                                if allowlist
+                                    .contains(&TokenPair::new(&update.sell_mint, &update.buy_mint))
+                                {
+                                    dispatch_trade_update(&pool, &producer, update);
+                                }
                             } else {
                                 debug!(target = "stage0", "dropped malformed trade update");
                             }
@@ -131,6 +149,7 @@ async fn pump_pool_stream(
     client: CoreCastClient,
     pool: SlabPool<PoolUpdate>,
     producer: RingProducer<Lease<PoolUpdate>>,
+    allowlist: Arc<HashSet<TokenPair>>,
 ) -> Result<()> {
     let mut seq = 0u64;
     let mut retry = Duration::from_millis(250);
@@ -146,7 +165,12 @@ async fn pump_pool_stream(
                         Ok(Some(message)) => {
                             if let Some(update) = PoolUpdate::from_corecast(seq, &message) {
                                 seq = seq.wrapping_add(1);
-                                dispatch_pool_update(&pool, &producer, update);
+                                if allowlist.contains(&TokenPair::new(
+                                    &update.base_mint,
+                                    &update.quote_mint,
+                                )) {
+                                    dispatch_pool_update(&pool, &producer, update);
+                                }
                             } else {
                                 debug!(target = "stage0", "dropped malformed pool update");
                             }

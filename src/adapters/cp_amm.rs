@@ -9,14 +9,18 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
 
-use crate::stages::types::{CpAmmPoolExtras, PoolUpdate};
-
-use super::{
-    build_quote_response, quote_from_reserves, ProtocolAdapter, QuoteRequest, QuoteResponse,
-    SwapDirection,
+use crate::stages::types::{
+    CpAmmPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
 };
 
+use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
+
+const BPS_DENOMINATOR: u64 = 10_000;
+
 const CP_AMM_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
+const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
+const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 
 #[derive(Debug, Clone)]
 pub struct CpAmmAdapterConfig {
@@ -200,6 +204,51 @@ impl CpAmmAdapter {
 
         extras
     }
+
+    fn build_snapshot_side(
+        &self,
+        state: &CpAmmState,
+        pool_id: Pubkey,
+        slot: u64,
+        base_to_quote: bool,
+        probe_amount: u64,
+    ) -> Option<PoolQuoteSide> {
+        if probe_amount == 0 {
+            return None;
+        }
+
+        let (input_mint, output_mint) = if base_to_quote {
+            (state.token_a_mint, state.token_b_mint)
+        } else {
+            (state.token_b_mint, state.token_a_mint)
+        };
+
+        let req = QuoteRequest {
+            pool_id,
+            input_mint,
+            output_mint,
+            amount: probe_amount,
+            slot,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let (expected_output, slippage_bps) = simulate_xyk_exact_in(state, &req)?;
+        let effective_price = if probe_amount == 0 {
+            0.0
+        } else {
+            expected_output as f64 / probe_amount as f64
+        };
+
+        Some(PoolQuoteSide {
+            input_mint: input_mint.to_string(),
+            output_mint: output_mint.to_string(),
+            notional: probe_amount,
+            expected_output,
+            fee_bps: state.total_fee_bps(),
+            effective_price,
+            estimated_slippage_bps: slippage_bps,
+        })
+    }
 }
 
 impl ProtocolAdapter for CpAmmAdapter {
@@ -233,15 +282,107 @@ impl ProtocolAdapter for CpAmmAdapter {
             return None;
         }
         let state = self.get_state(&req.pool_id)?;
-        let amount_out = quote_from_reserves(
-            &req,
-            &state.token_a_mint,
-            &state.token_b_mint,
-            state.vault_a_balance,
-            state.vault_b_balance,
-        )?;
-        Some(build_quote_response(req, amount_out))
+        let (amount_out, edge_bps) = simulate_xyk_exact_in(&state, &req)?;
+        let mut response = build_quote_response(req, amount_out);
+        response.edge_bps = edge_bps;
+        Some(response)
     }
+
+    fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
+        let pool_pubkey = parse_pubkey(&snapshot.pool_id)?;
+        let state = self.get_state(&pool_pubkey)?;
+
+        let base_probe = snapshot_probe_amount(state.vault_a_balance)?;
+        let quote_probe = snapshot_probe_amount(state.vault_b_balance)?;
+
+        let base_to_quote =
+            self.build_snapshot_side(&state, pool_pubkey, snapshot.slot, true, base_probe)?;
+        let quote_to_base =
+            self.build_snapshot_side(&state, pool_pubkey, snapshot.slot, false, quote_probe)?;
+
+        Some(PoolBidirectionalQuotes {
+            base_to_quote,
+            quote_to_base,
+        })
+    }
+}
+
+fn simulate_xyk_exact_in(state: &CpAmmState, req: &QuoteRequest) -> Option<(u64, f64)> {
+    if req.amount == 0 {
+        return None;
+    }
+
+    let (reserve_in, reserve_out) = state.resolve_reserves(&req.input_mint, &req.output_mint)?;
+    let total_fee_bps = state.total_fee_bps();
+    let amount_out = xyk_amount_out(reserve_in, reserve_out, req.amount, total_fee_bps)?;
+    let edge_bps =
+        compute_slippage_bps(reserve_in, reserve_out, req.amount, amount_out).unwrap_or(0.0);
+    Some((amount_out, edge_bps))
+}
+
+fn xyk_amount_out(
+    reserve_in: u128,
+    reserve_out: u128,
+    amount_in: u64,
+    fee_bps: u64,
+) -> Option<u64> {
+    if reserve_in == 0 || reserve_out == 0 {
+        return None;
+    }
+
+    let fee_bps = fee_bps.min(BPS_DENOMINATOR);
+    let fee_deduction = (BPS_DENOMINATOR - fee_bps) as u128;
+    let amount_less_fee = (amount_in as u128)
+        .saturating_mul(fee_deduction)
+        .checked_div(BPS_DENOMINATOR as u128)?;
+    if amount_less_fee == 0 {
+        return None;
+    }
+
+    let numerator = amount_less_fee.saturating_mul(reserve_out);
+    let denominator = reserve_in.saturating_add(amount_less_fee);
+    if denominator == 0 {
+        return None;
+    }
+
+    Some((numerator / denominator).min(u64::MAX as u128) as u64)
+}
+
+fn compute_slippage_bps(
+    reserve_in: u128,
+    reserve_out: u128,
+    amount_in: u64,
+    amount_out: u64,
+) -> Option<f64> {
+    if reserve_in == 0 || reserve_out == 0 || amount_in == 0 || amount_out == 0 {
+        return None;
+    }
+
+    let spot_price = reserve_out as f64 / reserve_in as f64;
+    if !spot_price.is_finite() || spot_price <= 0.0 {
+        return None;
+    }
+    let execution_price = amount_out as f64 / amount_in as f64;
+    if !execution_price.is_finite() || execution_price <= 0.0 {
+        return None;
+    }
+
+    Some(((execution_price / spot_price) - 1.0) * BPS_DENOMINATOR as f64)
+}
+
+fn snapshot_probe_amount(reserve: u128) -> Option<u64> {
+    if reserve == 0 {
+        return None;
+    }
+
+    let mut probe = reserve / SNAPSHOT_PROBE_DIVISOR;
+    if probe == 0 {
+        probe = SNAPSHOT_MIN_PROBE_INPUT.min(reserve).max(1u128);
+    }
+
+    probe = probe.min(reserve);
+    probe = probe.max(1u128).min(SNAPSHOT_MAX_PROBE_INPUT);
+    Some(probe as u64)
 }
 
 fn needs_hydration(extras: &CpAmmPoolExtras) -> bool {
@@ -389,6 +530,25 @@ impl CpAmmState {
         }
         Some(self.vault_b_balance as f64 / self.vault_a_balance as f64)
     }
+
+    fn resolve_reserves(&self, input_mint: &Pubkey, output_mint: &Pubkey) -> Option<(u128, u128)> {
+        if *input_mint == self.token_a_mint && *output_mint == self.token_b_mint {
+            Some((self.vault_a_balance, self.vault_b_balance))
+        } else if *input_mint == self.token_b_mint && *output_mint == self.token_a_mint {
+            Some((self.vault_b_balance, self.vault_a_balance))
+        } else {
+            None
+        }
+    }
+
+    fn total_fee_bps(&self) -> u64 {
+        let lp = self.lp_fee_bps.unwrap_or(0) as u64;
+        let protocol = self.protocol_fee_bps.unwrap_or(0) as u64;
+        let referral = self.referral_bps.unwrap_or(0) as u64;
+        lp.saturating_add(protocol)
+            .saturating_add(referral)
+            .min(BPS_DENOMINATOR)
+    }
 }
 
 fn parse_pubkey(value: &str) -> Option<Pubkey> {
@@ -398,6 +558,7 @@ fn parse_pubkey(value: &str) -> Option<Pubkey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stages::types::{PoolSnapshot, PoolUpdateExtensions};
 
     #[test]
     fn parses_pool_account_prefix() {
@@ -418,5 +579,133 @@ mod tests {
         assert_eq!(meta.token_b_mint, token_b_mint);
         assert_eq!(meta.token_a_vault, token_a_vault);
         assert_eq!(meta.token_b_vault, token_b_vault);
+    }
+
+    #[test]
+    fn simulate_xyk_exact_in_respects_slippage() {
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let req = QuoteRequest {
+            pool_id: pool,
+            input_mint: mint_a,
+            output_mint: mint_b,
+            amount: 100_000,
+            slot: 1,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            amp: None,
+            lp_fee_bps: Some(30),
+            protocol_fee_bps: None,
+            referral_bps: None,
+            referral_token_account: None,
+            vault_a_balance: 1_000_000,
+            vault_b_balance: 1_000_000,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+        };
+
+        let (amount_out, edge_bps) =
+            simulate_xyk_exact_in(&state, &req).expect("swap should quote");
+        assert_eq!(amount_out, 90_661);
+        assert!(edge_bps < -900.0);
+    }
+
+    #[test]
+    fn resolve_reserves_fails_for_unknown_direction() {
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let mut state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            amp: None,
+            lp_fee_bps: None,
+            protocol_fee_bps: None,
+            referral_bps: None,
+            referral_token_account: None,
+            vault_a_balance: 1,
+            vault_b_balance: 1,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+        };
+
+        let other_mint = Pubkey::new_unique();
+        assert!(state.resolve_reserves(&other_mint, &mint_b).is_none());
+        state.lp_fee_bps = Some(9_999);
+        state.protocol_fee_bps = Some(9_999);
+        assert_eq!(state.total_fee_bps(), 10_000);
+    }
+
+    #[test]
+    fn bidirectional_quotes_generate_snapshot_sides() {
+        let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default());
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+
+        let state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            amp: None,
+            lp_fee_bps: Some(30),
+            protocol_fee_bps: Some(5),
+            referral_bps: Some(5),
+            referral_token_account: None,
+            vault_a_balance: 1_000_000,
+            vault_b_balance: 2_000_000,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+        };
+
+        adapter.state.insert(pool, state.clone());
+
+        let snapshot = PoolSnapshot {
+            pool_id: pool.to_string(),
+            program_id: CP_AMM_PROGRAM_ID.to_string(),
+            slot: 42,
+            base_mint: mint_a.to_string(),
+            quote_mint: mint_b.to_string(),
+            base_post_amount: state.vault_a_balance,
+            quote_post_amount: state.vault_b_balance,
+            updated_at: Instant::now(),
+            quotes: None,
+            extensions: PoolUpdateExtensions::default(),
+        };
+
+        let quotes = adapter
+            .bidirectional_quotes(&snapshot)
+            .expect("quotes should be generated");
+
+        let expected_base_probe = snapshot_probe_amount(state.vault_a_balance).unwrap();
+        let expected_quote_probe = snapshot_probe_amount(state.vault_b_balance).unwrap();
+
+        assert_eq!(quotes.base_to_quote.notional, expected_base_probe);
+        assert_eq!(quotes.quote_to_base.notional, expected_quote_probe);
+        assert_eq!(quotes.base_to_quote.fee_bps, state.total_fee_bps());
+        assert!(quotes.base_to_quote.expected_output > 0);
+        assert!(quotes.quote_to_base.expected_output > 0);
     }
 }

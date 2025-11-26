@@ -1,6 +1,6 @@
 # Whirlpool Swap Playbook
 
-This document explains how to submit swaps against Whirlpool pools using the on-chain IDL at `protocol/pools/whirlpool.json` (program `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc`, version `0.3.6`). It is intended for searchers/bots that already ingest pool state via the proto pipeline but need a precise checklist for composing `swap` instructions.
+This document explains how to submit swaps against Whirlpool pools using the on-chain IDL at `idls/pools/whirlpool.json` (program `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc`, version `0.3.6`). It is intended for searchers/bots that already ingest pool state via the proto pipeline but need a precise checklist for composing `swap` instructions.
 
 ## Instruction recap
 
@@ -97,4 +97,4 @@ The Anchor instruction definitions in the upstream repo note a few optional-but-
 - Use `twoHopSwap` when routing through an intermediate mint; the IDL shows duplicated tick-array groups plus separate `sqrtPriceLimitOne/Two` arguments.
 - Adaptive-fee pools may require the `memoProgram` and mint-specific token programs (`tokenProgramA/B`) when using the V2 liquidity instructions. These requirements are spelled out in the same IDL file so keep it handy when constructing multi-instruction bundles.
 
-Keep `protocol/pools/whirlpool.json` under version control and regenerate this doc whenever the upstream IDL changes so downstream bots stay in sync with the on-chain contract signature.
+Keep `idls/pools/whirlpool.json` under version control and regenerate this doc whenever the upstream IDL changes so downstream bots stay in sync with the on-chain contract signature.

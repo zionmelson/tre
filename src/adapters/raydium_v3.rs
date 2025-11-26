@@ -1,4 +1,6 @@
 use std::{
+    cmp::Ordering,
+    collections::HashMap,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -8,15 +10,36 @@ use dashmap::DashMap;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
+use uint::construct_uint;
 
-use crate::stages::types::{PoolUpdate, RaydiumV3PoolExtras};
-
-use super::{
-    build_quote_response, quote_from_reserves, ProtocolAdapter, QuoteRequest, QuoteResponse,
-    SwapDirection,
+use crate::stages::types::{
+    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, RaydiumV3PoolExtras,
 };
 
+use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
+
 const RAYDIUM_V3_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const TICK_ARRAY_SEED: &[u8] = b"tick_array";
+const TICK_ARRAY_STATE_DISCRIMINATOR: [u8; 8] = [192, 155, 85, 205, 49, 249, 129, 42];
+const AMM_CONFIG_STATE_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 43, 111];
+const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
+const PUBKEY_BYTES: usize = 32;
+const TICK_ARRAY_TICK_COUNT: usize = 60;
+const TICK_STATE_PADDING_BYTES: usize = 13 * 4;
+const TICK_STATE_SERIALIZED_LEN: usize =
+    4 + 16 + 16 + 16 + 16 + (3 * 16) + TICK_STATE_PADDING_BYTES;
+const MIN_RAYDIUM_TICK_ARRAY_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN
+    + PUBKEY_BYTES
+    + 4
+    + (TICK_STATE_SERIALIZED_LEN * TICK_ARRAY_TICK_COUNT)
+    + 1
+    + 8
+    + 107;
+const MIN_RAYDIUM_AMM_CONFIG_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN + 109;
+
+construct_uint! {
+    pub struct U256(4);
+}
 
 #[derive(Debug, Clone)]
 pub struct RaydiumV3AdapterConfig {
@@ -48,7 +71,7 @@ impl RaydiumV3Adapter {
     pub fn new(config: RaydiumV3AdapterConfig) -> Self {
         let program_id = Pubkey::from_str(RAYDIUM_V3_PROGRAM_ID)
             .expect("static Raydium AMM v3 program id should be valid");
-        let hydrator = RaydiumPoolHydrator::new(&config);
+        let hydrator = RaydiumPoolHydrator::new(&config, program_id);
         if let Some(hydrator_ref) = hydrator.as_ref() {
             info!(
                 target = "adapter::raydium_v3",
@@ -71,6 +94,34 @@ impl RaydiumV3Adapter {
 
     pub fn get_state(&self, pool: &Pubkey) -> Option<RaydiumV3State> {
         self.state.get(pool).map(|entry| entry.clone())
+    }
+
+    fn xyk_amount_out(
+        reserve_in: u128,
+        reserve_out: u128,
+        amount_in: u64,
+        fee_bps: u64,
+    ) -> Option<u64> {
+        if reserve_in == 0 || reserve_out == 0 || amount_in == 0 {
+            return None;
+        }
+
+        let fee_deduction = 10_000u128.saturating_sub(fee_bps as u128);
+        let amount_less_fee = (amount_in as u128)
+            .saturating_mul(fee_deduction)
+            .checked_div(10_000)?;
+        if amount_less_fee == 0 {
+            return None;
+        }
+
+        let numerator = amount_less_fee.saturating_mul(reserve_out);
+        let denominator = reserve_in.saturating_add(amount_less_fee);
+        if denominator == 0 {
+            return None;
+        }
+
+        let amount_out = numerator.checked_div(denominator)?;
+        Some(amount_out.min(u64::MAX as u128) as u64)
     }
 
     fn evict_stale(&self, current_slot: u64) {
@@ -122,7 +173,11 @@ impl RaydiumV3Adapter {
             pool_bump,
             observation_bump,
             vault_bumps,
+            trade_fee_rate,
+            protocol_fee_rate: _,
         } = extras;
+
+        let trade_fee_bps = trade_fee_rate.map(fee_bps_from_hundredth_bip);
 
         let state = RaydiumV3State {
             pool_id: pool_pubkey,
@@ -141,6 +196,7 @@ impl RaydiumV3Adapter {
             pool_bump,
             observation_bump,
             vault_bumps,
+            trade_fee_bps,
         };
 
         trace!(
@@ -173,9 +229,209 @@ impl RaydiumV3Adapter {
             extras.amm_config = extras.amm_config.or(Some(meta.amm_config));
             extras.observation_state = extras.observation_state.or(Some(meta.observation_state));
             extras.pool_bump = extras.pool_bump.or(Some(meta.pool_bump));
+            extras.trade_fee_rate = extras.trade_fee_rate.or(meta.trade_fee_rate);
+            extras.protocol_fee_rate = extras.protocol_fee_rate.or(meta.protocol_fee_rate);
+        }
+
+        if let (Some(spacing), Some(tick)) = (extras.tick_spacing, extras.current_tick) {
+            if let Some(start_index) = active_tick_array_start(spacing, tick) {
+                let _ = hydrator.hydrate_tick_array(pool, start_index);
+                hydrator.hydrate_tick_array_window(pool, spacing, start_index, 2);
+            }
         }
 
         extras
+    }
+
+    fn simulate_clmm_exact_in(&self, state: &RaydiumV3State, req: &QuoteRequest) -> Option<u64> {
+        let hydrator = self.hydrator.as_ref()?;
+        let tick_spacing = state.tick_spacing?;
+        let mut current_tick = state.current_tick?;
+        let sqrt_price_x64 = state.sqrt_price_x64?;
+        let mut liquidity = state.liquidity?;
+        if liquidity == 0 || req.amount == 0 {
+            return None;
+        }
+
+        let (token0, token1) = if mint_is_less(&state.base_mint, &state.quote_mint) {
+            (state.base_mint, state.quote_mint)
+        } else {
+            (state.quote_mint, state.base_mint)
+        };
+
+        let (zero_for_one, valid_direction) =
+            if req.input_mint == token0 && req.output_mint == token1 {
+                (true, true)
+            } else if req.input_mint == token1 && req.output_mint == token0 {
+                (false, true)
+            } else {
+                (false, false)
+            };
+
+        if !valid_direction {
+            return None;
+        }
+
+        let mut sqrt_price_x96 = math::to_x96(sqrt_price_x64);
+        let sqrt_limit_tick = if zero_for_one {
+            math::MIN_TICK
+        } else {
+            math::MAX_TICK
+        };
+        let sqrt_price_limit_x96 = math::sqrt_price_at_tick_x96(sqrt_limit_tick)?;
+
+        let anchor_start = active_tick_array_start(tick_spacing, current_tick);
+        let mut cursor = TickArrayCursor::new(hydrator, state.pool_id, tick_spacing, anchor_start);
+        let mut amount_remaining = req.amount as u128;
+        let mut amount_out_accum = 0u128;
+        let fee_bps = state.trade_fee_bps.unwrap_or(DEFAULT_FEE_BPS);
+        let mut steps = 0usize;
+
+        while amount_remaining > 0 && liquidity > 0 && sqrt_price_x96 != sqrt_price_limit_x96 {
+            steps += 1;
+            if steps > 512 {
+                break;
+            }
+
+            let next_tick = cursor.next_initialized_tick(current_tick, zero_for_one);
+            let mut target_price = sqrt_price_limit_x96;
+            let mut crossing = None;
+            if let Some(tick_info) = next_tick {
+                let tick_price = math::sqrt_price_at_tick_x96(tick_info.index)?;
+                if zero_for_one {
+                    if tick_price > target_price {
+                        target_price = tick_price;
+                    }
+                } else if tick_price < target_price {
+                    target_price = tick_price;
+                }
+                crossing = Some(tick_info);
+            }
+
+            let step = math::compute_swap_step(
+                sqrt_price_x96,
+                target_price,
+                liquidity,
+                amount_remaining,
+                fee_bps,
+                zero_for_one,
+            )?;
+
+            if step.amount_in == 0 {
+                break;
+            }
+
+            sqrt_price_x96 = step.sqrt_price_next;
+            amount_remaining = amount_remaining
+                .saturating_sub(step.amount_in)
+                .saturating_sub(step.fee_amount);
+            amount_out_accum = amount_out_accum.saturating_add(step.amount_out);
+
+            if sqrt_price_x96 == target_price {
+                if let Some(init_tick) = crossing {
+                    current_tick = if zero_for_one {
+                        init_tick.index - 1
+                    } else {
+                        init_tick.index
+                    };
+                    liquidity =
+                        apply_liquidity_delta(liquidity, init_tick.liquidity_net, zero_for_one)?;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if amount_out_accum == 0 {
+            None
+        } else {
+            Some(amount_out_accum.min(u64::MAX as u128) as u64)
+        }
+    }
+
+    fn quote_amount_out(&self, state: &RaydiumV3State, req: &QuoteRequest) -> Option<u64> {
+        if let Some(amount_out) = self.simulate_clmm_exact_in(state, req) {
+            return Some(amount_out);
+        }
+
+        let (reserve_in, reserve_out) =
+            if req.input_mint == state.base_mint && req.output_mint == state.quote_mint {
+                (state.vault_base, state.vault_quote)
+            } else if req.input_mint == state.quote_mint && req.output_mint == state.base_mint {
+                (state.vault_quote, state.vault_base)
+            } else {
+                return None;
+            };
+
+        if reserve_in == 0 || reserve_out == 0 {
+            return None;
+        }
+
+        let fee_bps = state.trade_fee_bps.unwrap_or(DEFAULT_FEE_BPS);
+        Self::xyk_amount_out(reserve_in, reserve_out, req.amount, fee_bps)
+    }
+
+    fn build_snapshot_side(
+        &self,
+        state: &RaydiumV3State,
+        pool_id: Pubkey,
+        slot: u64,
+        base_to_quote: bool,
+        probe_amount: u64,
+    ) -> Option<PoolQuoteSide> {
+        if probe_amount == 0 {
+            return None;
+        }
+
+        let fee_bps = state.trade_fee_bps.unwrap_or(DEFAULT_FEE_BPS);
+        let (input_mint, output_mint) = if base_to_quote {
+            (state.base_mint, state.quote_mint)
+        } else {
+            (state.quote_mint, state.base_mint)
+        };
+
+        let req = QuoteRequest {
+            pool_id,
+            input_mint,
+            output_mint,
+            amount: probe_amount,
+            slot,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let amount_out = self.quote_amount_out(state, &req)?;
+        let execution_price = if probe_amount == 0 {
+            0.0
+        } else {
+            amount_out as f64 / probe_amount as f64
+        };
+
+        let reference_price = match state.mid_price() {
+            Some(mid) if mid > 0.0 => {
+                if base_to_quote {
+                    Some(mid)
+                } else {
+                    Some(1.0 / mid)
+                }
+            }
+            _ => None,
+        };
+
+        let slippage = reference_price
+            .map(|reference| compute_slippage_bps(reference, execution_price))
+            .unwrap_or_default();
+
+        Some(PoolQuoteSide {
+            input_mint: input_mint.to_string(),
+            output_mint: output_mint.to_string(),
+            notional: probe_amount,
+            expected_output: amount_out,
+            fee_bps,
+            effective_price: execution_price,
+            estimated_slippage_bps: slippage,
+        })
     }
 }
 
@@ -211,16 +467,33 @@ impl ProtocolAdapter for RaydiumV3Adapter {
             return None;
         }
         let state = self.get_state(&req.pool_id)?;
-        let amount_out = quote_from_reserves(
-            &req,
-            &state.base_mint,
-            &state.quote_mint,
-            state.vault_base,
-            state.vault_quote,
-        )?;
+        let amount_out = self.quote_amount_out(&state, &req)?;
         Some(build_quote_response(req, amount_out))
     }
+
+    fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
+        let pool_pubkey = parse_pubkey(&snapshot.pool_id)?;
+        let state = self.get_state(&pool_pubkey)?;
+
+        let base_probe = snapshot_probe_amount(state.vault_base)?;
+        let quote_probe = snapshot_probe_amount(state.vault_quote)?;
+
+        let base_to_quote =
+            self.build_snapshot_side(&state, pool_pubkey, snapshot.slot, true, base_probe)?;
+        let quote_to_base =
+            self.build_snapshot_side(&state, pool_pubkey, snapshot.slot, false, quote_probe)?;
+
+        Some(PoolBidirectionalQuotes {
+            base_to_quote,
+            quote_to_base,
+        })
+    }
 }
+
+const DEFAULT_FEE_BPS: u64 = 25; // assumed Raydium taker fee (0.25%)
+const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
+const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
+const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 
 #[derive(Debug, Clone)]
 pub struct RaydiumV3State {
@@ -240,6 +513,7 @@ pub struct RaydiumV3State {
     pub pool_bump: Option<u8>,
     pub observation_bump: Option<u8>,
     pub vault_bumps: Option<[u8; 2]>,
+    pub trade_fee_bps: Option<u64>,
 }
 
 impl RaydiumV3State {
@@ -255,6 +529,28 @@ fn parse_pubkey(value: &str) -> Option<Pubkey> {
     Pubkey::from_str(value).ok()
 }
 
+fn snapshot_probe_amount(reserve: u128) -> Option<u64> {
+    if reserve == 0 {
+        return None;
+    }
+
+    let mut probe = reserve / SNAPSHOT_PROBE_DIVISOR;
+    if probe == 0 {
+        probe = SNAPSHOT_MIN_PROBE_INPUT.min(reserve).max(1u128);
+    }
+
+    probe = probe.min(reserve);
+    probe = probe.max(1u128).min(SNAPSHOT_MAX_PROBE_INPUT);
+    Some(probe as u64)
+}
+
+fn compute_slippage_bps(reference: f64, execution: f64) -> f64 {
+    if !reference.is_finite() || reference == 0.0 || !execution.is_finite() {
+        return 0.0;
+    }
+    (((reference - execution) / reference) * 10_000.0).abs()
+}
+
 fn needs_hydration(extras: &RaydiumV3PoolExtras) -> bool {
     extras.tick_spacing.is_none()
         || extras.sqrt_price_x64.is_none()
@@ -263,6 +559,56 @@ fn needs_hydration(extras: &RaydiumV3PoolExtras) -> bool {
         || extras.amm_config.is_none()
         || extras.observation_state.is_none()
         || extras.pool_bump.is_none()
+        || extras.trade_fee_rate.is_none()
+}
+
+fn active_tick_array_start(tick_spacing: i32, tick_index: i32) -> Option<i32> {
+    if tick_spacing == 0 {
+        return None;
+    }
+    let spacing = (tick_spacing as i64).abs();
+    if spacing == 0 {
+        return None;
+    }
+    let ticks_per_array = spacing.checked_mul(TICK_ARRAY_TICK_COUNT as i64)?;
+    let tick = tick_index as i64;
+    let mut quotient = tick / ticks_per_array;
+    if tick < 0 && tick % ticks_per_array != 0 {
+        quotient -= 1;
+    }
+    let start = quotient.checked_mul(ticks_per_array)?;
+    if start < i64::from(i32::MIN) || start > i64::from(i32::MAX) {
+        return None;
+    }
+    Some(start as i32)
+}
+
+fn tick_array_span(tick_spacing: i32) -> Option<i32> {
+    tick_spacing
+        .checked_mul(TICK_ARRAY_TICK_COUNT as i32)
+        .map(|value| value.abs())
+}
+
+fn mint_is_less(a: &Pubkey, b: &Pubkey) -> bool {
+    a.to_bytes().cmp(&b.to_bytes()) == Ordering::Less
+}
+
+fn apply_liquidity_delta(liquidity: u128, liquidity_net: i128, zero_for_one: bool) -> Option<u128> {
+    let mut current = i128::try_from(liquidity).ok()?;
+    current = if zero_for_one {
+        current.checked_sub(liquidity_net)?
+    } else {
+        current.checked_add(liquidity_net)?
+    };
+    if current < 0 {
+        None
+    } else {
+        Some(current as u128)
+    }
+}
+
+fn fee_bps_from_hundredth_bip(rate: u32) -> u64 {
+    ((rate as u64).saturating_add(50)) / 100
 }
 
 #[derive(Clone, Debug)]
@@ -274,15 +620,147 @@ struct HydratedPoolMeta {
     liquidity: u128,
     current_tick: i32,
     pool_bump: u8,
+    trade_fee_rate: Option<u32>,
+    protocol_fee_rate: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct HydratedAmmConfig {
+    trade_fee_rate: u32,
+    protocol_fee_rate: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct HydratedTickArray {
+    address: Pubkey,
+    pool_id: Pubkey,
+    start_tick_index: i32,
+    ticks: Vec<HydratedTick>,
+    initialized_tick_count: u8,
+    recent_epoch: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct HydratedTick {
+    tick: i32,
+    liquidity_net: i128,
+    liquidity_gross: u128,
+    fee_growth_outside_0_x64: u128,
+    fee_growth_outside_1_x64: u128,
+    reward_growths_outside_x64: [u128; 3],
+}
+
+struct TickArrayCursor<'a> {
+    hydrator: &'a RaydiumPoolHydrator,
+    pool: Pubkey,
+    tick_spacing: i32,
+    cache: HashMap<i32, HydratedTickArray>,
+}
+
+impl<'a> TickArrayCursor<'a> {
+    fn new(
+        hydrator: &'a RaydiumPoolHydrator,
+        pool: Pubkey,
+        tick_spacing: i32,
+        anchor_start: Option<i32>,
+    ) -> Self {
+        if let Some(start) = anchor_start {
+            hydrator.hydrate_tick_array_window(pool, tick_spacing, start, 2);
+        }
+        Self {
+            hydrator,
+            pool,
+            tick_spacing,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn get_array(&mut self, start: i32) -> Option<HydratedTickArray> {
+        if let Some(entry) = self.cache.get(&start) {
+            return Some(entry.clone());
+        }
+        if let Some(entry) = self.hydrator.hydrate_tick_array(self.pool, start) {
+            self.cache.insert(start, entry.clone());
+            self.hydrator
+                .hydrate_tick_array_window(self.pool, self.tick_spacing, start, 1);
+            return Some(entry);
+        }
+        None
+    }
+
+    fn next_initialized_tick(
+        &mut self,
+        current_tick: i32,
+        zero_for_one: bool,
+    ) -> Option<InitializedTick> {
+        let span = tick_array_span(self.tick_spacing)?;
+        let mut array_start = active_tick_array_start(self.tick_spacing, current_tick)?;
+        let mut search_tick = current_tick;
+
+        const MAX_ARRAYS: usize = 16;
+        for _ in 0..MAX_ARRAYS {
+            let array = self.get_array(array_start)?;
+            if zero_for_one {
+                if let Some(tick) = find_prev_initialized(&array, search_tick) {
+                    return Some(tick);
+                }
+                array_start = array_start.checked_sub(span)?;
+                search_tick = array_start + span - self.tick_spacing;
+            } else {
+                if let Some(tick) = find_next_initialized(&array, search_tick) {
+                    return Some(tick);
+                }
+                array_start = array_start.checked_add(span)?;
+                search_tick = array_start - self.tick_spacing;
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InitializedTick {
+    index: i32,
+    liquidity_net: i128,
+}
+
+fn find_prev_initialized(array: &HydratedTickArray, current_tick: i32) -> Option<InitializedTick> {
+    for tick in array.ticks.iter().rev() {
+        if tick.tick <= current_tick && tick.liquidity_gross > 0 {
+            return Some(InitializedTick {
+                index: tick.tick,
+                liquidity_net: tick.liquidity_net,
+            });
+        }
+    }
+    None
+}
+
+fn find_next_initialized(array: &HydratedTickArray, current_tick: i32) -> Option<InitializedTick> {
+    for tick in &array.ticks {
+        if tick.tick > current_tick && tick.liquidity_gross > 0 {
+            return Some(InitializedTick {
+                index: tick.tick,
+                liquidity_net: tick.liquidity_net,
+            });
+        }
+    }
+    None
 }
 
 struct RaydiumPoolHydrator {
+    program_id: Pubkey,
     clients: Vec<Arc<RpcClient>>,
-    cache: DashMap<Pubkey, HydratedPoolMeta>,
+    pool_cache: DashMap<Pubkey, HydratedPoolMeta>,
+    tick_array_cache: DashMap<(Pubkey, i32), HydratedTickArray>,
+    amm_config_cache: DashMap<Pubkey, HydratedAmmConfig>,
 }
 
 impl RaydiumPoolHydrator {
-    fn new(config: &RaydiumV3AdapterConfig) -> Option<Self> {
+    fn new(config: &RaydiumV3AdapterConfig, program_id: Pubkey) -> Option<Self> {
         if config.rpc_endpoints.is_empty() {
             return None;
         }
@@ -299,8 +777,11 @@ impl RaydiumPoolHydrator {
         }
 
         Some(Self {
+            program_id,
             clients,
-            cache: DashMap::new(),
+            pool_cache: DashMap::new(),
+            tick_array_cache: DashMap::new(),
+            amm_config_cache: DashMap::new(),
         })
     }
 
@@ -309,19 +790,100 @@ impl RaydiumPoolHydrator {
     }
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        if let Some(meta) = self.cache.get(&pool) {
-            return Some(meta.clone());
+        if let Some(entry) = self.pool_cache.get(&pool) {
+            let mut meta = entry.clone();
+            drop(entry);
+            if self.attach_config_fees(&mut meta) {
+                self.pool_cache.insert(pool, meta.clone());
+            }
+            return Some(meta);
         }
 
-        self.fetch_from_rpc(pool)
+        self.fetch_pool_from_rpc(pool)
     }
 
-    fn fetch_from_rpc(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
+    pub fn hydrate_tick_array(
+        &self,
+        pool: Pubkey,
+        start_tick_index: i32,
+    ) -> Option<HydratedTickArray> {
+        let key = (pool, start_tick_index);
+        if let Some(entry) = self.tick_array_cache.get(&key) {
+            return Some(entry.clone());
+        }
+
+        self.fetch_tick_array_from_rpc(pool, start_tick_index)
+    }
+
+    pub fn hydrate_tick_array_window(
+        &self,
+        pool: Pubkey,
+        tick_spacing: i32,
+        anchor_start: i32,
+        look_ahead: u32,
+    ) {
+        if look_ahead == 0 || tick_spacing == 0 {
+            return;
+        }
+        let span = tick_spacing
+            .abs()
+            .saturating_mul(TICK_ARRAY_TICK_COUNT as i32);
+        if span == 0 {
+            return;
+        }
+        let mut starts = Vec::with_capacity((look_ahead as usize) * 2);
+        for step in 1..=look_ahead {
+            let offset = span.saturating_mul(step as i32);
+            if let Some(start) = anchor_start.checked_add(offset) {
+                starts.push(start);
+            }
+            if let Some(start) = anchor_start.checked_sub(offset) {
+                starts.push(start);
+            }
+        }
+        self.hydrate_tick_arrays(pool, &starts);
+    }
+
+    pub fn hydrate_tick_arrays(
+        &self,
+        pool: Pubkey,
+        start_tick_indices: &[i32],
+    ) -> Vec<HydratedTickArray> {
+        if start_tick_indices.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = Vec::new();
+        let mut missing = Vec::new();
+        for start in start_tick_indices {
+            let key = (pool, *start);
+            if let Some(entry) = self.tick_array_cache.get(&key) {
+                results.push(entry.clone());
+            } else {
+                missing.push(*start);
+            }
+        }
+
+        if !missing.is_empty() {
+            self.fetch_tick_arrays_from_rpc(pool, &missing);
+            for start in missing {
+                let key = (pool, start);
+                if let Some(entry) = self.tick_array_cache.get(&key) {
+                    results.push(entry.clone());
+                }
+            }
+        }
+
+        results
+    }
+
+    fn fetch_pool_from_rpc(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
         for client in &self.clients {
             match client.get_account(&pool) {
                 Ok(account) => {
-                    if let Some(meta) = parse_pool_account(&account.data) {
-                        self.cache.insert(pool, meta.clone());
+                    if let Some(mut meta) = parse_pool_account(&account.data) {
+                        self.attach_config_fees(&mut meta);
+                        self.pool_cache.insert(pool, meta.clone());
                         return Some(meta);
                     } else {
                         warn!(
@@ -344,10 +906,188 @@ impl RaydiumPoolHydrator {
 
         None
     }
+
+    fn hydrate_amm_config(&self, amm_config: Pubkey) -> Option<HydratedAmmConfig> {
+        if let Some(entry) = self.amm_config_cache.get(&amm_config) {
+            return Some(entry.clone());
+        }
+
+        self.fetch_amm_config_from_rpc(amm_config)
+    }
+
+    fn fetch_amm_config_from_rpc(&self, amm_config: Pubkey) -> Option<HydratedAmmConfig> {
+        for client in &self.clients {
+            match client.get_account(&amm_config) {
+                Ok(account) => {
+                    if let Some(config) = parse_amm_config_account(&account.data) {
+                        self.amm_config_cache.insert(amm_config, config.clone());
+                        return Some(config);
+                    } else {
+                        warn!(
+                            target = "adapter::raydium_v3",
+                            amm_config = %amm_config,
+                            "unexpected raydium amm config layout"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        target = "adapter::raydium_v3",
+                        amm_config = %amm_config,
+                        %error,
+                        "failed to fetch raydium amm config"
+                    );
+                }
+            }
+        }
+
+        None
+    }
+
+    fn attach_config_fees(&self, meta: &mut HydratedPoolMeta) -> bool {
+        let trade_missing = meta.trade_fee_rate.is_none();
+        let protocol_missing = meta.protocol_fee_rate.is_none();
+        if !(trade_missing || protocol_missing) {
+            return false;
+        }
+
+        let Some(config) = self.hydrate_amm_config(meta.amm_config) else {
+            return false;
+        };
+
+        if trade_missing {
+            meta.trade_fee_rate = Some(config.trade_fee_rate);
+        }
+        if protocol_missing {
+            meta.protocol_fee_rate = Some(config.protocol_fee_rate);
+        }
+        true
+    }
+
+    fn fetch_tick_array_from_rpc(
+        &self,
+        pool: Pubkey,
+        start_tick_index: i32,
+    ) -> Option<HydratedTickArray> {
+        let address = derive_tick_array_address(&self.program_id, &pool, start_tick_index);
+
+        for client in &self.clients {
+            match client.get_account(&address) {
+                Ok(account) => {
+                    if let Some(array) = parse_tick_array_account(address, &account.data) {
+                        if array.pool_id != pool {
+                            warn!(
+                                target = "adapter::raydium_v3",
+                                pool = %pool,
+                                tick_array = %address,
+                                "tick array pool mismatch"
+                            );
+                            return None;
+                        }
+                        if array.start_tick_index != start_tick_index {
+                            warn!(
+                                target = "adapter::raydium_v3",
+                                pool = %pool,
+                                tick_array = %address,
+                                actual = array.start_tick_index,
+                                requested = start_tick_index,
+                                "tick array start index mismatch"
+                            );
+                            return None;
+                        }
+                        self.tick_array_cache
+                            .insert((pool, start_tick_index), array.clone());
+                        return Some(array);
+                    } else {
+                        warn!(
+                            target = "adapter::raydium_v3",
+                            pool = %pool,
+                            tick_array = %address,
+                            "unexpected raydium tick array layout"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        target = "adapter::raydium_v3",
+                        pool = %pool,
+                        tick_array = %address,
+                        %error,
+                        "failed to fetch raydium tick array"
+                    );
+                }
+            }
+        }
+
+        None
+    }
+
+    fn fetch_tick_arrays_from_rpc(&self, pool: Pubkey, tick_starts: &[i32]) {
+        if tick_starts.is_empty() {
+            return;
+        }
+
+        let addresses: Vec<Pubkey> = tick_starts
+            .iter()
+            .map(|start| derive_tick_array_address(&self.program_id, &pool, *start))
+            .collect();
+
+        for client in &self.clients {
+            match client.get_multiple_accounts(&addresses) {
+                Ok(accounts) => {
+                    for ((start, address), account_opt) in tick_starts
+                        .iter()
+                        .zip(addresses.iter())
+                        .zip(accounts.into_iter())
+                    {
+                        if let Some(account) = account_opt {
+                            if let Some(array) = parse_tick_array_account(*address, &account.data) {
+                                if array.pool_id != pool || array.start_tick_index != *start {
+                                    continue;
+                                }
+                                self.tick_array_cache.insert((pool, *start), array.clone());
+                            }
+                        }
+                    }
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        target = "adapter::raydium_v3",
+                        pool = %pool,
+                        %error,
+                        "failed to fetch multiple tick arrays"
+                    );
+                }
+            }
+        }
+    }
 }
 
 const MIN_RAYDIUM_POOL_ACCOUNT_LEN: usize = 269;
-const PUBKEY_BYTES: usize = 32;
+
+fn parse_amm_config_account(data: &[u8]) -> Option<HydratedAmmConfig> {
+    if data.len() < MIN_RAYDIUM_AMM_CONFIG_ACCOUNT_LEN {
+        return None;
+    }
+
+    let discriminator = data.get(0..ANCHOR_DISCRIMINATOR_LEN)?;
+    if discriminator != AMM_CONFIG_STATE_DISCRIMINATOR {
+        return None;
+    }
+
+    let mut cursor = ANCHOR_DISCRIMINATOR_LEN;
+    read_u8(data, &mut cursor)?; // bump
+    read_u16(data, &mut cursor)?; // index
+    skip_pubkey(data, &mut cursor)?; // owner
+    let protocol_fee_rate = read_u32(data, &mut cursor)?;
+    let trade_fee_rate = read_u32(data, &mut cursor)?;
+
+    Some(HydratedAmmConfig {
+        trade_fee_rate,
+        protocol_fee_rate,
+    })
+}
 
 fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
     if data.len() < MIN_RAYDIUM_POOL_ACCOUNT_LEN {
@@ -384,6 +1124,58 @@ fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
         liquidity,
         current_tick,
         pool_bump,
+        trade_fee_rate: None,
+        protocol_fee_rate: None,
+    })
+}
+
+fn parse_tick_array_account(address: Pubkey, data: &[u8]) -> Option<HydratedTickArray> {
+    if data.len() < MIN_RAYDIUM_TICK_ARRAY_ACCOUNT_LEN {
+        return None;
+    }
+
+    let discriminator = data.get(0..ANCHOR_DISCRIMINATOR_LEN)?;
+    if discriminator != TICK_ARRAY_STATE_DISCRIMINATOR {
+        return None;
+    }
+
+    let mut cursor = ANCHOR_DISCRIMINATOR_LEN;
+    let pool_id = read_pubkey(data, &mut cursor)?;
+    let start_tick_index = read_i32(data, &mut cursor)?;
+
+    let mut ticks = Vec::with_capacity(TICK_ARRAY_TICK_COUNT);
+    for _ in 0..TICK_ARRAY_TICK_COUNT {
+        let tick = read_i32(data, &mut cursor)?;
+        let liquidity_net = read_i128(data, &mut cursor)?;
+        let liquidity_gross = read_u128(data, &mut cursor)?;
+        let fee_growth_outside_0_x64 = read_u128(data, &mut cursor)?;
+        let fee_growth_outside_1_x64 = read_u128(data, &mut cursor)?;
+        let mut reward_growths_outside_x64 = [0u128; 3];
+        for reward in reward_growths_outside_x64.iter_mut() {
+            *reward = read_u128(data, &mut cursor)?;
+        }
+        skip_bytes(data, &mut cursor, TICK_STATE_PADDING_BYTES)?;
+        ticks.push(HydratedTick {
+            tick,
+            liquidity_net,
+            liquidity_gross,
+            fee_growth_outside_0_x64,
+            fee_growth_outside_1_x64,
+            reward_growths_outside_x64,
+        });
+    }
+
+    let initialized_tick_count = read_u8(data, &mut cursor)?;
+    let recent_epoch = read_u64(data, &mut cursor)?;
+    skip_bytes(data, &mut cursor, 107)?;
+
+    Some(HydratedTickArray {
+        address,
+        pool_id,
+        start_tick_index,
+        ticks,
+        initialized_tick_count,
+        recent_epoch,
     })
 }
 
@@ -394,6 +1186,18 @@ fn skip_pubkey(data: &[u8], cursor: &mut usize) -> Option<()> {
     } else {
         None
     }
+}
+
+fn derive_tick_array_address(program_id: &Pubkey, pool: &Pubkey, start_tick_index: i32) -> Pubkey {
+    let (address, _) = Pubkey::find_program_address(
+        &[
+            TICK_ARRAY_SEED,
+            pool.as_ref(),
+            &start_tick_index.to_le_bytes(),
+        ],
+        program_id,
+    );
+    address
 }
 
 fn read_pubkey(data: &[u8], cursor: &mut usize) -> Option<Pubkey> {
@@ -414,6 +1218,24 @@ fn read_u16(data: &[u8], cursor: &mut usize) -> Option<u16> {
     Some(u16::from_le_bytes(bytes))
 }
 
+fn read_u32(data: &[u8], cursor: &mut usize) -> Option<u32> {
+    let end = cursor.checked_add(4)?;
+    let slice = data.get(*cursor..end)?;
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(slice);
+    *cursor = end;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(data: &[u8], cursor: &mut usize) -> Option<u64> {
+    let end = cursor.checked_add(8)?;
+    let slice = data.get(*cursor..end)?;
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(slice);
+    *cursor = end;
+    Some(u64::from_le_bytes(bytes))
+}
+
 fn read_u128(data: &[u8], cursor: &mut usize) -> Option<u128> {
     let end = cursor.checked_add(16)?;
     let slice = data.get(*cursor..end)?;
@@ -421,6 +1243,13 @@ fn read_u128(data: &[u8], cursor: &mut usize) -> Option<u128> {
     bytes.copy_from_slice(slice);
     *cursor = end;
     Some(u128::from_le_bytes(bytes))
+}
+
+fn read_u8(data: &[u8], cursor: &mut usize) -> Option<u8> {
+    let end = cursor.checked_add(1)?;
+    let value = *data.get(*cursor)?;
+    *cursor = end;
+    Some(value)
 }
 
 fn read_i32(data: &[u8], cursor: &mut usize) -> Option<i32> {
@@ -432,16 +1261,285 @@ fn read_i32(data: &[u8], cursor: &mut usize) -> Option<i32> {
     Some(i32::from_le_bytes(bytes))
 }
 
+fn read_i128(data: &[u8], cursor: &mut usize) -> Option<i128> {
+    let end = cursor.checked_add(16)?;
+    let slice = data.get(*cursor..end)?;
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(slice);
+    *cursor = end;
+    Some(i128::from_le_bytes(bytes))
+}
+
+fn skip_bytes(data: &[u8], cursor: &mut usize, len: usize) -> Option<()> {
+    *cursor = cursor.checked_add(len)?;
+    if *cursor <= data.len() {
+        Some(())
+    } else {
+        None
+    }
+}
+
+mod math {
+    use super::U256;
+    use once_cell::sync::Lazy;
+
+    pub const MIN_TICK: i32 = -443_636;
+    pub const MAX_TICK: i32 = 443_636;
+    const FEE_DENOMINATOR: u128 = 10_000;
+
+    static TICK_RATIO_FACTORS: Lazy<[U256; 20]> = Lazy::new(|| {
+        [
+            U256::from_str_radix("fffcb933bd6fad37aa2d162d1a594001", 16).unwrap(),
+            U256::from_str_radix("fff97272373d413259a46990580e213a", 16).unwrap(),
+            U256::from_str_radix("fff2e50f5f656932ef12357cf3c7fdcc", 16).unwrap(),
+            U256::from_str_radix("ffe5caca7e10e4e61c3624eaa0941cd0", 16).unwrap(),
+            U256::from_str_radix("ffcb9843d60f6159c9db58835c926644", 16).unwrap(),
+            U256::from_str_radix("ff973b41fa98c081472e6896dfb254c0", 16).unwrap(),
+            U256::from_str_radix("ff2ea16466c96a3843ec78b326b52861", 16).unwrap(),
+            U256::from_str_radix("fe5dee046a99a2a811c461f1969c3053", 16).unwrap(),
+            U256::from_str_radix("fcbe86c7900a88aedcffc83b479aa3a4", 16).unwrap(),
+            U256::from_str_radix("f987a7253ac413176f2b074cf7815e54", 16).unwrap(),
+            U256::from_str_radix("f3392b0822b70005940c7a398e4b70f3", 16).unwrap(),
+            U256::from_str_radix("e7159475a2c29b7443b29c7fa6e889d9", 16).unwrap(),
+            U256::from_str_radix("d097f3bdfd2022b8845ad8f792aa5825", 16).unwrap(),
+            U256::from_str_radix("a9f746462d870fdf8a65dc1f90e061e5", 16).unwrap(),
+            U256::from_str_radix("70d869a156d2a1b890bb3df62baf32f7", 16).unwrap(),
+            U256::from_str_radix("31be135f97d08fd981231505542fcfa6", 16).unwrap(),
+            U256::from_str_radix("9aa508b5b7a84e1c677de54f3e99bc9", 16).unwrap(),
+            U256::from_str_radix("5d6af8dedb81196699c329225ee604", 16).unwrap(),
+            U256::from_str_radix("2216e584f5fa1ea926041bedfe98", 16).unwrap(),
+            U256::from_str_radix("48a170391f7dc42444e8fa2", 16).unwrap(),
+        ]
+    });
+
+    #[derive(Debug, Clone)]
+    pub struct SwapStepResult {
+        pub sqrt_price_next: U256,
+        pub amount_in: u128,
+        pub amount_out: u128,
+        pub fee_amount: u128,
+    }
+
+    pub fn to_x96(value_x64: u128) -> U256 {
+        U256::from(value_x64) << 32
+    }
+
+    pub fn sqrt_price_at_tick_x96(tick: i32) -> Option<U256> {
+        if tick < MIN_TICK || tick > MAX_TICK {
+            return None;
+        }
+        let mut ratio = if (tick & 1) != 0 {
+            TICK_RATIO_FACTORS[0]
+        } else {
+            U256::one() << 128
+        };
+        let abs_tick = tick.abs();
+        for (i, factor) in TICK_RATIO_FACTORS.iter().enumerate().skip(1) {
+            if (abs_tick & (1 << i)) != 0 {
+                ratio = mul_shift_128(ratio, *factor);
+            }
+        }
+
+        if tick > 0 {
+            ratio = U256::MAX / ratio;
+        }
+
+        let remainder_mask = (U256::one() << 32) - U256::one();
+        let mut ratio_shifted = ratio >> 32;
+        if ratio & remainder_mask != U256::zero() {
+            ratio_shifted += U256::one();
+        }
+        Some(ratio_shifted)
+    }
+
+    pub fn compute_swap_step(
+        sqrt_price_current: U256,
+        sqrt_price_target: U256,
+        liquidity: u128,
+        amount_remaining: u128,
+        fee_bps: u64,
+        zero_for_one: bool,
+    ) -> Option<SwapStepResult> {
+        if liquidity == 0 {
+            return None;
+        }
+
+        let fee_bps = fee_bps as u128;
+        if fee_bps >= FEE_DENOMINATOR {
+            return None;
+        }
+
+        let amount_less_fee = amount_remaining
+            .checked_mul(FEE_DENOMINATOR - fee_bps)?
+            .checked_div(FEE_DENOMINATOR)?;
+
+        let (sqrt_price_next, amount_in, amount_out) = if zero_for_one {
+            let amount_in_max =
+                get_amount0_delta(liquidity, sqrt_price_target, sqrt_price_current, true)?;
+            if amount_less_fee >= amount_in_max {
+                let out =
+                    get_amount1_delta(liquidity, sqrt_price_target, sqrt_price_current, false)?;
+                (sqrt_price_target, amount_in_max, out)
+            } else {
+                let next_price = get_next_sqrt_price_from_input(
+                    sqrt_price_current,
+                    liquidity,
+                    amount_less_fee,
+                    true,
+                )?;
+                let in_amount = get_amount0_delta(liquidity, next_price, sqrt_price_current, true)?;
+                let out = get_amount1_delta(liquidity, next_price, sqrt_price_current, false)?;
+                (next_price, in_amount, out)
+            }
+        } else {
+            let amount_in_max =
+                get_amount1_delta(liquidity, sqrt_price_current, sqrt_price_target, true)?;
+            if amount_less_fee >= amount_in_max {
+                let out =
+                    get_amount0_delta(liquidity, sqrt_price_current, sqrt_price_target, false)?;
+                (sqrt_price_target, amount_in_max, out)
+            } else {
+                let next_price = get_next_sqrt_price_from_input(
+                    sqrt_price_current,
+                    liquidity,
+                    amount_less_fee,
+                    false,
+                )?;
+                let in_amount = get_amount1_delta(liquidity, sqrt_price_current, next_price, true)?;
+                let out = get_amount0_delta(liquidity, sqrt_price_current, next_price, false)?;
+                (next_price, in_amount, out)
+            }
+        };
+
+        let fee_amount = mul_div_round_up(amount_in, fee_bps, FEE_DENOMINATOR - fee_bps)?;
+
+        Some(SwapStepResult {
+            sqrt_price_next,
+            amount_in,
+            amount_out,
+            fee_amount,
+        })
+    }
+
+    fn get_amount0_delta(
+        liquidity: u128,
+        sqrt_a: U256,
+        sqrt_b: U256,
+        round_up: bool,
+    ) -> Option<u128> {
+        let (sqrt_low, sqrt_high) = if sqrt_a > sqrt_b {
+            (sqrt_b, sqrt_a)
+        } else {
+            (sqrt_a, sqrt_b)
+        };
+        if sqrt_low == U256::zero() {
+            return None;
+        }
+        let numerator1 = U256::from(liquidity) << 96;
+        let numerator2 = sqrt_high.checked_sub(sqrt_low)?;
+        let numerator = numerator1.checked_mul(numerator2)?;
+        let denominator = sqrt_high.checked_mul(sqrt_low)?;
+        let quotient = if round_up {
+            div_round_up(numerator, denominator)
+        } else {
+            numerator.checked_div(denominator)?
+        };
+        quotient.try_into().ok()
+    }
+
+    fn get_amount1_delta(
+        liquidity: u128,
+        sqrt_a: U256,
+        sqrt_b: U256,
+        round_up: bool,
+    ) -> Option<u128> {
+        let (sqrt_low, sqrt_high) = if sqrt_a > sqrt_b {
+            (sqrt_b, sqrt_a)
+        } else {
+            (sqrt_a, sqrt_b)
+        };
+        let diff = sqrt_high.checked_sub(sqrt_low)?;
+        let numerator = U256::from(liquidity).checked_mul(diff)?;
+        let denominator = U256::one() << 96;
+        let quotient = if round_up {
+            div_round_up(numerator, denominator)
+        } else {
+            numerator >> 96
+        };
+        quotient.try_into().ok()
+    }
+
+    fn get_next_sqrt_price_from_input(
+        sqrt_price_current: U256,
+        liquidity: u128,
+        amount_in: u128,
+        zero_for_one: bool,
+    ) -> Option<U256> {
+        if amount_in == 0 {
+            return Some(sqrt_price_current);
+        }
+        let liquidity_u256 = U256::from(liquidity);
+        if zero_for_one {
+            let numerator = sqrt_price_current
+                .checked_mul(liquidity_u256)?
+                .checked_mul(U256::one() << 96)?;
+            let denominator = liquidity_u256
+                .checked_mul(U256::one() << 96)?
+                .checked_add(U256::from(amount_in).checked_mul(sqrt_price_current)?)?;
+            Some(numerator.checked_div(denominator)?)
+        } else {
+            let increment = (U256::from(amount_in) << 96).checked_div(liquidity_u256)?;
+            Some(sqrt_price_current.checked_add(increment)?)
+        }
+    }
+
+    fn mul_shift_128(value: U256, multiplier: U256) -> U256 {
+        value.checked_mul(multiplier).unwrap_or(U256::zero()) >> 128
+    }
+
+    fn div_round_up(numerator: U256, denominator: U256) -> U256 {
+        let mut quotient = numerator / denominator;
+        if numerator % denominator != U256::zero() {
+            quotient += U256::one();
+        }
+        quotient
+    }
+
+    fn mul_div_round_up(value: u128, numerator: u128, denominator: u128) -> Option<u128> {
+        if denominator == 0 {
+            return None;
+        }
+        let result = div_round_up(
+            U256::from(value).checked_mul(U256::from(numerator))?,
+            U256::from(denominator),
+        );
+        result.try_into().ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{sqrt_price_at_tick_x96, U256};
+
+        #[test]
+        fn sqrt_price_at_zero_tick_matches_one() {
+            let sqrt = sqrt_price_at_tick_x96(0).expect("tick 0");
+            assert_eq!(sqrt, U256::one() << 96);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_sdk::pubkey::Pubkey;
 
     #[test]
-    fn parses_minimal_pool_account_view() {
+    fn parses_pool_account_layout() {
         let mut data = vec![0u8; MIN_RAYDIUM_POOL_ACCOUNT_LEN];
-        data[0] = 5;
+        let mut cursor = 0;
+        data[cursor] = 5; // bump
+        cursor += 1;
 
-        let mut cursor = 1;
         cursor = write_pubkey(&mut data, cursor, &Pubkey::new_unique()); // amm_config
         cursor = write_pubkey(&mut data, cursor, &Pubkey::new_unique()); // owner
         cursor = write_pubkey(&mut data, cursor, &Pubkey::new_unique()); // token_mint_0
@@ -449,7 +1547,7 @@ mod tests {
         cursor = write_pubkey(&mut data, cursor, &Pubkey::new_unique()); // token_vault_0
         cursor = write_pubkey(&mut data, cursor, &Pubkey::new_unique()); // token_vault_1
         let observation = Pubkey::new_unique();
-        cursor = write_pubkey(&mut data, cursor, &observation); // observation_key
+        cursor = write_pubkey(&mut data, cursor, &observation); // observation
 
         data[cursor] = 6;
         data[cursor + 1] = 9;
@@ -477,6 +1575,78 @@ mod tests {
         assert_eq!(meta.sqrt_price_x64, sqrt_price_x64);
         assert_eq!(meta.current_tick, current_tick);
         assert_eq!(meta.observation_state, observation);
+    }
+
+    #[test]
+    fn parses_tick_array_account_layout() {
+        let pool = Pubkey::new_unique();
+        let address = Pubkey::new_unique();
+        let start_tick_index: i32 = -120;
+        let mut data = vec![0u8; MIN_RAYDIUM_TICK_ARRAY_ACCOUNT_LEN];
+        data[..ANCHOR_DISCRIMINATOR_LEN].copy_from_slice(&TICK_ARRAY_STATE_DISCRIMINATOR);
+        let mut cursor = ANCHOR_DISCRIMINATOR_LEN;
+        cursor = write_pubkey(&mut data, cursor, &pool);
+        data[cursor..cursor + 4].copy_from_slice(&start_tick_index.to_le_bytes());
+        cursor += 4;
+
+        for idx in 0..TICK_ARRAY_TICK_COUNT {
+            let tick_value = start_tick_index + (idx as i32 * 2);
+            data[cursor..cursor + 4].copy_from_slice(&tick_value.to_le_bytes());
+            cursor += 4;
+
+            let liquidity_net: i128 = idx as i128 - 30;
+            data[cursor..cursor + 16].copy_from_slice(&liquidity_net.to_le_bytes());
+            cursor += 16;
+
+            let liquidity_gross: u128 = (idx as u128) * 1_000;
+            data[cursor..cursor + 16].copy_from_slice(&liquidity_gross.to_le_bytes());
+            cursor += 16;
+
+            let fee0: u128 = 1_000 + idx as u128;
+            data[cursor..cursor + 16].copy_from_slice(&fee0.to_le_bytes());
+            cursor += 16;
+
+            let fee1: u128 = 2_000 + idx as u128;
+            data[cursor..cursor + 16].copy_from_slice(&fee1.to_le_bytes());
+            cursor += 16;
+
+            for reward in 0..3 {
+                let reward_value: u128 = (reward as u128) << 32 | idx as u128;
+                data[cursor..cursor + 16].copy_from_slice(&reward_value.to_le_bytes());
+                cursor += 16;
+            }
+
+            cursor += TICK_STATE_PADDING_BYTES;
+        }
+
+        let initialized_count = 12u8;
+        data[cursor] = initialized_count;
+        cursor += 1;
+
+        let recent_epoch: u64 = 99;
+        data[cursor..cursor + 8].copy_from_slice(&recent_epoch.to_le_bytes());
+
+        let array = parse_tick_array_account(address, &data).expect("tick array should parse");
+        assert_eq!(array.address, address);
+        assert_eq!(array.pool_id, pool);
+        assert_eq!(array.start_tick_index, start_tick_index);
+        assert_eq!(array.initialized_tick_count, initialized_count);
+        assert_eq!(array.recent_epoch, recent_epoch);
+        assert_eq!(array.ticks.len(), TICK_ARRAY_TICK_COUNT);
+        let first = &array.ticks[0];
+        assert_eq!(first.tick, start_tick_index);
+        assert_eq!(first.liquidity_net, -30);
+        assert_eq!(first.liquidity_gross, 0);
+        assert_eq!(first.reward_growths_outside_x64[0], 0);
+        let last = &array.ticks[TICK_ARRAY_TICK_COUNT - 1];
+        assert_eq!(
+            last.tick,
+            start_tick_index + ((TICK_ARRAY_TICK_COUNT as i32 - 1) * 2)
+        );
+        assert_eq!(
+            last.fee_growth_outside_1_x64,
+            2_000 + (TICK_ARRAY_TICK_COUNT as u128 - 1)
+        );
     }
 
     fn write_pubkey(buffer: &mut [u8], cursor: usize, key: &Pubkey) -> usize {

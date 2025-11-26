@@ -66,6 +66,8 @@ impl PoolUpdate {
             base_post_amount: self.base_post_amount,
             quote_post_amount: self.quote_post_amount,
             updated_at: Instant::now(),
+            quotes: None,
+            extensions: self.extensions,
         }
     }
 }
@@ -84,13 +86,16 @@ impl PoolUpdateExtensions {
     fn from_pool_event(event: &PoolLiquidityChangeEvent) -> Self {
         let raydium_v3 = parse_raydium_v3_extras(event);
         let cp_amm = parse_cp_amm_extras(event);
+        let lb_clmm = parse_lb_clmm_extras(event);
+        let lifinity_v2 = parse_lifinity_extras(event);
+        let whirlpool = parse_whirlpool_extras(event);
         Self {
             instruction: event.instruction.clone(),
             raydium_v3,
             cp_amm,
-            lb_clmm: None,
-            lifinity_v2: None,
-            whirlpool: None,
+            lb_clmm,
+            lifinity_v2,
+            whirlpool,
         }
     }
 }
@@ -105,6 +110,16 @@ static RAYDIUM_V3_PROGRAM_PUBKEY: Lazy<Pubkey> =
 const POOL_SEED: &[u8] = b"pool";
 const OBSERVATION_SEED: &[u8] = b"observation";
 const VAULT_SEED: &[u8] = b"pool_vault";
+const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+static LB_CLMM_PROGRAM_PUBKEY: Lazy<Pubkey> =
+    Lazy::new(|| Pubkey::from_str(LB_CLMM_PROGRAM_ID).expect("static lb_clmm program id"));
+const LIFINITY_V2_PROGRAM_ID: &str = "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c";
+static LIFINITY_V2_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str(LIFINITY_V2_PROGRAM_ID).expect("static Lifinity AMM v2 program id")
+});
+const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN";
+static WHIRLPOOL_PROGRAM_PUBKEY: Lazy<Pubkey> =
+    Lazy::new(|| Pubkey::from_str(WHIRLPOOL_PROGRAM_ID).expect("static Whirlpool program id"));
 
 fn parse_raydium_v3_extras(event: &PoolLiquidityChangeEvent) -> Option<RaydiumV3PoolExtras> {
     let dex = event.dex.as_ref()?;
@@ -177,6 +192,8 @@ fn extras_if_any(extras: RaydiumV3PoolExtras) -> Option<RaydiumV3PoolExtras> {
         && extras.pool_bump.is_none()
         && extras.observation_bump.is_none()
         && extras.vault_bumps.is_none()
+        && extras.trade_fee_rate.is_none()
+        && extras.protocol_fee_rate.is_none()
     {
         None
     } else {
@@ -222,6 +239,176 @@ fn parse_cp_amm_extras(event: &PoolLiquidityChangeEvent) -> Option<CpAmmPoolExtr
     );
 
     Some(extras)
+}
+
+fn parse_lb_clmm_extras(event: &PoolLiquidityChangeEvent) -> Option<LbClmmPoolExtras> {
+    let dex = event.dex.as_ref()?;
+    let program_key = pubkey_from_bytes(&dex.program_address)?;
+    if program_key != *LB_CLMM_PROGRAM_PUBKEY {
+        return None;
+    }
+
+    let instruction = event.instruction.as_ref()?;
+    let program = instruction.program.as_ref()?;
+    let lookup = InstructionAccountLookup::new(program, &instruction.accounts);
+    let market = event.market.as_ref();
+    let base_currency = market.and_then(|m| m.base_currency.as_ref());
+    let quote_currency = market.and_then(|m| m.quote_currency.as_ref());
+    let base_side = event.base_currency.as_ref();
+    let quote_side = event.quote_currency.as_ref();
+
+    let mut extras = LbClmmPoolExtras::default();
+    extras.reserve_x = lookup_account_string(&lookup, &["reserve_x", "reserveX"]);
+    extras.reserve_y = lookup_account_string(&lookup, &["reserve_y", "reserveY"]);
+    extras.token_x_mint = lookup_account_string(&lookup, &["token_x_mint", "tokenXMint"])
+        .or_else(|| currency_mint(base_currency).map(|pk| pk.to_string()));
+    extras.token_y_mint = lookup_account_string(&lookup, &["token_y_mint", "tokenYMint"])
+        .or_else(|| currency_mint(quote_currency).map(|pk| pk.to_string()));
+    extras.token_x_program = lookup_account_string(&lookup, &["token_x_program", "tokenXProgram"])
+        .or_else(|| currency_program(base_currency).map(|pk| pk.to_string()));
+    extras.token_y_program = lookup_account_string(&lookup, &["token_y_program", "tokenYProgram"])
+        .or_else(|| currency_program(quote_currency).map(|pk| pk.to_string()));
+    extras.oracle = lookup_account_string(&lookup, &["oracle"]);
+    extras.bin_array_bitmap_extension = lookup_account_string(
+        &lookup,
+        &["bin_array_bitmap_extension", "binArrayBitmapExtension"],
+    );
+    extras.host_fee_account = lookup_account_string(&lookup, &["host_fee_in", "hostFeeIn"]);
+
+    if let Some(side) = base_side {
+        extras.reserve_x_balance = Some(side.post_amount as u128);
+    }
+    if let Some(side) = quote_side {
+        extras.reserve_y_balance = Some(side.post_amount as u128);
+    }
+
+    lb_clmm_extras_if_any(extras)
+}
+
+fn lb_clmm_extras_if_any(extras: LbClmmPoolExtras) -> Option<LbClmmPoolExtras> {
+    if extras.reserve_x.is_none()
+        && extras.reserve_y.is_none()
+        && extras.token_x_mint.is_none()
+        && extras.token_y_mint.is_none()
+        && extras.token_x_program.is_none()
+        && extras.token_y_program.is_none()
+        && extras.oracle.is_none()
+        && extras.bin_array_bitmap_extension.is_none()
+        && extras.host_fee_account.is_none()
+        && extras.reserve_x_balance.is_none()
+        && extras.reserve_y_balance.is_none()
+    {
+        None
+    } else {
+        Some(extras)
+    }
+}
+
+fn parse_lifinity_extras(event: &PoolLiquidityChangeEvent) -> Option<LifinityPoolExtras> {
+    let dex = event.dex.as_ref()?;
+    let program_key = pubkey_from_bytes(&dex.program_address)?;
+    if program_key != *LIFINITY_V2_PROGRAM_PUBKEY {
+        return None;
+    }
+
+    let instruction = event.instruction.as_ref()?;
+    let program = instruction.program.as_ref()?;
+    let lookup = InstructionAccountLookup::new(program, &instruction.accounts);
+
+    let mut extras = LifinityPoolExtras::default();
+    extras.authority = lookup_account_string(&lookup, &["authority", "Authority"]);
+    extras.token_program = lookup_account_string(&lookup, &["tokenProgram", "token_program"]);
+    extras.token_a_vault = lookup_account_string(
+        &lookup,
+        &["swapSource", "tokenA", "token_a_vault", "tokenAAccount"],
+    );
+    extras.token_b_vault = lookup_account_string(
+        &lookup,
+        &[
+            "swapDestination",
+            "tokenB",
+            "token_b_vault",
+            "tokenBAccount",
+        ],
+    );
+    extras.pool_mint = lookup_account_string(&lookup, &["poolMint", "pool_mint"]);
+    extras.fee_account = lookup_account_string(&lookup, &["feeAccount", "fee_account"]);
+    extras.oracle_main = lookup_account_string(
+        &lookup,
+        &["oracleMainAccount", "oracle_main_account", "oracleMain"],
+    );
+    extras.oracle_sub = lookup_account_string(
+        &lookup,
+        &["oracleSubAccount", "oracle_sub_account", "oracleSub"],
+    );
+    extras.oracle_pc = lookup_account_string(
+        &lookup,
+        &["oraclePcAccount", "oracle_pc_account", "oraclePc"],
+    );
+
+    if let Some(base_side) = event.base_currency.as_ref() {
+        extras.vault_a_balance = Some(base_side.post_amount as u128);
+    }
+    if let Some(quote_side) = event.quote_currency.as_ref() {
+        extras.vault_b_balance = Some(quote_side.post_amount as u128);
+    }
+
+    lifinity_extras_if_any(extras)
+}
+
+fn lifinity_extras_if_any(extras: LifinityPoolExtras) -> Option<LifinityPoolExtras> {
+    if extras.authority.is_none()
+        && extras.token_a_vault.is_none()
+        && extras.token_b_vault.is_none()
+        && extras.pool_mint.is_none()
+        && extras.fee_account.is_none()
+        && extras.token_program.is_none()
+        && extras.oracle_main.is_none()
+        && extras.oracle_sub.is_none()
+        && extras.oracle_pc.is_none()
+        && extras.vault_a_balance.is_none()
+        && extras.vault_b_balance.is_none()
+    {
+        None
+    } else {
+        Some(extras)
+    }
+}
+
+fn parse_whirlpool_extras(event: &PoolLiquidityChangeEvent) -> Option<WhirlpoolPoolExtras> {
+    let dex = event.dex.as_ref()?;
+    let program_key = pubkey_from_bytes(&dex.program_address)?;
+    if program_key != *WHIRLPOOL_PROGRAM_PUBKEY {
+        return None;
+    }
+
+    let instruction = event.instruction.as_ref()?;
+    let program = instruction.program.as_ref()?;
+    let lookup = InstructionAccountLookup::new(program, &instruction.accounts);
+
+    let mut extras = WhirlpoolPoolExtras::default();
+    extras.token_vault_a = lookup_account_string(&lookup, &["tokenVaultA", "token_vault_a"]);
+    extras.token_vault_b = lookup_account_string(&lookup, &["tokenVaultB", "token_vault_b"]);
+    extras.oracle = lookup_account_string(&lookup, &["oracle"]);
+    extras.tick_array0 = lookup_account_string(&lookup, &["tickArray0", "tick_array0"]);
+    extras.tick_array1 = lookup_account_string(&lookup, &["tickArray1", "tick_array1"]);
+    extras.tick_array2 = lookup_account_string(&lookup, &["tickArray2", "tick_array2"]);
+
+    whirlpool_extras_if_any(extras)
+}
+
+fn whirlpool_extras_if_any(extras: WhirlpoolPoolExtras) -> Option<WhirlpoolPoolExtras> {
+    if extras.token_vault_a.is_none()
+        && extras.token_vault_b.is_none()
+        && extras.oracle.is_none()
+        && extras.tick_array0.is_none()
+        && extras.tick_array1.is_none()
+        && extras.tick_array2.is_none()
+    {
+        None
+    } else {
+        Some(extras)
+    }
 }
 
 fn lookup_account_string(lookup: &InstructionAccountLookup, aliases: &[&str]) -> Option<String> {
@@ -342,6 +529,13 @@ mod tests {
             market_address: pool_id.to_bytes().to_vec(),
             base_currency: Some(proto_currency(base)),
             quote_currency: Some(proto_currency(quote)),
+        }
+    }
+    fn lifinity_dex_info() -> DexInfo {
+        DexInfo {
+            program_address: LIFINITY_V2_PROGRAM_PUBKEY.to_bytes().to_vec(),
+            protocol_name: String::from("Lifinity v2"),
+            protocol_family: String::from("Lifinity"),
         }
     }
 
@@ -515,6 +709,78 @@ mod tests {
             Some(referral_token_account.to_string())
         );
     }
+
+    #[test]
+    fn lifinity_extras_parse_accounts() {
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let token_a_vault = Pubkey::new_unique();
+        let token_b_vault = Pubkey::new_unique();
+        let pool_mint = Pubkey::new_unique();
+        let fee_account = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
+        let oracle_main = Pubkey::new_unique();
+        let oracle_sub = Pubkey::new_unique();
+        let oracle_pc = Pubkey::new_unique();
+
+        let account_names = vec![
+            "authority",
+            "amm",
+            "userTransferAuthority",
+            "sourceInfo",
+            "destinationInfo",
+            "swapSource",
+            "swapDestination",
+            "poolMint",
+            "feeAccount",
+            "tokenProgram",
+            "oracleMainAccount",
+            "oracleSubAccount",
+            "oraclePcAccount",
+        ];
+
+        let accounts = vec![
+            proto_account(&authority),
+            proto_account(&pool),
+            proto_account(&Pubkey::new_unique()),
+            proto_account(&Pubkey::new_unique()),
+            proto_account(&Pubkey::new_unique()),
+            proto_account(&token_a_vault),
+            proto_account(&token_b_vault),
+            proto_account(&pool_mint),
+            proto_account(&fee_account),
+            proto_account(&token_program),
+            proto_account(&oracle_main),
+            proto_account(&oracle_sub),
+            proto_account(&oracle_pc),
+        ];
+
+        let instruction = parsed_instruction(account_names, accounts);
+
+        let event = PoolLiquidityChangeEvent {
+            instruction_index: 0,
+            dex: Some(lifinity_dex_info()),
+            market: Some(raydium_market(&pool, &base_mint, &quote_mint)),
+            base_currency: Some(pool_side(42)),
+            quote_currency: Some(pool_side(84)),
+            instruction: Some(instruction),
+        };
+
+        let extras = parse_lifinity_extras(&event).expect("extras must parse");
+        assert_eq!(extras.authority, Some(authority.to_string()));
+        assert_eq!(extras.token_a_vault, Some(token_a_vault.to_string()));
+        assert_eq!(extras.token_b_vault, Some(token_b_vault.to_string()));
+        assert_eq!(extras.pool_mint, Some(pool_mint.to_string()));
+        assert_eq!(extras.fee_account, Some(fee_account.to_string()));
+        assert_eq!(extras.token_program, Some(token_program.to_string()));
+        assert_eq!(extras.oracle_main, Some(oracle_main.to_string()));
+        assert_eq!(extras.oracle_sub, Some(oracle_sub.to_string()));
+        assert_eq!(extras.oracle_pc, Some(oracle_pc.to_string()));
+        assert_eq!(extras.vault_a_balance, Some(42));
+        assert_eq!(extras.vault_b_balance, Some(84));
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -528,6 +794,8 @@ pub struct RaydiumV3PoolExtras {
     pub pool_bump: Option<u8>,
     pub observation_bump: Option<u8>,
     pub vault_bumps: Option<[u8; 2]>,
+    pub trade_fee_rate: Option<u32>,
+    pub protocol_fee_rate: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -564,6 +832,27 @@ pub struct LbClmmPoolExtras {
     pub reserve_x_balance: Option<u128>,
     pub reserve_y_balance: Option<u128>,
     pub volatility_bps: Option<u16>,
+    pub bin_arrays: Vec<LbClmmBinArrayExtras>,
+    pub active_bitmap: Option<LbClmmBitmapExtras>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LbClmmBinArrayExtras {
+    pub start_bin_id: i32,
+    pub bins: Vec<LbClmmBinLiquidityExtras>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LbClmmBinLiquidityExtras {
+    pub bin_id: i32,
+    pub liquidity_x: u128,
+    pub liquidity_y: u128,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LbClmmBitmapExtras {
+    pub anchor_bin_id: i32,
+    pub bitmap: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -582,6 +871,16 @@ pub struct LifinityPoolExtras {
     pub host_fee_bps: Option<u16>,
     pub std_spread_bps: Option<u16>,
     pub spread_buffer_bps: Option<u16>,
+    pub spread_coefficient_bps: Option<u32>,
+    pub price_buffer_coin_bps: Option<i32>,
+    pub price_buffer_pc_bps: Option<i32>,
+    pub fee_trade_bps: Option<u16>,
+    pub fee_platform_bps: Option<u16>,
+    pub oracle_main_slot_limit: Option<u64>,
+    pub oracle_sub_confidence_limit: Option<u64>,
+    pub oracle_sub_slot_limit: Option<u64>,
+    pub oracle_pc_confidence_limit: Option<u64>,
+    pub oracle_pc_slot_limit: Option<u64>,
     pub vault_a_balance: Option<u128>,
     pub vault_b_balance: Option<u128>,
     pub freeze_trade: Option<u8>,
@@ -596,12 +895,55 @@ pub struct WhirlpoolPoolExtras {
     pub tick_spacing: Option<i32>,
     pub sqrt_price_x64: Option<u128>,
     pub liquidity: Option<u128>,
+    pub tick_current_index: Option<i32>,
     pub fee_rate: Option<u16>,
     pub protocol_fee_rate: Option<u16>,
     pub oracle: Option<String>,
     pub tick_array0: Option<String>,
     pub tick_array1: Option<String>,
     pub tick_array2: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolQuoteDirection {
+    BaseToQuote,
+    QuoteToBase,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolQuoteSide {
+    pub input_mint: String,
+    pub output_mint: String,
+    pub notional: u64,
+    pub expected_output: u64,
+    pub fee_bps: u64,
+    pub effective_price: f64,
+    pub estimated_slippage_bps: f64,
+}
+
+impl PoolQuoteSide {
+    pub fn price(&self) -> f64 {
+        self.effective_price
+    }
+
+    pub fn slippage_bps(&self) -> f64 {
+        self.estimated_slippage_bps
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolBidirectionalQuotes {
+    pub base_to_quote: PoolQuoteSide,
+    pub quote_to_base: PoolQuoteSide,
+}
+
+impl PoolBidirectionalQuotes {
+    pub fn side(&self, direction: PoolQuoteDirection) -> &PoolQuoteSide {
+        match direction {
+            PoolQuoteDirection::BaseToQuote => &self.base_to_quote,
+            PoolQuoteDirection::QuoteToBase => &self.quote_to_base,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -614,6 +956,8 @@ pub struct PoolSnapshot {
     pub base_post_amount: u128,
     pub quote_post_amount: u128,
     pub updated_at: Instant,
+    pub quotes: Option<PoolBidirectionalQuotes>,
+    pub extensions: PoolUpdateExtensions,
 }
 
 impl PoolSnapshot {
@@ -622,6 +966,22 @@ impl PoolSnapshot {
             return 0.0;
         }
         self.quote_post_amount as f64 / self.base_post_amount as f64
+    }
+
+    pub fn quotes(&self) -> Option<&PoolBidirectionalQuotes> {
+        self.quotes.as_ref()
+    }
+
+    pub fn quote(&self, direction: PoolQuoteDirection) -> Option<&PoolQuoteSide> {
+        self.quotes().map(|bundle| bundle.side(direction))
+    }
+
+    pub fn base_to_quote_quote(&self) -> Option<&PoolQuoteSide> {
+        self.quotes().map(|bundle| &bundle.base_to_quote)
+    }
+
+    pub fn quote_to_base_quote(&self) -> Option<&PoolQuoteSide> {
+        self.quotes().map(|bundle| &bundle.quote_to_base)
     }
 }
 
@@ -685,6 +1045,7 @@ pub struct Opportunity {
     pub pool_snapshot: Option<PoolSnapshot>,
     pub estimated_edge_bps: f64,
     pub created_at: Instant,
+    pub route_plan: Option<RoutePlan>,
 }
 
 fn encode_pubkey(bytes: &[u8]) -> String {
@@ -716,6 +1077,7 @@ impl Opportunity {
             pool_snapshot: snapshot,
             estimated_edge_bps,
             created_at: Instant::now(),
+            route_plan: None,
         }
     }
 }
@@ -735,6 +1097,8 @@ pub struct BundleCandidate {
     pub trade_signature: String,
     pub estimated_edge_bps: f64,
     pub created_at: Instant,
+    pub route_plan: Option<RoutePlan>,
+    pub instructions: Vec<PlannedInstruction>,
 }
 
 impl BundleCandidate {
@@ -746,6 +1110,38 @@ impl BundleCandidate {
             trade_signature: opportunity.trade.signature.clone(),
             estimated_edge_bps: opportunity.estimated_edge_bps,
             created_at: Instant::now(),
+            route_plan: opportunity.route_plan.clone(),
+            instructions: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutePlan {
+    pub start_mint: String,
+    pub end_mint: String,
+    pub legs: Vec<RouteLegPlan>,
+    pub estimated_final_output_amount: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteLegPlan {
+    pub pool_id: String,
+    pub program_id: String,
+    pub input_mint: String,
+    pub output_mint: String,
+    pub input_amount: u64,
+    pub estimated_output_amount: u64,
+    pub effective_price: f64,
+    pub fee_bps: u64,
+    pub estimated_slippage_bps: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlannedInstruction {
+    pub pool_id: String,
+    pub program_id: String,
+    pub input_mint: String,
+    pub output_mint: String,
+    pub amount: u64,
 }

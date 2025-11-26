@@ -1,6 +1,6 @@
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
-use crate::stages::types::PoolUpdate;
+use crate::stages::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate};
 
 mod cp_amm;
 mod lb_clmm;
@@ -30,7 +30,15 @@ pub trait ProtocolAdapter: Send + Sync {
         None
     }
 
+    fn quote_exact_out(&self, _req: QuoteRequest) -> Option<QuoteResponse> {
+        None
+    }
+
     fn build_swap_template(&self, _quote: &QuoteResponse) -> Option<SwapTemplate> {
+        None
+    }
+
+    fn bidirectional_quotes(&self, _snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         None
     }
 }
@@ -84,26 +92,6 @@ pub struct TemplateContext {
     pub requires_memo: bool,
 }
 
-pub(crate) fn quote_from_reserves(
-    req: &QuoteRequest,
-    mint_a: &Pubkey,
-    mint_b: &Pubkey,
-    reserve_a: u128,
-    reserve_b: u128,
-) -> Option<u64> {
-    if reserve_a == 0 || reserve_b == 0 {
-        return None;
-    }
-
-    if req.input_mint == *mint_a && req.output_mint == *mint_b {
-        Some(mul_div_u64(req.amount, reserve_b, reserve_a))
-    } else if req.input_mint == *mint_b && req.output_mint == *mint_a {
-        Some(mul_div_u64(req.amount, reserve_a, reserve_b))
-    } else {
-        None
-    }
-}
-
 pub(crate) fn quote_from_price(
     req: &QuoteRequest,
     mint_a: &Pubkey,
@@ -132,14 +120,6 @@ pub(crate) fn build_quote_response(req: QuoteRequest, amount_out: u64) -> QuoteR
         status: QuoteStatus::Ok,
         request: req,
     }
-}
-
-fn mul_div_u64(amount: u64, numerator: u128, denominator: u128) -> u64 {
-    if denominator == 0 {
-        return 0;
-    }
-    let product = (amount as u128).saturating_mul(numerator);
-    (product / denominator).min(u64::MAX as u128) as u64
 }
 
 fn mul_div_price(amount: u64, price: f64) -> u64 {

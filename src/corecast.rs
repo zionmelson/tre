@@ -1,18 +1,24 @@
-use std::{fs, io::Cursor, sync::Arc, time::Duration};
+use std::{
+    fs,
+    io::Cursor,
+    ops::{Deref, DerefMut},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{anyhow, ensure, Context, Result};
-use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnectorBuilder;
 use reqwest::{Client as HttpClient, ClientBuilder as HttpClientBuilder};
 use rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore};
 use rustls_pemfile as pemfile;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{
     metadata::{Ascii, MetadataValue},
     service::{interceptor::InterceptedService, Interceptor},
     transport::{Channel, Endpoint},
     Request, Status, Streaming,
 };
-use tracing::info;
+use tracing::{debug, info};
 use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
 
@@ -48,7 +54,8 @@ pub struct CoreCastClient {
     config: Arc<AppConfig>,
     endpoint: String,
     http_client: HttpClient,
-    tls_config: Arc<ClientConfig>,
+    channel_pool: Arc<ChannelPool>,
+    auth_header: MetadataValue<Ascii>,
 }
 
 impl CoreCastClient {
@@ -78,18 +85,28 @@ impl CoreCastClient {
 
         let has_custom_ca = ca_pem.is_some();
         let tls_config = build_tls_config(ca_pem.as_ref().map(|buf| buf.as_slice()))?;
+        let auth_header = make_auth_header(&config.corecast.authorization)?;
+        let channel_pool = ChannelPool::new(
+            endpoint.clone(),
+            tls_config,
+            config.corecast.cache.warm_capacity,
+            config.corecast.cache.channel_capacity,
+        );
 
         let client = Self {
-            config,
+            config: config.clone(),
             endpoint,
             http_client,
-            tls_config,
+            channel_pool: Arc::new(channel_pool),
+            auth_header,
         };
 
         info!(
             target = "corecast",
             endpoint = %client.endpoint,
             has_custom_ca,
+            warm_capacity = config.corecast.cache.warm_capacity,
+            channel_capacity = config.corecast.cache.channel_capacity,
             "CoreCast client initialized"
         );
 
@@ -97,7 +114,7 @@ impl CoreCastClient {
     }
 
     pub async fn connect(&self) -> Result<()> {
-        let _client = self.build_proto_client().await?;
+        let _lease = self.channel_pool.acquire().await?;
         Ok(())
     }
 
@@ -105,9 +122,23 @@ impl CoreCastClient {
         self.http_client.clone()
     }
 
-    pub async fn trade_stream(&self) -> Result<Streaming<DexTradeStreamMessage>> {
+    pub async fn trade_stream(&self) -> Result<CoreCastStream<DexTradeStreamMessage>> {
         info!(target = "corecast", endpoint = %self.endpoint, "subscribing to trade stream");
-        let mut client = self.build_proto_client().await?;
+        let lease = self.channel_pool.acquire().await?;
+        self.subscribe_trades(lease).await
+    }
+
+    pub async fn pool_stream(&self) -> Result<CoreCastStream<PoolLiquidityChangeStreamMessage>> {
+        info!(target = "corecast", endpoint = %self.endpoint, "subscribing to pool stream");
+        let lease = self.channel_pool.acquire().await?;
+        self.subscribe_pools(lease).await
+    }
+
+    async fn subscribe_trades(
+        &self,
+        lease: ChannelLease,
+    ) -> Result<CoreCastStream<DexTradeStreamMessage>> {
+        let mut client = self.proto_client_from_lease(&lease);
         let request = SubscribeTradesRequest {
             program: Some(self.program_filter()?),
             ..Default::default()
@@ -116,12 +147,14 @@ impl CoreCastClient {
             .dex_trades(Request::new(request))
             .await
             .with_context(|| "failed to subscribe to CoreCast dex trades")?;
-        Ok(response.into_inner())
+        Ok(CoreCastStream::new(response.into_inner(), lease))
     }
 
-    pub async fn pool_stream(&self) -> Result<Streaming<PoolLiquidityChangeStreamMessage>> {
-        info!(target = "corecast", endpoint = %self.endpoint, "subscribing to pool stream");
-        let mut client = self.build_proto_client().await?;
+    async fn subscribe_pools(
+        &self,
+        lease: ChannelLease,
+    ) -> Result<CoreCastStream<PoolLiquidityChangeStreamMessage>> {
+        let mut client = self.proto_client_from_lease(&lease);
         let request = SubscribePoolsRequest {
             program: Some(self.program_filter()?),
             ..Default::default()
@@ -130,40 +163,14 @@ impl CoreCastClient {
             .dex_pools(Request::new(request))
             .await
             .with_context(|| "failed to subscribe to CoreCast dex pools")?;
-        Ok(response.into_inner())
+        Ok(CoreCastStream::new(response.into_inner(), lease))
     }
 
-    async fn build_proto_client(&self) -> Result<ProtoClient> {
-        info!(target = "corecast", endpoint = %self.endpoint, "dialing CoreCast gRPC endpoint");
-        let endpoint = Endpoint::from_shared(self.endpoint_uri())
-            .with_context(|| "invalid CoreCast endpoint")?
-            .connect_timeout(Duration::from_secs(5))
-            .tcp_nodelay(true);
-
-        let connector = self.https_connector();
-
-        let channel = endpoint
-            .connect_with_connector(connector)
-            .await
-            .with_context(|| "failed to connect to CoreCast endpoint")?;
-        info!(target = "corecast", "CoreCast gRPC channel established");
-        let auth_header = make_auth_header(&self.config.corecast.authorization)?;
-        Ok(ProtoCoreCast::with_interceptor(
-            channel,
-            AuthInterceptor::new(auth_header),
-        ))
-    }
-
-    fn endpoint_uri(&self) -> String {
-        self.endpoint.clone()
-    }
-
-    fn https_connector(&self) -> hyper_rustls::HttpsConnector<HttpConnector> {
-        HttpsConnectorBuilder::new()
-            .with_tls_config((*self.tls_config).clone())
-            .https_or_http()
-            .enable_http2()
-            .build()
+    fn proto_client_from_lease(&self, lease: &ChannelLease) -> ProtoClient {
+        ProtoCoreCast::with_interceptor(
+            lease.channel().clone(),
+            AuthInterceptor::new(self.auth_header.clone()),
+        )
     }
 
     fn program_filter(&self) -> Result<AddressFilter> {
@@ -178,6 +185,167 @@ impl CoreCastClient {
 }
 
 type ProtoClient = ProtoCoreCast<InterceptedService<Channel, AuthInterceptor>>;
+
+pub struct CoreCastStream<T> {
+    inner: Streaming<T>,
+    _lease: ChannelLease,
+}
+
+impl<T> CoreCastStream<T> {
+    fn new(inner: Streaming<T>, lease: ChannelLease) -> Self {
+        Self {
+            inner,
+            _lease: lease,
+        }
+    }
+}
+
+impl<T> Deref for CoreCastStream<T> {
+    type Target = Streaming<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T> DerefMut for CoreCastStream<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+struct ChannelPool {
+    endpoint: String,
+    tls_config: Arc<ClientConfig>,
+    warm_capacity: usize,
+    connect_timeout: Duration,
+    idle: Mutex<Vec<Channel>>,
+    semaphore: Arc<Semaphore>,
+}
+
+impl ChannelPool {
+    fn new(
+        endpoint: String,
+        tls_config: Arc<ClientConfig>,
+        warm_capacity: usize,
+        channel_capacity: usize,
+    ) -> Self {
+        let capacity = channel_capacity.max(1);
+        let warm_capacity = warm_capacity.min(capacity);
+        if warm_capacity == 0 {
+            debug!(target = "corecast", "CoreCast channel warm cache disabled");
+        }
+        Self {
+            endpoint,
+            tls_config,
+            warm_capacity,
+            connect_timeout: Duration::from_secs(5),
+            idle: Mutex::new(Vec::new()),
+            semaphore: Arc::new(Semaphore::new(capacity)),
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>) -> Result<ChannelLease> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("CoreCast channel pool closed"))?;
+
+        if let Some(channel) = self.try_take_idle() {
+            return Ok(ChannelLease::new(self.clone(), channel, permit));
+        }
+
+        let channel = self.connect_channel().await?;
+        Ok(ChannelLease::new(self.clone(), channel, permit))
+    }
+
+    fn try_take_idle(&self) -> Option<Channel> {
+        let mut guard = self
+            .idle
+            .lock()
+            .expect("CoreCast channel pool mutex poisoned");
+        guard.pop()
+    }
+
+    async fn connect_channel(&self) -> Result<Channel> {
+        info!(target = "corecast", endpoint = %self.endpoint, "dialing CoreCast gRPC endpoint");
+        let endpoint = Endpoint::from_shared(self.endpoint.clone())
+            .with_context(|| "invalid CoreCast endpoint")?
+            .connect_timeout(self.connect_timeout)
+            .tcp_nodelay(true);
+
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config((*self.tls_config).clone())
+            .https_or_http()
+            .enable_http2()
+            .build();
+
+        let channel = endpoint
+            .connect_with_connector(connector)
+            .await
+            .with_context(|| "failed to connect to CoreCast endpoint")?;
+        info!(target = "corecast", "CoreCast gRPC channel established");
+        Ok(channel)
+    }
+
+    fn release_channel(&self, channel: Channel) {
+        if self.warm_capacity == 0 {
+            debug!(
+                target = "corecast",
+                "dropping CoreCast channel (warm cache disabled)"
+            );
+            return;
+        }
+
+        let mut guard = self
+            .idle
+            .lock()
+            .expect("CoreCast channel pool mutex poisoned");
+        if guard.len() < self.warm_capacity {
+            guard.push(channel);
+        } else {
+            debug!(
+                target = "corecast",
+                "dropping CoreCast channel (warm cache full)"
+            );
+        }
+    }
+}
+
+struct ChannelLease {
+    pool: Arc<ChannelPool>,
+    channel: Option<Channel>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ChannelLease {
+    fn new(pool: Arc<ChannelPool>, channel: Channel, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            pool,
+            channel: Some(channel),
+            permit: Some(permit),
+        }
+    }
+
+    fn channel(&self) -> &Channel {
+        self.channel
+            .as_ref()
+            .expect("CoreCast channel lease missing channel")
+    }
+}
+
+impl Drop for ChannelLease {
+    fn drop(&mut self) {
+        if let Some(channel) = self.channel.take() {
+            self.pool.release_channel(channel);
+        }
+        if let Some(permit) = self.permit.take() {
+            drop(permit);
+        }
+    }
+}
 
 fn make_auth_header(token: &str) -> Result<MetadataValue<Ascii>> {
     let trimmed = token.trim();

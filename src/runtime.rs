@@ -6,9 +6,12 @@ use std::thread;
 
 use anyhow::{anyhow, Result};
 
+use crate::builder::BuilderHandle;
 use crate::config::AppConfig;
 use crate::core::{Lease, SlabPool, SpscRing};
+use crate::notifier::Notifier;
 use crate::stages::{self, BundleCandidate, PoolUpdate, TradeUpdate};
+use crate::strategy::StrategyEngine;
 
 pub struct ExecutorRuntime {
     stop: Arc<AtomicBool>,
@@ -31,6 +34,10 @@ impl ExecutorRuntime {
             SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
                 .into_split();
 
+        let builder = BuilderHandle::new(config.clone());
+        let strategy = Arc::new(StrategyEngine::new());
+        let notifier = Arc::new(Notifier::new(strategy.clone()));
+
         let mut handles = Vec::new();
         handles.push(stages::spawn_ingest_stage(
             stop.clone(),
@@ -49,11 +56,15 @@ impl ExecutorRuntime {
             pool_rx,
             bundle_tx,
             bundle_pool.clone(),
+            builder.clone(),
+            notifier.clone(),
+            strategy.clone(),
         )?);
         handles.push(stages::spawn_submit_stage(
             stop.clone(),
             Some(config.perf.submit_core),
             bundle_rx,
+            builder.clone(),
         )?);
 
         Ok(Self {

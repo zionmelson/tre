@@ -1,31 +1,31 @@
 # Lifinity AMM v2 Swap Guide
 
-Use this reference when constructing `swap` instructions against the `lifinity_amm_v2` program (`2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c`). Every field below is derived from `protocol/pools/lifinity_amm_v2.json`.
+Use this reference when constructing `swap` instructions against the `lifinity_amm_v2` program (`2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c`). Every field below is derived from `idls/pools/lifinity_amm_v2.json`.
 
 ## Instruction surface
 
-| Arg | Type | Notes |
-| --- | --- | --- |
-| `amount_in` | `u64` | Exact input amount taken from the user source token account. |
+| Arg                  | Type  | Notes                                                                                               |
+| -------------------- | ----- | --------------------------------------------------------------------------------------------------- |
+| `amount_in`          | `u64` | Exact input amount taken from the user source token account.                                        |
 | `minimum_amount_out` | `u64` | Slippage guard; the swap aborts with `ExceededSlippage (6016)` if the quote falls below this value. |
 
 ## Account map
 
-| Account | Mut | Signer | Purpose |
-| --- | --- | --- | --- |
-| `authority` | ❌ | ❌ | Program-derived authority stored on the AMM state; signs for pool vaults via PDA seeds. |
-| `amm` | ✅ | ❌ | On-chain `Amm` account that stores curve config, fee params, vault mints, oracle config, and freeze flags. Must match the pool you intend to trade. |
-| `user_transfer_authority` | ❌ | ✅ | Delegated authority that has an SPL allowance on `source_info`. Typically derived via `spl_token::instruction::approve`. |
-| `source_info` | ✅ | ❌ | User-owned SPL token account providing the input asset. Owner must equal `user_transfer_authority` (delegated) or the signing key. |
-| `destination_info` | ✅ | ❌ | User-owned SPL token account receiving the output asset. Owner must equal the wallet signer. |
-| `swap_source` | ✅ | ❌ | Pool vault that holds the same mint as `source_info`; recorded in the AMM as `token_a_account` or `token_b_account`. |
-| `swap_destination` | ✅ | ❌ | Pool vault that holds the opposite side of the pair. |
-| `pool_mint` | ✅ | ❌ | Pool LP mint; must match the AMM’s `pool_mint`. Used internally for fee/price accounting. |
-| `fee_account` | ✅ | ❌ | SPL account receiving owner/host fees, recorded in `fees`. Must match AMM config or `IncorrectFeeAccount (6019)` triggers. |
-| `token_program` | ❌ | ❌ | Usually `spl_token::ID`. Must match `token_program_id` stored on the AMM or `IncorrectTokenProgramId (6024)` fires. |
-| `oracle_main_account` | ❌ | ❌ | Primary price feed account; the address lives in `oracleMainAccount`. |
-| `oracle_sub_account` | ❌ | ❌ | Secondary oracle feed (confidence check). |
-| `oracle_pc_account` | ❌ | ❌ | Optional PC/Pyth oracle enforcing price buffers. |
+| Account                   | Mut | Signer | Purpose                                                                                                                                             |
+| ------------------------- | --- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `authority`               | ❌  | ❌     | Program-derived authority stored on the AMM state; signs for pool vaults via PDA seeds.                                                             |
+| `amm`                     | ✅  | ❌     | On-chain `Amm` account that stores curve config, fee params, vault mints, oracle config, and freeze flags. Must match the pool you intend to trade. |
+| `user_transfer_authority` | ❌  | ✅     | Delegated authority that has an SPL allowance on `source_info`. Typically derived via `spl_token::instruction::approve`.                            |
+| `source_info`             | ✅  | ❌     | User-owned SPL token account providing the input asset. Owner must equal `user_transfer_authority` (delegated) or the signing key.                  |
+| `destination_info`        | ✅  | ❌     | User-owned SPL token account receiving the output asset. Owner must equal the wallet signer.                                                        |
+| `swap_source`             | ✅  | ❌     | Pool vault that holds the same mint as `source_info`; recorded in the AMM as `token_a_account` or `token_b_account`.                                |
+| `swap_destination`        | ✅  | ❌     | Pool vault that holds the opposite side of the pair.                                                                                                |
+| `pool_mint`               | ✅  | ❌     | Pool LP mint; must match the AMM’s `pool_mint`. Used internally for fee/price accounting.                                                           |
+| `fee_account`             | ✅  | ❌     | SPL account receiving owner/host fees, recorded in `fees`. Must match AMM config or `IncorrectFeeAccount (6019)` triggers.                          |
+| `token_program`           | ❌  | ❌     | Usually `spl_token::ID`. Must match `token_program_id` stored on the AMM or `IncorrectTokenProgramId (6024)` fires.                                 |
+| `oracle_main_account`     | ❌  | ❌     | Primary price feed account; the address lives in `oracleMainAccount`.                                                                               |
+| `oracle_sub_account`      | ❌  | ❌     | Secondary oracle feed (confidence check).                                                                                                           |
+| `oracle_pc_account`       | ❌  | ❌     | Optional PC/Pyth oracle enforcing price buffers.                                                                                                    |
 
 ## Required pre-flight checks
 
@@ -69,16 +69,16 @@ let ix = Instruction {
 
 ## Failure modes to monitor
 
-| Code | Name | Typical trigger |
-| --- | --- | --- |
-| 6000 | `AlreadyInUse` | You passed the same AMM account to two writes within a single atomic transaction. |
-| 6009 | `InvalidInput` | Source/destination vault mismatch or unsupported oracle combination. |
-| 6013 | `CalculationFailure` | Overflow/underflow when computing output; generally indicates stale pool state. |
-| 6016 | `ExceededSlippage` | Realized price worse than `minimum_amount_out`. |
-| 6019 | `IncorrectFeeAccount` | Fee account mismatch versus `amm.fee_account`. |
-| 6024 | `IncorrectTokenProgramId` | Using Token-2022 on a Token-2020 pool (or vice versa). |
-| 6025 | `IncorrectOracleAccount` | Any oracle key not matching the AMM config. |
-| 6029 | `UnsupportedCurveOperation` | Attempting to trade on a pool running a curve that does not permit the direction or size requested.
+| Code | Name                        | Typical trigger                                                                                     |
+| ---- | --------------------------- | --------------------------------------------------------------------------------------------------- |
+| 6000 | `AlreadyInUse`              | You passed the same AMM account to two writes within a single atomic transaction.                   |
+| 6009 | `InvalidInput`              | Source/destination vault mismatch or unsupported oracle combination.                                |
+| 6013 | `CalculationFailure`        | Overflow/underflow when computing output; generally indicates stale pool state.                     |
+| 6016 | `ExceededSlippage`          | Realized price worse than `minimum_amount_out`.                                                     |
+| 6019 | `IncorrectFeeAccount`       | Fee account mismatch versus `amm.fee_account`.                                                      |
+| 6024 | `IncorrectTokenProgramId`   | Using Token-2022 on a Token-2020 pool (or vice versa).                                              |
+| 6025 | `IncorrectOracleAccount`    | Any oracle key not matching the AMM config.                                                         |
+| 6029 | `UnsupportedCurveOperation` | Attempting to trade on a pool running a curve that does not permit the direction or size requested. |
 
 ## Operational checklist
 

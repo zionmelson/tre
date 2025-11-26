@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -7,12 +7,16 @@ use std::{
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 
+use crate::token_pair::TokenPair;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub wallets: Wallets,
     pub jito: JitoConfig,
     pub corecast: CoreCastConfig,
     pub tokens: HashMap<String, String>,
+    #[serde(default)]
+    pub token_pairs: Vec<[String; 2]>,
     #[serde(default)]
     pub program_addresses: Vec<String>,
     pub flash_loan: FlashLoanConfig,
@@ -30,9 +34,15 @@ impl AppConfig {
             .with_context(|| format!("failed reading config file {}", path.display()))?;
         let mut config: AppConfig = serde_json::from_str(&contents)
             .with_context(|| format!("failed parsing config file {}", path.display()))?;
+        config.populate_token_pairs_from_tokens();
+        config.normalize_token_pairs();
         config.apply_protocol_defaults();
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn token_pair_allowlist(&self) -> HashSet<TokenPair> {
+        self.token_pairs.iter().map(TokenPair::from_array).collect()
     }
 
     fn apply_protocol_defaults(&mut self) {
@@ -59,6 +69,10 @@ impl AppConfig {
 
     fn validate(&self) -> Result<()> {
         ensure!(
+            !self.token_pairs.is_empty(),
+            "token_pairs must contain at least one allowed pair"
+        );
+        ensure!(
             !self.jito.endpoints.is_empty(),
             "at least one Jito endpoint is required"
         );
@@ -82,7 +96,46 @@ impl AppConfig {
             !self.corecast.authorization.trim().is_empty(),
             "corecast.authorization must be set"
         );
+        ensure!(
+            self.corecast.cache.channel_capacity > 0,
+            "corecast.cache.channel_capacity must be greater than zero"
+        );
+        ensure!(
+            self.corecast.cache.warm_capacity <= self.corecast.cache.channel_capacity,
+            "corecast.cache.warm_capacity must be less than or equal to channel_capacity"
+        );
         Ok(())
+    }
+
+    fn populate_token_pairs_from_tokens(&mut self) {
+        if !self.token_pairs.is_empty() {
+            return;
+        }
+        let mut mints: Vec<String> = self.tokens.values().cloned().collect();
+        mints.sort();
+        mints.dedup();
+        for i in 0..mints.len() {
+            for j in (i + 1)..mints.len() {
+                self.token_pairs.push([mints[i].clone(), mints[j].clone()]);
+            }
+        }
+    }
+
+    fn normalize_token_pairs(&mut self) {
+        if self.token_pairs.is_empty() {
+            return;
+        }
+        let mut normalized: Vec<[String; 2]> = self
+            .token_pairs
+            .iter()
+            .map(|entry| {
+                let pair = TokenPair::from_array(entry);
+                [pair.mint_a, pair.mint_b]
+            })
+            .collect();
+        normalized.sort();
+        normalized.dedup();
+        self.token_pairs = normalized;
     }
 }
 

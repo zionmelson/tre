@@ -1,6 +1,6 @@
 # Raydium AMM v3 Swap Playbook
 
-This note explains how to construct "swap" instructions for Raydium's concentrated liquidity program (`CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`). The source of truth is `protocol/pools/amm_v3.json` in this repo; every detail below is pulled directly from that IDL.
+This note explains how to construct "swap" instructions for Raydium's concentrated liquidity program (`CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`). The source of truth is `idls/pools/amm_v3.json` in this repo; every detail below is pulled directly from that IDL.
 
 ## Instruction to call
 

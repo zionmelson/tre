@@ -10,8 +10,8 @@
 ## High-Level Flow
 
 1. **Bootstrap:** Load `config.json`, hydrate wallet paths, parse pool IDLs in `idls/pools`, and emit `src/codegen/pools_static.rs` at build time. Templates are exposed as const byte slices during runtime startup.
-2. **Ingress (Stage 0):** Subscribe to Bitquery CoreCast streams (gRPC) and decode events directly into `Opportunity` structs that live inside a pre-allocated `SlabPool`. A dedicated CPU core runs this stage and pushes slab leases into Ring 0.
-3. **Strategy Evaluation (Stage 1):** Pull leases from Ring 0, run strategy heuristics against cached templates, and allocate bundle objects from another slab when firing. Successful bundles are enqueued onto Ring 1.
+2. **Ingress (Stage 0):** Subscribe to Bitquery CoreCast streams (gRPC) and decode events into normalized trade + pool update structs (e.g., `TradeUpdate`, `PoolSnapshot`). A dedicated CPU core runs this stage and pushes raw update leases into Ring 0 without performing strategy math. `TradeUpdate` captures execution-level facts (program, pool, signature, buy/sell mints, amounts), while `PoolSnapshot` caches the latest reserves plus spot price derived from those balances.
+3. **Strategy Evaluation (Stage 1):** Pull updates from Ring 0, maintain pool state, synthesize `Opportunity` objects, then run strategy heuristics against cached templates. When a strategy fires it allocates bundle objects from another slab and enqueues them onto Ring 1.
 4. **Bundle Submission (Stage 2):** Consume bundle leases, marshal transactions, apply tip policy, submit via `SearcherService`, and notify observers. This stage is also pinned to its own core and writes status metrics out-of-band.
 5. **Control Plane:** Tokio remains responsible for ctrl-c shutdown, asynchronous gRPC clients, and future health probes, but it does not sit in the hot path.
 
@@ -21,10 +21,10 @@
 - `idl` – Reads all pool IDLs once so codegen can emit const instruction bytes consumed by the runtime.
 - `core` – Lock-free primitives (`core::ring`, `core::slab`) shared by every stage.
 - `codegen` – Build-time generated `pools_static.rs` that exposes `PoolTemplate` slices without runtime JSON parsing.
-- `corecast` – Holds tonic clients + streaming logic; publishes `Opportunity` structs directly into the Stage 0 slab.
-- `stages` – `stage0_ingest`, `stage1_eval`, and `stage2_submit`, each owning a dedicated thread/core and communicating via SPSC rings.
+- `corecast` – Holds tonic clients + streaming logic; feeds Stage 0 with decoded CoreCast trade/pool updates backed by the ingestion slab.
+- `stages` – `stage0_ingest`, `stage1_eval`, and `stage2_submit`, each owning a dedicated thread/core and communicating via SPSC rings. Stage 0 ingests + normalizes CoreCast data, Stage 1 builds opportunities and bundles, Stage 2 submits.
 - `runtime` – Wires slabs, rings, and stages together, handles ctrl-c shutdown, and guarantees deterministic teardown.
-- `strategy` – Stateless engine that consumes opportunities, references cached IDLs, runs risk checks, and emits `BundleRequest`s.
+- `strategy` – Stateless engine invoked from Stage 1 after an opportunity is synthesized; references cached IDLs, runs risk checks, and emits `BundleRequest`s.
 - `bundle` – Manages long-lived gRPC channels to each Jito endpoint, sends bundles synchronously from Stage 2, and feeds success notifications to `notifier`.
 - `notifier` – Lightweight Gmail API integration triggered by bundle success events; isolated from hot path via stage-local calls.
 

@@ -1,6 +1,6 @@
 # lb_clmm Swap Reference
 
-Program: `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo` (IDL v0.10.1, see `protocol/pools/lb_clmm.json`). All account layouts, events, errors, and constants referenced below are copied from that IDL.
+Program: `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo` (IDL v0.10.1, see `idls/pools/lb_clmm.json`). All account layouts, events, errors, and constants referenced below are copied from that IDL.
 
 ## Core accounts touched by every swap
 
