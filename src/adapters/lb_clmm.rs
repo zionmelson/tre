@@ -8,7 +8,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use once_cell::sync::Lazy;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::{
@@ -16,13 +16,15 @@ use solana_client::rpc_config::{
 };
 use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
 use solana_client::rpc_response::{UiAccount, UiAccountData};
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use tracing::{debug, info, trace, warn};
 
+use crate::builder::{BuilderHandle, LbClmmPoolMeta};
 use crate::stages::types::{
     compute_edge_bps, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras,
     LbClmmPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
 };
+use crate::template::TemplateContext;
 
 use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
 
@@ -41,6 +43,9 @@ const BITMAP_EXTENSION_ACCOUNT_LEN: usize = 32 + (2 * 12 * 8 * 8);
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
+const PRICE_IMPACT_FLOOR_BPS: u16 = 25;
+const PRICE_IMPACT_PADDING_BPS: u16 = 10;
+const LB_CLMM_DEFAULT_CU_LIMIT: u32 = 420_000;
 
 static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program id should be valid")
@@ -64,7 +69,8 @@ impl Default for LbClmmAdapterConfig {
             stale_slot_threshold: 400,
             stale_after_ms: 2_000,
             rpc_endpoints: Vec::new(),
-            rpc_timeout_ms: 1_000,
+            // lb_clmm bin array/bitmap fetches can be slow; give RPC plenty of time.
+            rpc_timeout_ms: 15_000,
         }
     }
 }
@@ -74,10 +80,12 @@ pub struct LbClmmAdapter {
     state: DashMap<Pubkey, LbClmmState>,
     config: LbClmmAdapterConfig,
     hydrator: Option<LbClmmPoolHydrator>,
+    template_builder: Option<BuilderHandle>,
+    registered_templates: DashSet<Pubkey>,
 }
 
 impl LbClmmAdapter {
-    pub fn new(config: LbClmmAdapterConfig) -> Self {
+    pub fn new(config: LbClmmAdapterConfig, template_builder: Option<BuilderHandle>) -> Self {
         let program_id = Pubkey::from_str(LB_CLMM_PROGRAM_ID)
             .expect("static lb_clmm program id should be valid");
         let hydrator = LbClmmPoolHydrator::new(program_id, &config);
@@ -98,6 +106,8 @@ impl LbClmmAdapter {
             state: DashMap::new(),
             config,
             hydrator,
+            template_builder,
+            registered_templates: DashSet::new(),
         }
     }
 
@@ -202,6 +212,7 @@ impl LbClmmAdapter {
             "upserting lb_clmm pool state"
         );
 
+        self.register_templates_with_builder(&state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
     }
@@ -248,6 +259,50 @@ impl LbClmmAdapter {
         extras
     }
 
+    fn register_templates_with_builder(&self, state: &LbClmmState) {
+        let Some(builder) = self.template_builder.as_ref() else {
+            return;
+        };
+
+        if !self.registered_templates.insert(state.lb_pair) {
+            return;
+        }
+
+        let mut alt_accounts = Vec::with_capacity(12);
+        alt_accounts.push(state.lb_pair);
+        alt_accounts.push(state.token_x_mint);
+        alt_accounts.push(state.token_y_mint);
+        if let Some(pk) = state.token_x_program {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.token_y_program {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.reserve_x {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.reserve_y {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.oracle {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.bin_array_bitmap_extension {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.host_fee_account {
+            alt_accounts.push(pk);
+        }
+
+        let fee_tier_bps = state.taker_fee_bps().min(u64::from(u16::MAX)) as u16;
+        builder.register_lb_clmm_pool(LbClmmPoolMeta {
+            pool_id: state.lb_pair,
+            fee_tier_bps,
+            alt_accounts,
+            alt_handle: None,
+        });
+    }
+
     fn build_snapshot_side(
         &self,
         state: &LbClmmState,
@@ -282,6 +337,12 @@ impl LbClmmAdapter {
             expected_output as f64 / probe_amount as f64
         };
 
+        let limit_price = state.active_bin_id.map(|id| id as i64);
+        let price_impact_limit_bps = Some(derive_price_impact_limit(
+            slippage_bps,
+            state.volatility_bps,
+        ));
+
         Some(PoolQuoteSide {
             input_mint: input_mint.to_string(),
             output_mint: output_mint.to_string(),
@@ -290,6 +351,22 @@ impl LbClmmAdapter {
             fee_bps: state.taker_fee_bps(),
             effective_price,
             estimated_slippage_bps: slippage_bps.abs(),
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price,
+            price_impact_limit_bps,
+            context: {
+                let mut ctx = TemplateContext::default();
+                ctx.compute_unit_limit = Some(LB_CLMM_DEFAULT_CU_LIMIT);
+                if let Some(host_fee) = state.host_fee_account {
+                    ctx.host_fee_account = Some(host_fee);
+                }
+                if let Some(extension) = state.bin_array_bitmap_extension {
+                    ctx.remaining_accounts
+                        .push(AccountMeta::new_readonly(extension, false));
+                }
+                ctx
+            },
         })
     }
 }
@@ -328,6 +405,17 @@ impl ProtocolAdapter for LbClmmAdapter {
         let (amount_out, edge_bps) = simulate_lb_clmm_exact_in(&state, &req)?;
         let mut response = build_quote_response(req, amount_out);
         response.edge_bps = edge_bps;
+        response.min_output_amount = Some(amount_out);
+        response.context.compute_unit_limit = Some(LB_CLMM_DEFAULT_CU_LIMIT);
+        if let Some(host_fee) = state.host_fee_account {
+            response.context.host_fee_account = Some(host_fee);
+        }
+        if let Some(extension) = state.bin_array_bitmap_extension {
+            response
+                .context
+                .remaining_accounts
+                .push(AccountMeta::new_readonly(extension, false));
+        }
         Some(response)
     }
 
@@ -494,6 +582,20 @@ fn simulate_lb_clmm_exact_in(state: &LbClmmState, req: &QuoteRequest) -> Option<
     let amount_out = amount_out_u128.min(u128::from(u64::MAX)) as u64;
     let edge_bps = compute_bin_walk_edge(state, gross_in, amount_out, swap_x_to_y);
     Some((amount_out, edge_bps))
+}
+
+fn derive_price_impact_limit(slippage_bps: f64, volatility_bps: Option<u16>) -> u16 {
+    let abs_slippage = if slippage_bps.is_finite() {
+        slippage_bps.abs()
+    } else {
+        0.0
+    };
+    let floor = f64::from(PRICE_IMPACT_FLOOR_BPS);
+    let base = abs_slippage.max(floor).ceil() as u64;
+    let headroom = PRICE_IMPACT_PADDING_BPS as u64;
+    let volatility = volatility_bps.unwrap_or(0) as u64;
+    let total = base.saturating_add(volatility).saturating_add(headroom);
+    total.min(u16::MAX as u64) as u16
 }
 
 fn simulate_xyk_fallback(state: &LbClmmState, req: &QuoteRequest) -> Option<(u64, f64)> {

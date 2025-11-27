@@ -17,34 +17,40 @@ serde_json = "1"
 thiserror = "1"
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 tokio-stream = "0.1"
-tonic = { version = "0.11", default-features = false, features = ["transport", "gzip", "codegen", "prost"] }
-prost = "0.12"
-prost-types = "0.12"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"] }
-hyper-rustls = { version = "0.24", features = ["http2"] }
-rustls = "0.21"
+tonic = { version = "0.12", default-features = false, features = ["transport", "tls", "tls-roots", "gzip", "codegen", "prost"] }
+prost = "0.13"
+prost-types = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+rustls = "0.23"
 rustls-pemfile = "1"
-webpki-roots = "0.25"
 solana-sdk = "3"
 solana-client = "3"
+solana-address-lookup-table-interface = { version = "3", features = ["bincode"] }
+solana-compute-budget-interface = "3"
+solana-system-interface = { version = "3", features = ["alloc", "bincode"] }
 bs58 = "0.5"
 base64 = "0.22"
 url = "2"
 tower = { version = "0.4", features = ["util"] }
 http = "0.2"
-hyper = { version = "0.14", features = ["client", "http2"] }
+hyper = { version = "0.14", features = ["client", "http1", "http2", "server", "tcp"] }
+bincode = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 core_affinity = "0.8"
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
+crossbeam-channel = "0.5"
 clap = { version = "4", features = ["derive"] }
 dashmap = "5"
 uint = "0.9"
+sha2 = "0.10"
+prometheus-client = "0.22"
 
 [build-dependencies]
-prost-build = "0.12"
-tonic-build = { version = "0.11", features = ["prost"] }
+prost-build = "0.13"
+tonic-build = { version = "0.12", features = ["prost"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 heck = "0.4"

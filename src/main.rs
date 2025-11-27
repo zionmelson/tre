@@ -1,12 +1,15 @@
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use rustls::crypto::{aws_lc_rs, CryptoProvider};
 use tracing_subscriber::{fmt, EnvFilter};
-use tre_arb_bot::{config::AppConfig, runtime};
+use tre_arb_bot::{config::AppConfig, runtime, telemetry};
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_crypto_provider()?;
     init_tracing();
+    telemetry::init_from_env().await?;
 
     let config_path = resolve_config_path();
     let app_config = AppConfig::load(&config_path)
@@ -16,6 +19,13 @@ async fn main() -> Result<()> {
 
     runtime::run(Arc::new(app_config)).await?;
 
+    Ok(())
+}
+
+fn install_rustls_crypto_provider() -> Result<()> {
+    let provider = aws_lc_rs::default_provider();
+    CryptoProvider::install_default(provider)
+        .map_err(|err| anyhow!("failed to install rustls crypto provider: {err:?}"))?;
     Ok(())
 }
 

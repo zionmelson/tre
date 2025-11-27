@@ -1,26 +1,20 @@
 use std::{
-    fs,
-    io::Cursor,
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use anyhow::{anyhow, ensure, Context, Result};
-use hyper_rustls::HttpsConnectorBuilder;
+use anyhow::{anyhow, Context, Result};
 use reqwest::{Client as HttpClient, ClientBuilder as HttpClientBuilder};
-use rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore};
-use rustls_pemfile as pemfile;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{
     metadata::{Ascii, MetadataValue},
     service::{interceptor::InterceptedService, Interceptor},
-    transport::{Channel, Endpoint},
+    transport::{Channel, ClientTlsConfig, Endpoint},
     Request, Status, Streaming,
 };
 use tracing::{debug, info};
 use url::Url;
-use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::{
     config::AppConfig,
@@ -61,30 +55,13 @@ pub struct CoreCastClient {
 impl CoreCastClient {
     pub fn new(config: Arc<AppConfig>) -> Result<Self> {
         let endpoint = normalize_endpoint(&config.corecast.address)?;
-        let ca_pem = match config.corecast.ca_pem.as_ref() {
-            Some(path) => {
-                info!(target = "corecast", pem = %path.display(), "loading CoreCast custom CA bundle");
-                let bytes = fs::read(path).with_context(|| {
-                    format!("failed to read CoreCast ca_pem from {}", path.display())
-                })?;
-                Some(Arc::new(bytes))
-            }
-            None => None,
-        };
-
+        let domain = endpoint_host(&endpoint)?;
         let mut http_builder = HttpClientBuilder::new().use_rustls_tls();
-        if let Some(pem) = ca_pem.as_ref() {
-            let cert = reqwest::tls::Certificate::from_pem(pem)
-                .with_context(|| "failed to parse CoreCast ca_pem for HTTP client")?;
-            http_builder = http_builder.add_root_certificate(cert);
-        }
-
         let http_client = http_builder
             .build()
             .with_context(|| "failed to build CoreCast HTTP client")?;
 
-        let has_custom_ca = ca_pem.is_some();
-        let tls_config = build_tls_config(ca_pem.as_ref().map(|buf| buf.as_slice()))?;
+        let tls_config = build_tls_config(&domain)?;
         let auth_header = make_auth_header(&config.corecast.authorization)?;
         let channel_pool = ChannelPool::new(
             endpoint.clone(),
@@ -104,7 +81,6 @@ impl CoreCastClient {
         info!(
             target = "corecast",
             endpoint = %client.endpoint,
-            has_custom_ca,
             warm_capacity = config.corecast.cache.warm_capacity,
             channel_capacity = config.corecast.cache.channel_capacity,
             "CoreCast client initialized"
@@ -174,10 +150,11 @@ impl CoreCastClient {
     }
 
     fn program_filter(&self) -> Result<AddressFilter> {
-        ensure!(
-            !self.config.program_addresses.is_empty(),
-            "config.program_addresses must contain at least one CoreCast program id"
-        );
+        if self.config.program_addresses.is_empty() {
+            return Err(anyhow!(
+                "config.program_addresses must contain at least one CoreCast program id"
+            ));
+        }
         Ok(AddressFilter {
             addresses: self.config.program_addresses.clone(),
         })
@@ -216,7 +193,7 @@ impl<T> DerefMut for CoreCastStream<T> {
 
 struct ChannelPool {
     endpoint: String,
-    tls_config: Arc<ClientConfig>,
+    tls_config: ClientTlsConfig,
     warm_capacity: usize,
     connect_timeout: Duration,
     idle: Mutex<Vec<Channel>>,
@@ -226,7 +203,7 @@ struct ChannelPool {
 impl ChannelPool {
     fn new(
         endpoint: String,
-        tls_config: Arc<ClientConfig>,
+        tls_config: ClientTlsConfig,
         warm_capacity: usize,
         channel_capacity: usize,
     ) -> Self {
@@ -276,14 +253,12 @@ impl ChannelPool {
             .connect_timeout(self.connect_timeout)
             .tcp_nodelay(true);
 
-        let connector = HttpsConnectorBuilder::new()
-            .with_tls_config((*self.tls_config).clone())
-            .https_or_http()
-            .enable_http2()
-            .build();
+        let endpoint = endpoint
+            .tls_config(self.tls_config.clone())
+            .with_context(|| "failed to configure CoreCast TLS")?;
 
         let channel = endpoint
-            .connect_with_connector(connector)
+            .connect()
             .await
             .with_context(|| "failed to connect to CoreCast endpoint")?;
         info!(target = "corecast", "CoreCast gRPC channel established");
@@ -379,39 +354,17 @@ fn normalize_endpoint(addr: &str) -> Result<String> {
     Ok(endpoint)
 }
 
-fn build_tls_config(ca_pem: Option<&[u8]>) -> Result<Arc<ClientConfig>> {
-    let mut root_store = RootCertStore::empty();
-    root_store.add_trust_anchors(TLS_SERVER_ROOTS.iter().map(|ta| {
-        OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
+fn build_tls_config(domain: &str) -> Result<ClientTlsConfig> {
+    Ok(ClientTlsConfig::new()
+        .with_enabled_roots()
+        .domain_name(domain.to_owned()))
+}
 
-    if let Some(pem) = ca_pem {
-        let mut cursor = Cursor::new(pem);
-        let certs = pemfile::certs(&mut cursor)
-            .with_context(|| "failed to parse CoreCast ca_pem contents")?;
-        ensure!(
-            !certs.is_empty(),
-            "CoreCast ca_pem did not contain certificates"
-        );
-        let (added, _skipped) = root_store.add_parsable_certificates(&certs);
-        ensure!(
-            added > 0,
-            "CoreCast ca_pem certificates could not be added to root store"
-        );
-        info!(
-            target = "corecast",
-            added, "loaded CoreCast custom CA certificates"
-        );
-    }
-
-    let config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(Arc::new(config))
+fn endpoint_host(endpoint: &str) -> Result<String> {
+    let parsed = Url::parse(endpoint)
+        .with_context(|| format!("invalid CoreCast endpoint URI: {}", endpoint))?;
+    parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("CoreCast endpoint missing host"))
+        .map(|host| host.to_string())
 }

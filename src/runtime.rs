@@ -5,8 +5,10 @@ use std::sync::{
 use std::thread;
 
 use anyhow::{anyhow, Result};
+use tokio::{signal, task};
 
 use crate::builder::BuilderHandle;
+use crate::bundle::{BundleClient, BundleTracker};
 use crate::config::AppConfig;
 use crate::core::{Lease, SlabPool, SpscRing};
 use crate::notifier::Notifier;
@@ -33,10 +35,13 @@ impl ExecutorRuntime {
         let (bundle_tx, bundle_rx) =
             SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
                 .into_split();
+        let (submit_tx, submit_rx) =
+            SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
+                .into_split();
 
-        let builder = BuilderHandle::new(config.clone());
-        let strategy = Arc::new(StrategyEngine::new());
-        let notifier = Arc::new(Notifier::new(strategy.clone()));
+        let builder = BuilderHandle::new(config.clone())?;
+        let strategy = Arc::new(StrategyEngine::new(config.clone())?);
+        let notifier = Arc::new(Notifier::new(strategy.clone(), config.clone()));
 
         let mut handles = Vec::new();
         handles.push(stages::spawn_ingest_stage(
@@ -64,7 +69,25 @@ impl ExecutorRuntime {
             stop.clone(),
             Some(config.perf.submit_core),
             bundle_rx,
+            submit_tx,
             builder.clone(),
+        )?);
+        let bundle_client = Arc::new(BundleClient::new(config.clone(), builder.auth_signer())?);
+        let (tracker, mut tracker_handles) = BundleTracker::spawn(
+            stop.clone(),
+            config.clone(),
+            notifier.clone(),
+            builder.auth_signer(),
+        )?;
+        handles.append(&mut tracker_handles);
+        handles.push(stages::spawn_send_stage(
+            stop.clone(),
+            None,
+            submit_rx,
+            builder.clone(),
+            bundle_client,
+            notifier.clone(),
+            tracker,
         )?);
 
         Ok(Self {
@@ -102,8 +125,17 @@ fn describe_panic(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
 }
 
 pub async fn run(config: Arc<AppConfig>) -> Result<()> {
-    let runtime = ExecutorRuntime::spawn(config)?;
-    tokio::signal::ctrl_c().await?;
-    runtime.request_shutdown();
-    runtime.join()
+    let config_for_executor = config.clone();
+    let mut executor = task::spawn_blocking(move || ExecutorRuntime::spawn(config_for_executor))
+        .await
+        .map_err(|err| anyhow!("executor initialization panicked: {err}"))??;
+
+    signal::ctrl_c().await?;
+    executor.request_shutdown();
+
+    task::spawn_blocking(move || executor.join())
+        .await
+        .map_err(|err| anyhow!("executor shutdown panicked: {err}"))??;
+
+    Ok(())
 }

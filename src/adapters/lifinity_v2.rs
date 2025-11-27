@@ -4,14 +4,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
 
+use crate::builder::{BuilderHandle, LifinityPoolMeta};
 use crate::stages::types::{
     LifinityPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
 };
+use crate::template::TemplateContext;
 
 use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
 
@@ -20,6 +22,7 @@ const BPS_DENOMINATOR: u64 = 10_000;
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
+const LIFINITY_DEFAULT_CU_LIMIT: u32 = 320_000;
 
 #[derive(Debug, Clone)]
 pub struct LifinityAdapterConfig {
@@ -36,7 +39,7 @@ impl Default for LifinityAdapterConfig {
             stale_slot_threshold: 400,
             stale_after_ms: 2_000,
             rpc_endpoints: Vec::new(),
-            rpc_timeout_ms: 1_000,
+            rpc_timeout_ms: 15_000,
             oracle_stale_after_ms: 1_000,
         }
     }
@@ -48,10 +51,12 @@ pub struct LifinityAdapter {
     config: LifinityAdapterConfig,
     hydrator: Option<LifinityPoolHydrator>,
     oracle_cache: Option<LifinityOracleCache>,
+    template_builder: Option<BuilderHandle>,
+    registered_templates: DashSet<Pubkey>,
 }
 
 impl LifinityAdapter {
-    pub fn new(config: LifinityAdapterConfig) -> Self {
+    pub fn new(config: LifinityAdapterConfig, template_builder: Option<BuilderHandle>) -> Self {
         let program_id = Pubkey::from_str(LIFINITY_PROGRAM_ID)
             .expect("static Lifinity AMM v2 program id should be valid");
         let hydrator = LifinityPoolHydrator::new(program_id, &config);
@@ -82,6 +87,8 @@ impl LifinityAdapter {
             config,
             hydrator,
             oracle_cache,
+            template_builder,
+            registered_templates: DashSet::new(),
         }
     }
 
@@ -200,6 +207,7 @@ impl LifinityAdapter {
             "upserting Lifinity pool state"
         );
 
+        self.register_templates_with_builder(&state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
     }
@@ -270,6 +278,56 @@ impl LifinityAdapter {
         }
 
         extras
+    }
+
+    fn register_templates_with_builder(&self, state: &LifinityPoolState) {
+        let Some(builder) = self.template_builder.as_ref() else {
+            return;
+        };
+
+        if !self.registered_templates.insert(state.amm) {
+            return;
+        }
+
+        let mut alt_accounts = Vec::with_capacity(12);
+        alt_accounts.push(state.amm);
+        alt_accounts.push(state.base_mint);
+        alt_accounts.push(state.quote_mint);
+        if let Some(pk) = state.authority {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.token_a_vault {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.token_b_vault {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.pool_mint {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.fee_account {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.token_program {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.oracle_main {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.oracle_sub {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.oracle_pc {
+            alt_accounts.push(pk);
+        }
+
+        let fee_tier_bps = base_fee_bps(state).min(u64::from(u16::MAX)) as u16;
+        builder.register_lifinity_pool(LifinityPoolMeta {
+            pool_id: state.amm,
+            fee_tier_bps,
+            alt_accounts,
+            alt_handle: None,
+        });
     }
 
     fn ensure_oracles_healthy(&self, state: &LifinityPoolState, current_slot: u64) -> bool {
@@ -437,6 +495,15 @@ impl LifinityAdapter {
             fee_bps,
             effective_price: execution_price,
             estimated_slippage_bps: slippage_bps,
+            sqrt_price_limit: None,
+            min_output_amount: Some(expected_output),
+            limit_price: None,
+            price_impact_limit_bps: None,
+            context: {
+                let mut ctx = TemplateContext::default();
+                ctx.compute_unit_limit = Some(LIFINITY_DEFAULT_CU_LIMIT);
+                ctx
+            },
         })
     }
 }
@@ -482,7 +549,10 @@ impl ProtocolAdapter for LifinityAdapter {
 
         let ctx = select_reserves(&state, &req)?;
         let amount_out = lifinity_amount_out(req.amount, ctx, &state)?;
-        Some(build_quote_response(req, amount_out))
+        let mut response = build_quote_response(req, amount_out);
+        response.min_output_amount = Some(amount_out);
+        response.context.compute_unit_limit = Some(LIFINITY_DEFAULT_CU_LIMIT);
+        Some(response)
     }
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
@@ -1460,7 +1530,7 @@ mod tests {
 
     #[test]
     fn bidirectional_quotes_generate_snapshot_sides() {
-        let adapter = LifinityAdapter::new(LifinityAdapterConfig::default());
+        let adapter = LifinityAdapter::new(LifinityAdapterConfig::default(), None);
         let pool = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
         let quote_mint = Pubkey::new_unique();

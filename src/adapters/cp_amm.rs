@@ -4,18 +4,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
 
+use crate::builder::{BuilderHandle, CpAmmPoolMeta};
 use crate::stages::types::{
     CpAmmPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
 };
+use crate::template::TemplateContext;
 
 use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
 
 const BPS_DENOMINATOR: u64 = 10_000;
+const CP_AMM_DEFAULT_CU_LIMIT: u32 = 400_000;
 
 const CP_AMM_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
@@ -36,7 +39,8 @@ impl Default for CpAmmAdapterConfig {
             stale_slot_threshold: 400,
             stale_after_ms: 2_000,
             rpc_endpoints: Vec::new(),
-            rpc_timeout_ms: 1_000,
+            // initial hydration hits several large accounts; allow generous timeout
+            rpc_timeout_ms: 15_000,
         }
     }
 }
@@ -46,10 +50,12 @@ pub struct CpAmmAdapter {
     state: DashMap<Pubkey, CpAmmState>,
     config: CpAmmAdapterConfig,
     hydrator: Option<CpAmmPoolHydrator>,
+    template_builder: Option<BuilderHandle>,
+    registered_templates: DashSet<Pubkey>,
 }
 
 impl CpAmmAdapter {
-    pub fn new(config: CpAmmAdapterConfig) -> Self {
+    pub fn new(config: CpAmmAdapterConfig, template_builder: Option<BuilderHandle>) -> Self {
         let program_id =
             Pubkey::from_str(CP_AMM_PROGRAM_ID).expect("static cp_amm program id should be valid");
         let hydrator = CpAmmPoolHydrator::new(&config);
@@ -70,6 +76,8 @@ impl CpAmmAdapter {
             state: DashMap::new(),
             config,
             hydrator,
+            template_builder,
+            registered_templates: DashSet::new(),
         }
     }
 
@@ -174,6 +182,7 @@ impl CpAmmAdapter {
             "upserting cp_amm pool state"
         );
 
+        self.register_templates_with_builder(&state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
     }
@@ -203,6 +212,47 @@ impl CpAmmAdapter {
         }
 
         extras
+    }
+
+    fn register_templates_with_builder(&self, state: &CpAmmState) {
+        let Some(builder) = self.template_builder.as_ref() else {
+            return;
+        };
+        if !self.registered_templates.insert(state.pool) {
+            return;
+        }
+
+        let mut alt_accounts = Vec::with_capacity(10);
+        alt_accounts.push(state.pool);
+        alt_accounts.push(state.token_a_mint);
+        alt_accounts.push(state.token_b_mint);
+        if let Some(pk) = state.pool_authority {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.token_a_vault {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.token_b_vault {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.token_a_program {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.token_b_program {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.referral_token_account {
+            alt_accounts.push(pk);
+        }
+
+        let fee_tier_bps = state.total_fee_bps().min(u64::from(u16::MAX)) as u16;
+
+        builder.register_cp_amm_pool(CpAmmPoolMeta {
+            pool_id: state.pool,
+            fee_tier_bps,
+            alt_accounts,
+            alt_handle: None,
+        });
     }
 
     fn build_snapshot_side(
@@ -247,6 +297,17 @@ impl CpAmmAdapter {
             fee_bps: state.total_fee_bps(),
             effective_price,
             estimated_slippage_bps: slippage_bps,
+            sqrt_price_limit: None,
+            min_output_amount: Some(expected_output),
+            limit_price: None,
+            price_impact_limit_bps: None,
+            context: {
+                let mut ctx = TemplateContext::default();
+                ctx.compute_unit_limit = Some(CP_AMM_DEFAULT_CU_LIMIT);
+                ctx.requires_memo = state.referral_token_account.is_some();
+                ctx.host_fee_account = state.referral_token_account;
+                ctx
+            },
         })
     }
 }
@@ -285,6 +346,10 @@ impl ProtocolAdapter for CpAmmAdapter {
         let (amount_out, edge_bps) = simulate_xyk_exact_in(&state, &req)?;
         let mut response = build_quote_response(req, amount_out);
         response.edge_bps = edge_bps;
+        response.min_output_amount = Some(amount_out);
+        response.context.compute_unit_limit = Some(CP_AMM_DEFAULT_CU_LIMIT);
+        response.context.requires_memo = state.referral_token_account.is_some();
+        response.context.host_fee_account = state.referral_token_account;
         Some(response)
     }
 
@@ -655,7 +720,7 @@ mod tests {
 
     #[test]
     fn bidirectional_quotes_generate_snapshot_sides() {
-        let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default());
+        let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default(), None);
         let pool = Pubkey::new_unique();
         let mint_a = Pubkey::new_unique();
         let mint_b = Pubkey::new_unique();

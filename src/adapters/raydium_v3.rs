@@ -6,21 +6,25 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
+use solana_client::client_error::{ClientError, ClientErrorKind};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
+use crate::builder::{AmmV3PoolMeta, BuilderHandle};
 use crate::stages::types::{
     PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, RaydiumV3PoolExtras,
 };
+use crate::template::TemplateContext;
 
 use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
 
 const RAYDIUM_V3_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 const TICK_ARRAY_SEED: &[u8] = b"tick_array";
 const TICK_ARRAY_STATE_DISCRIMINATOR: [u8; 8] = [192, 155, 85, 205, 49, 249, 129, 42];
+const POOL_STATE_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
 const AMM_CONFIG_STATE_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 43, 111];
 const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 const PUBKEY_BYTES: usize = 32;
@@ -41,12 +45,27 @@ construct_uint! {
     pub struct U256(4);
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClmmSwapSimulation {
+    amount_out: u64,
+    sqrt_price_after: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuoteOutcome {
+    amount_out: u64,
+    sqrt_price_limit: Option<u128>,
+}
+
+const DEFAULT_RAYDIUM_HYDRATION_RETRY_MS: u64 = 60_000;
+
 #[derive(Debug, Clone)]
 pub struct RaydiumV3AdapterConfig {
     pub stale_slot_threshold: u64,
     pub stale_after_ms: u64,
     pub rpc_endpoints: Vec<String>,
     pub rpc_timeout_ms: u64,
+    pub hydration_retry_ms: u64,
 }
 
 impl Default for RaydiumV3AdapterConfig {
@@ -55,7 +74,9 @@ impl Default for RaydiumV3AdapterConfig {
             stale_slot_threshold: 400,
             stale_after_ms: 2_000,
             rpc_endpoints: Vec::new(),
-            rpc_timeout_ms: 1_000,
+            // tick array hydration can take several seconds; cache once fetched.
+            rpc_timeout_ms: 15_000,
+            hydration_retry_ms: DEFAULT_RAYDIUM_HYDRATION_RETRY_MS,
         }
     }
 }
@@ -65,10 +86,12 @@ pub struct RaydiumV3Adapter {
     state: DashMap<Pubkey, RaydiumV3State>,
     config: RaydiumV3AdapterConfig,
     hydrator: Option<RaydiumPoolHydrator>,
+    template_builder: Option<BuilderHandle>,
+    registered_templates: DashSet<Pubkey>,
 }
 
 impl RaydiumV3Adapter {
-    pub fn new(config: RaydiumV3AdapterConfig) -> Self {
+    pub fn new(config: RaydiumV3AdapterConfig, template_builder: Option<BuilderHandle>) -> Self {
         let program_id = Pubkey::from_str(RAYDIUM_V3_PROGRAM_ID)
             .expect("static Raydium AMM v3 program id should be valid");
         let hydrator = RaydiumPoolHydrator::new(&config, program_id);
@@ -89,6 +112,8 @@ impl RaydiumV3Adapter {
             state: DashMap::new(),
             config,
             hydrator,
+            template_builder,
+            registered_templates: DashSet::new(),
         }
     }
 
@@ -208,15 +233,12 @@ impl RaydiumV3Adapter {
             "upserting Raydium pool state"
         );
 
+        self.register_templates_with_builder(&state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
     }
 
     fn enrich_extras(&self, pool: Pubkey, mut extras: RaydiumV3PoolExtras) -> RaydiumV3PoolExtras {
-        if !needs_hydration(&extras) {
-            return extras;
-        }
-
         let Some(hydrator) = self.hydrator.as_ref() else {
             return extras;
         };
@@ -226,7 +248,9 @@ impl RaydiumV3Adapter {
             extras.sqrt_price_x64 = extras.sqrt_price_x64.or(Some(meta.sqrt_price_x64));
             extras.liquidity = extras.liquidity.or(Some(meta.liquidity));
             extras.current_tick = extras.current_tick.or(Some(meta.current_tick));
-            extras.amm_config = extras.amm_config.or(Some(meta.amm_config));
+            // Always trust the on-chain pool account for amm_config so stale CoreCast
+            // metadata cannot point us at a non-existent config account.
+            extras.amm_config = Some(meta.amm_config);
             extras.observation_state = extras.observation_state.or(Some(meta.observation_state));
             extras.pool_bump = extras.pool_bump.or(Some(meta.pool_bump));
             extras.trade_fee_rate = extras.trade_fee_rate.or(meta.trade_fee_rate);
@@ -243,7 +267,42 @@ impl RaydiumV3Adapter {
         extras
     }
 
-    fn simulate_clmm_exact_in(&self, state: &RaydiumV3State, req: &QuoteRequest) -> Option<u64> {
+    fn register_templates_with_builder(&self, state: &RaydiumV3State) {
+        let Some(builder) = self.template_builder.as_ref() else {
+            return;
+        };
+        let Some(fee_bps) = state.trade_fee_bps else {
+            return;
+        };
+        if !self.registered_templates.insert(state.pool_id) {
+            return;
+        }
+
+        let fee_tier_bps = u16::try_from(fee_bps).unwrap_or(u16::MAX);
+        let mut alt_accounts = Vec::with_capacity(8);
+        alt_accounts.push(state.pool_id);
+        alt_accounts.push(state.base_mint);
+        alt_accounts.push(state.quote_mint);
+        if let Some(key) = state.amm_config {
+            alt_accounts.push(key);
+        }
+        if let Some(key) = state.observation_state {
+            alt_accounts.push(key);
+        }
+
+        builder.register_amm_v3_pool(AmmV3PoolMeta {
+            pool_id: state.pool_id,
+            fee_tier_bps,
+            alt_accounts,
+            alt_handle: None,
+        });
+    }
+
+    fn simulate_clmm_exact_in(
+        &self,
+        state: &RaydiumV3State,
+        req: &QuoteRequest,
+    ) -> Option<ClmmSwapSimulation> {
         let hydrator = self.hydrator.as_ref()?;
         let tick_spacing = state.tick_spacing?;
         let mut current_tick = state.current_tick?;
@@ -347,13 +406,21 @@ impl RaydiumV3Adapter {
         if amount_out_accum == 0 {
             None
         } else {
-            Some(amount_out_accum.min(u64::MAX as u128) as u64)
+            let amount_out = amount_out_accum.min(u64::MAX as u128) as u64;
+            let sqrt_price_after = sqrt_price_x64_from_x96(&sqrt_price_x96);
+            Some(ClmmSwapSimulation {
+                amount_out,
+                sqrt_price_after,
+            })
         }
     }
 
-    fn quote_amount_out(&self, state: &RaydiumV3State, req: &QuoteRequest) -> Option<u64> {
-        if let Some(amount_out) = self.simulate_clmm_exact_in(state, req) {
-            return Some(amount_out);
+    fn quote_amount_out(&self, state: &RaydiumV3State, req: &QuoteRequest) -> Option<QuoteOutcome> {
+        if let Some(simulation) = self.simulate_clmm_exact_in(state, req) {
+            return Some(QuoteOutcome {
+                amount_out: simulation.amount_out,
+                sqrt_price_limit: Some(simulation.sqrt_price_after),
+            });
         }
 
         let (reserve_in, reserve_out) =
@@ -370,7 +437,11 @@ impl RaydiumV3Adapter {
         }
 
         let fee_bps = state.trade_fee_bps.unwrap_or(DEFAULT_FEE_BPS);
-        Self::xyk_amount_out(reserve_in, reserve_out, req.amount, fee_bps)
+        let amount_out = Self::xyk_amount_out(reserve_in, reserve_out, req.amount, fee_bps)?;
+        Some(QuoteOutcome {
+            amount_out,
+            sqrt_price_limit: None,
+        })
     }
 
     fn build_snapshot_side(
@@ -401,11 +472,11 @@ impl RaydiumV3Adapter {
             direction: SwapDirection::ExactIn,
         };
 
-        let amount_out = self.quote_amount_out(state, &req)?;
+        let quote = self.quote_amount_out(state, &req)?;
         let execution_price = if probe_amount == 0 {
             0.0
         } else {
-            amount_out as f64 / probe_amount as f64
+            quote.amount_out as f64 / probe_amount as f64
         };
 
         let reference_price = match state.mid_price() {
@@ -427,10 +498,19 @@ impl RaydiumV3Adapter {
             input_mint: input_mint.to_string(),
             output_mint: output_mint.to_string(),
             notional: probe_amount,
-            expected_output: amount_out,
+            expected_output: quote.amount_out,
             fee_bps,
             effective_price: execution_price,
             estimated_slippage_bps: slippage,
+            sqrt_price_limit: quote.sqrt_price_limit,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            context: {
+                let mut ctx = TemplateContext::default();
+                ctx.compute_unit_limit = Some(RAYDIUM_DEFAULT_CU_LIMIT);
+                ctx
+            },
         })
     }
 }
@@ -457,9 +537,8 @@ impl ProtocolAdapter for RaydiumV3Adapter {
             return;
         }
 
-        let extras = update.extensions.raydium_v3.clone().unwrap_or_default();
-
-        self.upsert_state(update, extras);
+        // CoreCast metadata is often stale; rely solely on on-chain hydration.
+        self.upsert_state(update, RaydiumV3PoolExtras::default());
     }
 
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
@@ -467,8 +546,12 @@ impl ProtocolAdapter for RaydiumV3Adapter {
             return None;
         }
         let state = self.get_state(&req.pool_id)?;
-        let amount_out = self.quote_amount_out(&state, &req)?;
-        Some(build_quote_response(req, amount_out))
+        let quote = self.quote_amount_out(&state, &req)?;
+        let mut response = build_quote_response(req, quote.amount_out);
+        response.sqrt_price_limit = quote.sqrt_price_limit;
+        response.min_output_amount = Some(quote.amount_out);
+        response.context.compute_unit_limit = Some(RAYDIUM_DEFAULT_CU_LIMIT);
+        Some(response)
     }
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
@@ -491,6 +574,7 @@ impl ProtocolAdapter for RaydiumV3Adapter {
 }
 
 const DEFAULT_FEE_BPS: u64 = 25; // assumed Raydium taker fee (0.25%)
+const RAYDIUM_DEFAULT_CU_LIMIT: u32 = 350_000;
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
@@ -544,22 +628,15 @@ fn snapshot_probe_amount(reserve: u128) -> Option<u64> {
     Some(probe as u64)
 }
 
+fn sqrt_price_x64_from_x96(value: &U256) -> u128 {
+    (value >> 32).low_u128()
+}
+
 fn compute_slippage_bps(reference: f64, execution: f64) -> f64 {
     if !reference.is_finite() || reference == 0.0 || !execution.is_finite() {
         return 0.0;
     }
     (((reference - execution) / reference) * 10_000.0).abs()
-}
-
-fn needs_hydration(extras: &RaydiumV3PoolExtras) -> bool {
-    extras.tick_spacing.is_none()
-        || extras.sqrt_price_x64.is_none()
-        || extras.liquidity.is_none()
-        || extras.current_tick.is_none()
-        || extras.amm_config.is_none()
-        || extras.observation_state.is_none()
-        || extras.pool_bump.is_none()
-        || extras.trade_fee_rate.is_none()
 }
 
 fn active_tick_array_start(tick_spacing: i32, tick_index: i32) -> Option<i32> {
@@ -757,6 +834,9 @@ struct RaydiumPoolHydrator {
     pool_cache: DashMap<Pubkey, HydratedPoolMeta>,
     tick_array_cache: DashMap<(Pubkey, i32), HydratedTickArray>,
     amm_config_cache: DashMap<Pubkey, HydratedAmmConfig>,
+    missing_amm_configs: DashMap<Pubkey, Instant>,
+    missing_tick_arrays: DashMap<Pubkey, Instant>,
+    retry_backoff: Duration,
 }
 
 impl RaydiumPoolHydrator {
@@ -782,6 +862,9 @@ impl RaydiumPoolHydrator {
             pool_cache: DashMap::new(),
             tick_array_cache: DashMap::new(),
             amm_config_cache: DashMap::new(),
+            missing_amm_configs: DashMap::new(),
+            missing_tick_arrays: DashMap::new(),
+            retry_backoff: Duration::from_millis(config.hydration_retry_ms.max(1)),
         })
     }
 
@@ -810,6 +893,11 @@ impl RaydiumPoolHydrator {
         let key = (pool, start_tick_index);
         if let Some(entry) = self.tick_array_cache.get(&key) {
             return Some(entry.clone());
+        }
+
+        let address = derive_tick_array_address(&self.program_id, &pool, start_tick_index);
+        if self.should_skip_missing_tick_array(&address) {
+            return None;
         }
 
         self.fetch_tick_array_from_rpc(pool, start_tick_index)
@@ -854,19 +942,23 @@ impl RaydiumPoolHydrator {
         }
 
         let mut results = Vec::new();
-        let mut missing = Vec::new();
+        let mut pending = Vec::new();
         for start in start_tick_indices {
             let key = (pool, *start);
             if let Some(entry) = self.tick_array_cache.get(&key) {
                 results.push(entry.clone());
-            } else {
-                missing.push(*start);
+                continue;
             }
+            let address = derive_tick_array_address(&self.program_id, &pool, *start);
+            if self.should_skip_missing_tick_array(&address) {
+                continue;
+            }
+            pending.push((*start, address));
         }
 
-        if !missing.is_empty() {
-            self.fetch_tick_arrays_from_rpc(pool, &missing);
-            for start in missing {
+        if !pending.is_empty() {
+            self.fetch_tick_arrays_from_rpc(pool, &pending);
+            for (start, _) in pending {
                 let key = (pool, start);
                 if let Some(entry) = self.tick_array_cache.get(&key) {
                     results.push(entry.clone());
@@ -908,6 +1000,9 @@ impl RaydiumPoolHydrator {
     }
 
     fn hydrate_amm_config(&self, amm_config: Pubkey) -> Option<HydratedAmmConfig> {
+        if self.should_skip_missing_config(&amm_config) {
+            return None;
+        }
         if let Some(entry) = self.amm_config_cache.get(&amm_config) {
             return Some(entry.clone());
         }
@@ -931,12 +1026,23 @@ impl RaydiumPoolHydrator {
                     }
                 }
                 Err(error) => {
-                    warn!(
-                        target = "adapter::raydium_v3",
-                        amm_config = %amm_config,
-                        %error,
-                        "failed to fetch raydium amm config"
-                    );
+                    if is_account_not_found(&error) {
+                        let first_time = self.mark_missing_config(amm_config);
+                        if first_time {
+                            warn!(
+                                target = "adapter::raydium_v3",
+                                amm_config = %amm_config,
+                                "raydium amm config missing on-chain"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            target = "adapter::raydium_v3",
+                            amm_config = %amm_config,
+                            %error,
+                            "failed to fetch raydium amm config"
+                        );
+                    }
                 }
             }
         }
@@ -1008,13 +1114,25 @@ impl RaydiumPoolHydrator {
                     }
                 }
                 Err(error) => {
-                    warn!(
-                        target = "adapter::raydium_v3",
-                        pool = %pool,
-                        tick_array = %address,
-                        %error,
-                        "failed to fetch raydium tick array"
-                    );
+                    if is_account_not_found(&error) {
+                        let first_time = self.mark_missing_tick_array(address);
+                        if first_time {
+                            warn!(
+                                target = "adapter::raydium_v3",
+                                pool = %pool,
+                                tick_array = %address,
+                                "raydium tick array missing on-chain"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            target = "adapter::raydium_v3",
+                            pool = %pool,
+                            tick_array = %address,
+                            %error,
+                            "failed to fetch raydium tick array"
+                        );
+                    }
                 }
             }
         }
@@ -1022,23 +1140,17 @@ impl RaydiumPoolHydrator {
         None
     }
 
-    fn fetch_tick_arrays_from_rpc(&self, pool: Pubkey, tick_starts: &[i32]) {
-        if tick_starts.is_empty() {
+    fn fetch_tick_arrays_from_rpc(&self, pool: Pubkey, pending: &[(i32, Pubkey)]) {
+        if pending.is_empty() {
             return;
         }
 
-        let addresses: Vec<Pubkey> = tick_starts
-            .iter()
-            .map(|start| derive_tick_array_address(&self.program_id, &pool, *start))
-            .collect();
+        let addresses: Vec<Pubkey> = pending.iter().map(|(_, address)| *address).collect();
 
         for client in &self.clients {
             match client.get_multiple_accounts(&addresses) {
                 Ok(accounts) => {
-                    for ((start, address), account_opt) in tick_starts
-                        .iter()
-                        .zip(addresses.iter())
-                        .zip(accounts.into_iter())
+                    for ((start, address), account_opt) in pending.iter().zip(accounts.into_iter())
                     {
                         if let Some(account) = account_opt {
                             if let Some(array) = parse_tick_array_account(*address, &account.data) {
@@ -1062,9 +1174,44 @@ impl RaydiumPoolHydrator {
             }
         }
     }
+
+    fn should_skip_missing_config(&self, key: &Pubkey) -> bool {
+        Self::should_skip_missing(&self.missing_amm_configs, key, self.retry_backoff)
+    }
+
+    fn should_skip_missing_tick_array(&self, key: &Pubkey) -> bool {
+        Self::should_skip_missing(&self.missing_tick_arrays, key, self.retry_backoff)
+    }
+
+    fn mark_missing_config(&self, key: Pubkey) -> bool {
+        Self::record_missing(&self.missing_amm_configs, key)
+    }
+
+    fn mark_missing_tick_array(&self, key: Pubkey) -> bool {
+        Self::record_missing(&self.missing_tick_arrays, key)
+    }
+
+    fn should_skip_missing(
+        map: &DashMap<Pubkey, Instant>,
+        key: &Pubkey,
+        backoff: Duration,
+    ) -> bool {
+        if let Some(entry) = map.get(key) {
+            if entry.value().elapsed() < backoff {
+                return true;
+            }
+            drop(entry);
+            map.remove(key);
+        }
+        false
+    }
+
+    fn record_missing(map: &DashMap<Pubkey, Instant>, key: Pubkey) -> bool {
+        map.insert(key, Instant::now()).is_none()
+    }
 }
 
-const MIN_RAYDIUM_POOL_ACCOUNT_LEN: usize = 269;
+const MIN_RAYDIUM_POOL_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN + 261;
 
 fn parse_amm_config_account(data: &[u8]) -> Option<HydratedAmmConfig> {
     if data.len() < MIN_RAYDIUM_AMM_CONFIG_ACCOUNT_LEN {
@@ -1094,7 +1241,12 @@ fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
         return None;
     }
 
-    let mut cursor = 0usize;
+    let discriminator = data.get(0..ANCHOR_DISCRIMINATOR_LEN)?;
+    if discriminator != POOL_STATE_DISCRIMINATOR {
+        return None;
+    }
+
+    let mut cursor = ANCHOR_DISCRIMINATOR_LEN;
     let pool_bump = *data.get(cursor)?;
     cursor += 1;
 
@@ -1106,10 +1258,8 @@ fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
     skip_pubkey(data, &mut cursor)?; // token_vault_1
     let observation_state = read_pubkey(data, &mut cursor)?;
 
-    cursor = cursor.checked_add(2)?; // mint_decimals_0 + mint_decimals_1
-    if cursor > data.len() {
-        return None;
-    }
+    skip_bytes(data, &mut cursor, 2)?; // mint_decimals_0 + mint_decimals_1
+    skip_bytes(data, &mut cursor, 8)?; // reserved flags (token program ids, decimals extras)
 
     let tick_spacing = read_u16(data, &mut cursor)? as i32;
     let liquidity = read_u128(data, &mut cursor)?;
@@ -1276,6 +1426,18 @@ fn skip_bytes(data: &[u8], cursor: &mut usize, len: usize) -> Option<()> {
         Some(())
     } else {
         None
+    }
+}
+
+fn is_account_not_found(error: &ClientError) -> bool {
+    use solana_client::rpc_request::RpcError;
+
+    match error.kind() {
+        ClientErrorKind::RpcError(RpcError::RpcResponseError { message, data, .. }) => {
+            message.contains("AccountNotFound") || format!("{:?}", data).contains("AccountNotFound")
+        }
+        ClientErrorKind::Custom(message) => message.contains("AccountNotFound"),
+        _ => error.to_string().contains("AccountNotFound"),
     }
 }
 

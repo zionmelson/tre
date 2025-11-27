@@ -5,19 +5,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
+use crate::builder::{BuilderHandle, WhirlpoolPoolMeta};
 use crate::stages::types::{
     PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, WhirlpoolPoolExtras,
 };
 
 use super::{
     build_quote_response, mul_div_price, quote_from_price, ProtocolAdapter, QuoteRequest,
-    QuoteResponse, QuoteStatus, SwapDirection,
+    QuoteResponse, QuoteStatus, SwapDirection, TemplateContext,
 };
 
 const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN";
@@ -25,6 +26,7 @@ const TICK_ARRAY_SEED: &[u8] = b"tick_array";
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
+const WHIRLPOOL_DEFAULT_CU_LIMIT: u32 = 380_000;
 
 construct_uint! {
     pub struct U256(4);
@@ -44,7 +46,7 @@ impl Default for WhirlpoolAdapterConfig {
             stale_slot_threshold: 400,
             stale_after_ms: 2_000,
             rpc_endpoints: Vec::new(),
-            rpc_timeout_ms: 1_000,
+            rpc_timeout_ms: 15_000,
         }
     }
 }
@@ -54,10 +56,12 @@ pub struct WhirlpoolAdapter {
     state: DashMap<Pubkey, WhirlpoolState>,
     config: WhirlpoolAdapterConfig,
     hydrator: Option<WhirlpoolPoolHydrator>,
+    template_builder: Option<BuilderHandle>,
+    registered_templates: DashSet<Pubkey>,
 }
 
 impl WhirlpoolAdapter {
-    pub fn new(config: WhirlpoolAdapterConfig) -> Self {
+    pub fn new(config: WhirlpoolAdapterConfig, template_builder: Option<BuilderHandle>) -> Self {
         let program_id = Pubkey::from_str(WHIRLPOOL_PROGRAM_ID)
             .expect("static Whirlpool program id should be valid");
         let hydrator = WhirlpoolPoolHydrator::new(&config, program_id);
@@ -78,6 +82,8 @@ impl WhirlpoolAdapter {
             state: DashMap::new(),
             config,
             hydrator,
+            template_builder,
+            registered_templates: DashSet::new(),
         }
     }
 
@@ -178,6 +184,7 @@ impl WhirlpoolAdapter {
         );
 
         self.prefetch_tick_array_hints(&state);
+        self.register_templates_with_builder(&state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
     }
@@ -214,6 +221,72 @@ impl WhirlpoolAdapter {
         }
 
         extras
+    }
+
+    fn register_templates_with_builder(&self, state: &WhirlpoolState) {
+        let Some(builder) = self.template_builder.as_ref() else {
+            return;
+        };
+        let Some(raw_fee) = state.fee_rate else {
+            return;
+        };
+        if !self.registered_templates.insert(state.whirlpool) {
+            return;
+        }
+
+        let mut alt_accounts = Vec::with_capacity(12);
+        alt_accounts.push(state.whirlpool);
+        alt_accounts.push(state.token_mint_a);
+        alt_accounts.push(state.token_mint_b);
+        if let Some(pk) = state.token_vault_a {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.token_vault_b {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.oracle {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.tick_array0 {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.tick_array1 {
+            alt_accounts.push(pk);
+        }
+        if let Some(pk) = state.tick_array2 {
+            alt_accounts.push(pk);
+        }
+
+        let fee_bps = fee_bps_from_hundredth_bip(raw_fee);
+        let fee_tier_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
+        builder.register_whirlpool_pool(WhirlpoolPoolMeta {
+            pool_id: state.whirlpool,
+            fee_tier_bps,
+            alt_accounts,
+            alt_handle: None,
+        });
+    }
+
+    fn decorate_template_context(&self, response: &mut QuoteResponse, state: &WhirlpoolState) {
+        response.context = self.snapshot_template_context(state);
+    }
+
+    fn snapshot_template_context(&self, state: &WhirlpoolState) -> TemplateContext {
+        let mut context = TemplateContext::default();
+        context.compute_unit_limit = Some(WHIRLPOOL_DEFAULT_CU_LIMIT);
+        if let Some(oracle) = state.oracle {
+            context
+                .remaining_accounts
+                .push(AccountMeta::new_readonly(oracle, false));
+        }
+        for account in [state.tick_array0, state.tick_array1, state.tick_array2] {
+            if let Some(key) = account {
+                context
+                    .remaining_accounts
+                    .push(AccountMeta::new(key, false));
+            }
+        }
+        context
     }
 
     fn prefetch_tick_array_hints(&self, state: &WhirlpoolState) {
@@ -267,9 +340,11 @@ impl WhirlpoolAdapter {
             direction: SwapDirection::ExactIn,
         };
 
+        let mut sqrt_price_limit = None;
         let (expected_output, slippage_bps) = if let Some(simulation) =
             simulate_best_exact_in(self.hydrator.as_ref(), state, &req, probe_amount)
         {
+            sqrt_price_limit = Some(simulation.sqrt_price_after);
             (simulation.amount_out, simulation.edge_bps)
         } else {
             let price = state.mid_price()?;
@@ -296,6 +371,11 @@ impl WhirlpoolAdapter {
             fee_bps: whirlpool_trade_fee_bps(state),
             effective_price,
             estimated_slippage_bps: slippage_bps,
+            sqrt_price_limit,
+            min_output_amount: Some(expected_output),
+            limit_price: None,
+            price_impact_limit_bps: None,
+            context: self.snapshot_template_context(state),
         })
     }
 }
@@ -337,11 +417,16 @@ impl ProtocolAdapter for WhirlpoolAdapter {
             let mut response = build_quote_response(req, simulation.amount_out);
             response.edge_bps = simulation.edge_bps;
             response.sqrt_price_limit = Some(simulation.sqrt_price_after);
+            response.min_output_amount = Some(simulation.amount_out);
+            self.decorate_template_context(&mut response, &state);
             return Some(response);
         }
         let price = state.mid_price()?;
         let amount_out = quote_from_price(&req, &state.token_mint_a, &state.token_mint_b, price)?;
-        Some(build_quote_response(req, amount_out))
+        let mut fallback = build_quote_response(req, amount_out);
+        fallback.min_output_amount = Some(amount_out);
+        self.decorate_template_context(&mut fallback, &state);
+        Some(fallback)
     }
 
     fn quote_exact_out(&self, req: QuoteRequest) -> Option<QuoteResponse> {
@@ -355,25 +440,33 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         if let Some((amount_in, simulation)) =
             find_input_for_exact_out(self.hydrator.as_ref(), &state, &req, req.amount)
         {
-            return Some(QuoteResponse {
+            let mut response = QuoteResponse {
                 amount_in,
                 amount_out: req.amount,
                 edge_bps: simulation.edge_bps,
                 sqrt_price_limit: Some(simulation.sqrt_price_after),
+                min_output_amount: None,
                 status: QuoteStatus::Ok,
                 request: req,
-            });
+                context: TemplateContext::default(),
+            };
+            self.decorate_template_context(&mut response, &state);
+            return Some(response);
         }
 
         let amount_in = quote_exact_out_from_price(&req, &state)?;
-        Some(QuoteResponse {
+        let mut response = QuoteResponse {
             amount_in,
             amount_out: req.amount,
             edge_bps: 0.0,
             sqrt_price_limit: None,
+            min_output_amount: None,
             status: QuoteStatus::Ok,
             request: req,
-        })
+            context: TemplateContext::default(),
+        };
+        self.decorate_template_context(&mut response, &state);
+        Some(response)
     }
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
@@ -1853,6 +1946,8 @@ mod tests {
             state: DashMap::new(),
             config: WhirlpoolAdapterConfig::default(),
             hydrator: None,
+            template_builder: None,
+            registered_templates: DashSet::new(),
         };
 
         let pool = Pubkey::new_unique();

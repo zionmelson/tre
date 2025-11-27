@@ -20,16 +20,12 @@ message GenerateAuthChallengeRequest {
 }
 
 message GenerateAuthChallengeResponse {
-  /// Server-issued identifier for this challenge. Must be echoed in GenerateAuthTokensRequest.
-  string challenge_id = 1;
-
-  /// Bytes the client must sign (after prepending the pubkey) to prove ownership.
-  bytes challenge = 2;
+  string challenge = 1;
 }
 
 message GenerateAuthTokensRequest {
-  /// Identifier returned from GenerateAuthChallenge.
-  string challenge_id = 1;
+  /// The pre-signed challenge.
+  string challenge = 1;
 
   /// The signing keypair's corresponding 32 byte pubkey.
   bytes client_pubkey = 2;
@@ -77,4 +73,3 @@ service AuthService {
   /// Call this method with a non-expired refresh token to obtain a new access token.
   rpc RefreshAccessToken(RefreshAccessTokenRequest) returns (RefreshAccessTokenResponse) {}
 }
-

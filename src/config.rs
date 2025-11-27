@@ -19,13 +19,19 @@ pub struct AppConfig {
     pub token_pairs: Vec<[String; 2]>,
     #[serde(default)]
     pub program_addresses: Vec<String>,
-    pub flash_loan: FlashLoanConfig,
+    pub flash_loans: HashMap<String, FlashLoanConfig>,
     #[serde(default)]
     pub quicknode_rpcs: Vec<String>,
     #[serde(default)]
     pub protocols: HashMap<String, ProtocolConfig>,
     #[serde(default)]
     pub perf: PerfTuning,
+    #[serde(default)]
+    pub strategy: StrategyOverrides,
+    #[serde(default)]
+    pub alerts: AlertingConfig,
+    #[serde(default)]
+    pub submission: SubmissionTrackingConfig,
 }
 
 impl AppConfig {
@@ -67,14 +73,20 @@ impl AppConfig {
             .unwrap_or_else(|| self.quicknode_rpcs.clone())
     }
 
+    pub fn protocol_hydration_retry_ms(&self, protocol: &str) -> Option<u64> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.hydration_retry_ms)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.token_pairs.is_empty(),
             "token_pairs must contain at least one allowed pair"
         );
         ensure!(
-            !self.jito.endpoints.is_empty(),
-            "at least one Jito endpoint is required"
+            self.jito.endpoints.len() >= 2,
+            "jito.endpoints must contain at least two endpoints for failover"
         );
         ensure!(
             self.perf.ring_capacity > 0,
@@ -103,6 +115,10 @@ impl AppConfig {
         ensure!(
             self.corecast.cache.warm_capacity <= self.corecast.cache.channel_capacity,
             "corecast.cache.warm_capacity must be less than or equal to channel_capacity"
+        );
+        ensure!(
+            !self.flash_loans.is_empty(),
+            "flash_loans must contain at least one Solend reserve entry"
         );
         Ok(())
     }
@@ -156,6 +172,12 @@ pub struct JitoConfig {
     pub endpoints: Vec<String>,
     pub tip_floor_url: String,
     pub tip_stream_url: String,
+    #[serde(default)]
+    pub api_token: Option<String>,
+    #[serde(default)]
+    pub auction_stream_url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_path")]
+    pub ca_pem: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -167,14 +189,14 @@ pub struct FlashLoanConfig {
     pub reserve_liquidity_supply: String,
     pub reserve_liquidity_fee_receiver: String,
     pub host_fee_receiver: String,
+    #[serde(default)]
+    pub receiver_program_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreCastConfig {
     pub address: String,
     pub authorization: String,
-    #[serde(default, deserialize_with = "deserialize_optional_path")]
-    pub ca_pem: Option<PathBuf>,
     #[serde(default)]
     pub cache: CoreCastCache,
 }
@@ -206,10 +228,46 @@ pub struct PerfTuning {
     pub bundle_slab: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SubmissionTrackingConfig {
+    pub pending_ttl_secs: u64,
+    pub sweep_interval_secs: u64,
+    pub result_stream_backoff_ms: u64,
+    pub auction_stream_backoff_ms: u64,
+    pub status_poll_interval_secs: u64,
+    pub status_poll_batch_size: usize,
+    pub status_poll_timeout_secs: u64,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProtocolConfig {
     #[serde(default)]
     pub rpc_endpoints: Vec<String>,
+    #[serde(default)]
+    pub hydration_retry_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct StrategyOverrides {
+    pub min_edge_bps: Option<f64>,
+    pub max_opportunity_staleness_ms: Option<u64>,
+    pub max_duplicates_per_signature: Option<usize>,
+    pub max_route_hops: Option<usize>,
+    pub min_profit_lamports: Option<u64>,
+    pub min_tip_lamports: Option<u64>,
+    pub max_tip_lamports: Option<u64>,
+    pub tip_profit_share_bps: Option<u64>,
+    pub tip_floor_markup_bps: Option<u64>,
+    pub tip_floor_fallback_lamports: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AlertingConfig {
+    pub webhook_url: Option<String>,
+    pub environment: Option<String>,
 }
 
 const KNOWN_PROTOCOLS: &[&str] = &[
@@ -229,6 +287,20 @@ impl Default for PerfTuning {
             ring_capacity: 1024,
             opportunity_slab: 2048,
             bundle_slab: 512,
+        }
+    }
+}
+
+impl Default for SubmissionTrackingConfig {
+    fn default() -> Self {
+        Self {
+            pending_ttl_secs: 180,
+            sweep_interval_secs: 10,
+            result_stream_backoff_ms: 500,
+            auction_stream_backoff_ms: 1_000,
+            status_poll_interval_secs: 5,
+            status_poll_batch_size: 32,
+            status_poll_timeout_secs: 2,
         }
     }
 }

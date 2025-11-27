@@ -4,10 +4,12 @@ use std::time::Instant;
 use once_cell::sync::Lazy;
 use solana_sdk::pubkey::Pubkey;
 
+use crate::builder::BundleBuildContext;
 use crate::proto::solana_corecast::{DexTradeStreamMessage, PoolLiquidityChangeStreamMessage};
 use crate::proto::solana_messages::{
     Account as ProtoAccount, Currency, ParsedIdlInstruction, PoolLiquidityChangeEvent, Program,
 };
+use crate::template::TemplateContext;
 
 #[derive(Debug, Clone)]
 pub struct PoolUpdate {
@@ -919,6 +921,11 @@ pub struct PoolQuoteSide {
     pub fee_bps: u64,
     pub effective_price: f64,
     pub estimated_slippage_bps: f64,
+    pub sqrt_price_limit: Option<u128>,
+    pub min_output_amount: Option<u64>,
+    pub limit_price: Option<i64>,
+    pub price_impact_limit_bps: Option<u16>,
+    pub context: TemplateContext,
 }
 
 impl PoolQuoteSide {
@@ -1099,6 +1106,11 @@ pub struct BundleCandidate {
     pub created_at: Instant,
     pub route_plan: Option<RoutePlan>,
     pub instructions: Vec<PlannedInstruction>,
+    pub bundle_context: Option<BundleBuildContext>,
+    pub tip_lamports: Option<u64>,
+    pub tip_account: Option<Pubkey>,
+    pub stage2_attempts: u8,
+    pub stage3_attempts: u8,
 }
 
 impl BundleCandidate {
@@ -1109,9 +1121,14 @@ impl BundleCandidate {
             pool_id: opportunity.trade.pool_id.clone(),
             trade_signature: opportunity.trade.signature.clone(),
             estimated_edge_bps: opportunity.estimated_edge_bps,
-            created_at: Instant::now(),
+            created_at: opportunity.created_at,
             route_plan: opportunity.route_plan.clone(),
             instructions: Vec::new(),
+            bundle_context: None,
+            tip_lamports: None,
+            tip_account: None,
+            stage2_attempts: 0,
+            stage3_attempts: 0,
         }
     }
 }
@@ -1135,6 +1152,14 @@ pub struct RouteLegPlan {
     pub effective_price: f64,
     pub fee_bps: u64,
     pub estimated_slippage_bps: f64,
+    pub direction: PoolQuoteDirection,
+    pub sqrt_price_limit: Option<u128>,
+    pub min_output_amount: Option<u64>,
+    pub limit_price: Option<i64>,
+    pub price_impact_limit_bps: Option<u16>,
+    pub context: TemplateContext,
+    pub template_ready: bool,
+    pub alt_ready: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1144,4 +1169,23 @@ pub struct PlannedInstruction {
     pub input_mint: String,
     pub output_mint: String,
     pub amount: u64,
+    pub estimated_output_amount: u64,
+    pub fee_bps: u64,
+    pub direction: PoolQuoteDirection,
+    pub lookup_table: Option<PlannedLookupTable>,
+    pub sqrt_price_limit: Option<u128>,
+    pub min_output_amount: Option<u64>,
+    pub limit_price: Option<i64>,
+    pub price_impact_limit_bps: Option<u16>,
+    pub context: TemplateContext,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlannedLookupTable {
+    pub handle_id: u32,
+    pub table_address: String,
+    pub authority: String,
+    pub creation_slot: u64,
+    pub last_extended_slot: u64,
+    pub accounts: Vec<String>,
 }

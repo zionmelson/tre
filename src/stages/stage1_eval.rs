@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
@@ -16,11 +16,13 @@ use crate::adapters::{
     LifinityAdapterConfig, ProtocolAdapter, QuoteRequest, QuoteResponse, RaydiumV3Adapter,
     RaydiumV3AdapterConfig, SwapDirection, WhirlpoolAdapter, WhirlpoolAdapterConfig,
 };
-use crate::builder::{BuilderHandle, BuilderStage};
+use crate::builder::templates::SwapTemplateDirection;
+use crate::builder::{BuilderHandle, BuilderStage, TemplateReadiness};
 use crate::config::AppConfig;
 use crate::core::{pin_current_thread, Lease, RingConsumer, RingProducer, SlabPool};
 use crate::notifier::Notifier;
 use crate::strategy::StrategyEngine;
+use crate::telemetry::{self, Stage1BackpressureEvent, Stage1FeedGapEvent};
 
 use super::graph_manager::{ArbitrageOpportunity, GraphManager, PathLeg, PoolPath};
 use super::types::{
@@ -30,6 +32,65 @@ use super::types::{
 
 const MAX_MULTI_LEG_PATHS: usize = 4;
 const MAX_MULTI_LEG_HOPS: usize = 3;
+const MAX_CLOSING_PATHS: usize = 2;
+const PATH_PROFILE_LOG_INTERVAL_SECS: u64 = 10;
+const OVERFLOW_QUEUE_CAPACITY: usize = 256;
+const MAX_DEFERRED_TRADES_PER_POOL: usize = 64;
+
+struct PathSearchProfile {
+    total_duration: Duration,
+    max_duration: Duration,
+    sample_count: u64,
+    last_log: Instant,
+}
+
+impl PathSearchProfile {
+    fn new() -> Self {
+        Self {
+            total_duration: Duration::ZERO,
+            max_duration: Duration::ZERO,
+            sample_count: 0,
+            last_log: Instant::now(),
+        }
+    }
+
+    fn record(&mut self, duration: Duration) {
+        self.total_duration += duration;
+        if duration > self.max_duration {
+            self.max_duration = duration;
+        }
+        self.sample_count += 1;
+    }
+
+    fn maybe_log(&mut self, path_count: usize) {
+        if self.last_log.elapsed().as_secs() < PATH_PROFILE_LOG_INTERVAL_SECS {
+            return;
+        }
+        if self.sample_count == 0 {
+            self.last_log = Instant::now();
+            return;
+        }
+
+        let divisor = self.sample_count.min(u32::MAX as u64) as u32;
+        let avg_duration = if divisor > 0 {
+            self.total_duration / divisor
+        } else {
+            Duration::ZERO
+        };
+        debug!(
+            avg_duration_micros = avg_duration.as_micros(),
+            max_duration_micros = self.max_duration.as_micros(),
+            samples = self.sample_count,
+            last_path_count = path_count,
+            "stage1 path search profile",
+        );
+
+        self.total_duration = Duration::ZERO;
+        self.max_duration = Duration::ZERO;
+        self.sample_count = 0;
+        self.last_log = Instant::now();
+    }
+}
 
 pub fn spawn_eval_stage(
     stop: Arc<AtomicBool>,
@@ -83,8 +144,12 @@ fn run(
     builder.flash_loan_planner().prepare_default_routes();
 
     let mut pool_snapshots: HashMap<String, PoolSnapshot> = HashMap::new();
+    let mut pending_trades: HashMap<String, VecDeque<TradeUpdate>> = HashMap::new();
+    let mut overflow_queue: VecDeque<BundleCandidate> =
+        VecDeque::with_capacity(OVERFLOW_QUEUE_CAPACITY);
+    let mut path_profile = PathSearchProfile::new();
     let mut opportunity_seq = 0u64;
-    let adapters = AdapterBook::new(config);
+    let adapters = AdapterBook::new(config, builder.clone());
     let mut graph_manager = GraphManager::new();
     let mut last_cycle_signatures: HashSet<String> = HashSet::new();
 
@@ -92,6 +157,10 @@ fn run(
     while !stop.load(Ordering::Relaxed) {
         builder.heartbeat(BuilderStage::EvalHotPath);
         let mut made_progress = false;
+
+        if flush_overflow_queue(&mut overflow_queue, &bundle_pool, &producer) {
+            made_progress = true;
+        }
 
         if let Some(pool_lease) = pool_consumer.pop() {
             let update = pool_lease.into_inner();
@@ -101,7 +170,8 @@ fn run(
                 snapshot.quotes = Some(quotes);
             }
             graph_manager.index_pool(&snapshot);
-            pool_snapshots.insert(snapshot.pool_id.clone(), snapshot);
+            let pool_id = snapshot.pool_id.clone();
+            pool_snapshots.insert(pool_id.clone(), snapshot);
             let cycles = graph_manager.latest_profitable_cycles();
             let cycle_signatures: HashSet<String> = cycles.iter().map(cycle_signature).collect();
             if cycles.is_empty() {
@@ -113,58 +183,61 @@ fn run(
                     last_cycle_signatures = cycle_signatures;
                 }
             }
+
+            if let Some(mut queue) = pending_trades.remove(&pool_id) {
+                while let Some(trade) = queue.pop_front() {
+                    telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::BacklogFlushed);
+                    match process_trade_update(
+                        trade,
+                        pool_snapshots.get(&pool_id).cloned(),
+                        &mut path_profile,
+                        &mut graph_manager,
+                        &pool_snapshots,
+                        &adapters,
+                        &builder,
+                        strategy.as_ref(),
+                        notifier.as_ref(),
+                        &bundle_pool,
+                        &producer,
+                        &mut overflow_queue,
+                        &mut opportunity_seq,
+                    ) {
+                        TradeProcessResult::Processed => {}
+                        TradeProcessResult::MissingSnapshot(trade) => {
+                            enqueue_pending_trade(&mut pending_trades, trade);
+                            break;
+                        }
+                    }
+                }
+                if !queue.is_empty() {
+                    pending_trades.insert(pool_id.clone(), queue);
+                }
+            }
             made_progress = true;
         }
 
         if let Some(trade_lease) = trade_consumer.pop() {
             let trade = trade_lease.into_inner();
             let snapshot = pool_snapshots.get(&trade.pool_id).cloned();
-            let quote_edge = adapters.quote_trade(&trade).map(|quote| {
-                if quote.amount_in == 0 || quote.amount_out == 0 {
-                    return 0.0;
-                }
-                let quote_price = quote.amount_out as f64 / quote.amount_in as f64;
-                compute_edge_bps(trade.price(), quote_price)
-            });
-            let multi_leg_paths = graph_manager.find_paths(
-                &trade.sell_mint,
-                &trade.buy_mint,
-                MAX_MULTI_LEG_HOPS,
-                MAX_MULTI_LEG_PATHS,
-            );
-            let mut selected_route: Option<RoutePlan> = None;
-            if let Some(best_path) = multi_leg_paths.first() {
-                let direct_pools = graph_manager.pools_for_pair(&trade.sell_mint, &trade.buy_mint);
-                let best_ratio = graph_manager.path_price_ratio(best_path);
-                if trade.sell_amount > 0 {
-                    selected_route =
-                        build_route_plan(best_path, &pool_snapshots, trade.sell_amount);
-                }
-                debug!(
-                    path_len = best_path.len(),
-                    path_count = multi_leg_paths.len(),
-                    direct_pool_count = direct_pools.len(),
-                    best_ratio,
-                    sell_mint = %trade.sell_mint,
-                    buy_mint = %trade.buy_mint,
-                    "multi-leg route candidates discovered",
-                );
-            }
-            let mut opportunity =
-                Opportunity::from_trade(opportunity_seq, trade, snapshot, quote_edge);
-            opportunity.route_plan = selected_route;
-            opportunity_seq = opportunity_seq.wrapping_add(1);
-
-            if let Some(candidate) = strategy.evaluate(&opportunity) {
-                if let Some(lease) = bundle_pool.try_acquire_with(|| candidate) {
-                    if producer.push(lease).is_ok() {
-                        debug!(
-                            opp_seq = opportunity.seq,
-                            edge_bps = opportunity.estimated_edge_bps,
-                            signature = %opportunity.trade.signature,
-                            "emitted bundle candidate"
-                        );
-                    }
+            match process_trade_update(
+                trade,
+                snapshot,
+                &mut path_profile,
+                &mut graph_manager,
+                &pool_snapshots,
+                &adapters,
+                &builder,
+                strategy.as_ref(),
+                notifier.as_ref(),
+                &bundle_pool,
+                &producer,
+                &mut overflow_queue,
+                &mut opportunity_seq,
+            ) {
+                TradeProcessResult::Processed => {}
+                TradeProcessResult::MissingSnapshot(trade) => {
+                    telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::MissingSnapshot);
+                    enqueue_pending_trade(&mut pending_trades, trade);
                 }
             }
 
@@ -179,6 +252,254 @@ fn run(
 
     info!("stage1 eval shutting down");
     Ok(())
+}
+
+fn enqueue_overflow(queue: &mut VecDeque<BundleCandidate>, candidate: BundleCandidate) -> bool {
+    if queue.len() >= OVERFLOW_QUEUE_CAPACITY {
+        warn!(
+            seq = candidate.seq,
+            "stage1 overflow queue full; dropping candidate"
+        );
+        false
+    } else {
+        queue.push_back(candidate);
+        true
+    }
+}
+
+fn dispatch_bundle_candidate(
+    bundle_pool: &SlabPool<BundleCandidate>,
+    producer: &RingProducer<Lease<BundleCandidate>>,
+    candidate: BundleCandidate,
+) -> Result<(), DispatchError> {
+    let lease = bundle_pool
+        .try_acquire_with(|| candidate.clone())
+        .ok_or_else(|| DispatchError::SlabExhausted(candidate.clone()))?;
+    producer
+        .push(lease)
+        .map_err(|lease| DispatchError::RingFull(lease.into_inner()))
+}
+
+fn flush_overflow_queue(
+    queue: &mut VecDeque<BundleCandidate>,
+    bundle_pool: &SlabPool<BundleCandidate>,
+    producer: &RingProducer<Lease<BundleCandidate>>,
+) -> bool {
+    let mut made_progress = false;
+    while let Some(candidate) = queue.pop_front() {
+        match dispatch_bundle_candidate(bundle_pool, producer, candidate) {
+            Ok(()) => {
+                telemetry::record_stage1_backpressure(Stage1BackpressureEvent::OverflowFlushed);
+                made_progress = true;
+            }
+            Err(err) => {
+                let (event, candidate) = match err {
+                    DispatchError::SlabExhausted(candidate) => {
+                        (Stage1BackpressureEvent::SlabExhausted, candidate)
+                    }
+                    DispatchError::RingFull(candidate) => {
+                        (Stage1BackpressureEvent::RingFull, candidate)
+                    }
+                };
+                telemetry::record_stage1_backpressure(event);
+                queue.push_front(candidate);
+                break;
+            }
+        }
+    }
+    made_progress
+}
+
+fn enqueue_pending_trade(pending: &mut HashMap<String, VecDeque<TradeUpdate>>, trade: TradeUpdate) {
+    let pool_id = trade.pool_id.clone();
+    let queue = pending.entry(pool_id.clone()).or_default();
+    if queue.len() >= MAX_DEFERRED_TRADES_PER_POOL {
+        telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::BacklogOverflow);
+        warn!(
+            pool = %pool_id,
+            seq = trade.seq,
+            "pending trade backlog full; dropping trade"
+        );
+        return;
+    }
+
+    queue.push_back(trade);
+    telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::BacklogQueued);
+}
+
+enum TradeProcessResult {
+    Processed,
+    MissingSnapshot(TradeUpdate),
+}
+
+fn process_trade_update(
+    trade: TradeUpdate,
+    snapshot: Option<PoolSnapshot>,
+    path_profile: &mut PathSearchProfile,
+    graph_manager: &mut GraphManager,
+    pool_snapshots: &HashMap<String, PoolSnapshot>,
+    adapters: &AdapterBook,
+    builder: &BuilderHandle,
+    strategy: &StrategyEngine,
+    notifier: &Notifier,
+    bundle_pool: &SlabPool<BundleCandidate>,
+    producer: &RingProducer<Lease<BundleCandidate>>,
+    overflow_queue: &mut VecDeque<BundleCandidate>,
+    opportunity_seq: &mut u64,
+) -> TradeProcessResult {
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => return TradeProcessResult::MissingSnapshot(trade),
+    };
+
+    let quote_edge = adapters.quote_trade(&trade).map(|quote| {
+        if quote.amount_in == 0 || quote.amount_out == 0 {
+            return 0.0;
+        }
+        let quote_price = quote.amount_out as f64 / quote.amount_in as f64;
+        compute_edge_bps(trade.price(), quote_price)
+    });
+
+    let path_search_start = Instant::now();
+    let candidate_paths =
+        candidate_paths_for_trade(graph_manager, &trade.sell_mint, &trade.buy_mint);
+    let path_search_elapsed = path_search_start.elapsed();
+    path_profile.record(path_search_elapsed);
+    path_profile.maybe_log(candidate_paths.len());
+    telemetry::record_path_search(path_search_elapsed, candidate_paths.len());
+
+    if let Some(best_path) = candidate_paths.first() {
+        let direct_pools = graph_manager.pools_for_pair(&trade.sell_mint, &trade.buy_mint);
+        let best_ratio = graph_manager.path_price_ratio(best_path);
+        debug!(
+            path_len = best_path.len(),
+            path_count = candidate_paths.len(),
+            direct_pool_count = direct_pools.len(),
+            best_ratio,
+            sell_mint = %trade.sell_mint,
+            buy_mint = %trade.buy_mint,
+            "multi-leg route candidates discovered",
+        );
+    }
+
+    let mut selected_route: Option<RoutePlan> = None;
+    let mut fallback_route: Option<(RoutePlan, usize, usize)> = None;
+
+    if trade.sell_amount > 0 {
+        for path in &candidate_paths {
+            let mut plan = match build_route_plan(path, pool_snapshots, trade.sell_amount) {
+                Some(plan) => plan,
+                None => continue,
+            };
+            annotate_route_leg_readiness(builder, &mut plan);
+            if route_plan_serializable(&plan) {
+                selected_route = Some(plan);
+                break;
+            }
+            let score = route_readiness_score(&plan);
+            let leg_count = plan.legs.len();
+            let replace = match &fallback_route {
+                Some((_, best_score, best_len)) => {
+                    score > *best_score || (score == *best_score && leg_count < *best_len)
+                }
+                None => true,
+            };
+            if replace {
+                fallback_route = Some((plan, score, leg_count));
+            }
+        }
+    }
+
+    if selected_route.is_none() {
+        selected_route = fallback_route.map(|(plan, _, _)| plan);
+    }
+
+    let mut opportunity =
+        Opportunity::from_trade(*opportunity_seq, trade, Some(snapshot), quote_edge);
+    opportunity.route_plan = selected_route;
+    *opportunity_seq = opportunity_seq.wrapping_add(1);
+
+    if let Some(candidate) = strategy.evaluate(&opportunity) {
+        if let Err(err) = notifier.notify_bundle_candidate(&candidate) {
+            warn!(
+                error = %err,
+                seq = candidate.seq,
+                "failed to send bundle candidate alert"
+            );
+        }
+        match dispatch_bundle_candidate(bundle_pool, producer, candidate) {
+            Ok(()) => {
+                debug!(
+                    opp_seq = opportunity.seq,
+                    edge_bps = opportunity.estimated_edge_bps,
+                    signature = %opportunity.trade.signature,
+                    "emitted bundle candidate"
+                );
+            }
+            Err(err) => {
+                let (event, candidate) = match err {
+                    DispatchError::SlabExhausted(candidate) => {
+                        (Stage1BackpressureEvent::SlabExhausted, candidate)
+                    }
+                    DispatchError::RingFull(candidate) => {
+                        (Stage1BackpressureEvent::RingFull, candidate)
+                    }
+                };
+                telemetry::record_stage1_backpressure(event);
+                if enqueue_overflow(overflow_queue, candidate) {
+                    telemetry::record_stage1_backpressure(Stage1BackpressureEvent::OverflowQueued);
+                } else {
+                    telemetry::record_stage1_backpressure(Stage1BackpressureEvent::OverflowDropped);
+                }
+            }
+        }
+    }
+
+    TradeProcessResult::Processed
+}
+
+fn annotate_route_leg_readiness(builder: &BuilderHandle, plan: &mut RoutePlan) {
+    for leg in &mut plan.legs {
+        if let Some(status) = readiness_for_leg(builder, leg) {
+            leg.template_ready = status.template_ready;
+            leg.alt_ready = status.alt_ready;
+            leg.context.template_ready = status.template_ready;
+            leg.context.alt_ready = status.alt_ready;
+        } else {
+            leg.template_ready = false;
+            leg.alt_ready = false;
+            leg.context.template_ready = false;
+            leg.context.alt_ready = false;
+        }
+    }
+}
+
+fn readiness_for_leg(builder: &BuilderHandle, leg: &RouteLegPlan) -> Option<TemplateReadiness> {
+    let pool = Pubkey::from_str(&leg.pool_id).ok()?;
+    let direction = match leg.direction {
+        PoolQuoteDirection::BaseToQuote => SwapTemplateDirection::BaseIn,
+        PoolQuoteDirection::QuoteToBase => SwapTemplateDirection::BaseOut,
+    };
+    let fee_bps = leg.fee_bps.min(u16::MAX as u64) as u16;
+    Some(builder.template_readiness(&pool, direction, fee_bps))
+}
+
+fn route_plan_serializable(plan: &RoutePlan) -> bool {
+    plan.legs
+        .iter()
+        .all(|leg| leg.template_ready && leg.alt_ready)
+}
+
+fn route_readiness_score(plan: &RoutePlan) -> usize {
+    plan.legs
+        .iter()
+        .filter(|leg| leg.template_ready && leg.alt_ready)
+        .count()
+}
+
+enum DispatchError {
+    SlabExhausted(BundleCandidate),
+    RingFull(BundleCandidate),
 }
 
 fn cycle_signature(opportunity: &ArbitrageOpportunity) -> String {
@@ -209,6 +530,11 @@ fn build_route_plan(
         let quote = snapshot.quote(direction)?.clone();
         let input_amount = running_amount;
         let estimated_output_amount = estimate_output_amount(input_amount, quote.price());
+        let min_output_amount = quote
+            .min_output_amount
+            .and_then(|min_out| scale_quote_amount(min_out, quote.notional, input_amount));
+        let limit_price = quote.limit_price;
+        let price_impact_limit_bps = quote.price_impact_limit_bps;
         running_amount = estimated_output_amount;
 
         legs.push(RouteLegPlan {
@@ -221,6 +547,14 @@ fn build_route_plan(
             effective_price: quote.price(),
             fee_bps: quote.fee_bps,
             estimated_slippage_bps: quote.slippage_bps(),
+            direction,
+            sqrt_price_limit: quote.sqrt_price_limit,
+            min_output_amount,
+            limit_price,
+            price_impact_limit_bps,
+            context: quote.context.clone(),
+            template_ready: false,
+            alt_ready: false,
         });
     }
 
@@ -230,6 +564,71 @@ fn build_route_plan(
         legs,
         estimated_final_output_amount: Some(running_amount),
     })
+}
+
+fn candidate_paths_for_trade(
+    graph_manager: &GraphManager,
+    sell_mint: &str,
+    buy_mint: &str,
+) -> Vec<PoolPath> {
+    let mut candidates = Vec::new();
+
+    let cycles =
+        graph_manager.find_cycles_through(sell_mint, MAX_MULTI_LEG_HOPS, MAX_MULTI_LEG_PATHS);
+    for cycle in cycles {
+        candidates.push(cycle);
+        if candidates.len() >= MAX_MULTI_LEG_PATHS {
+            return candidates;
+        }
+    }
+
+    let directional_paths =
+        graph_manager.find_paths(sell_mint, buy_mint, MAX_MULTI_LEG_HOPS, MAX_MULTI_LEG_PATHS);
+    for path in directional_paths {
+        if candidates.len() >= MAX_MULTI_LEG_PATHS {
+            break;
+        }
+        if let Some(closed) = close_path_to_start(&path, graph_manager) {
+            candidates.push(closed);
+        }
+    }
+
+    candidates
+}
+
+fn close_path_to_start(path: &PoolPath, graph_manager: &GraphManager) -> Option<PoolPath> {
+    if path.start_mint == path.end_mint {
+        return Some(path.clone());
+    }
+
+    let remaining_hops = MAX_MULTI_LEG_HOPS.saturating_sub(path.len());
+    if remaining_hops == 0 {
+        return None;
+    }
+
+    let closing_paths = graph_manager.find_paths(
+        &path.end_mint,
+        &path.start_mint,
+        remaining_hops,
+        MAX_CLOSING_PATHS,
+    );
+
+    for closing in closing_paths {
+        let total_len = path.len() + closing.len();
+        if total_len > MAX_MULTI_LEG_HOPS {
+            continue;
+        }
+        let mut legs = Vec::with_capacity(total_len);
+        legs.extend(path.legs.iter().cloned());
+        legs.extend(closing.legs.into_iter());
+        return Some(PoolPath {
+            start_mint: path.start_mint.clone(),
+            end_mint: path.start_mint.clone(),
+            legs,
+        });
+    }
+
+    None
 }
 
 fn quote_direction_for_leg(snapshot: &PoolSnapshot, leg: &PathLeg) -> Option<PoolQuoteDirection> {
@@ -254,11 +653,22 @@ fn estimate_output_amount(input: u64, price: f64) -> u64 {
     clamped.floor() as u64
 }
 
+fn scale_quote_amount(amount: u64, base_notional: u64, target_notional: u64) -> Option<u64> {
+    if base_notional == 0 {
+        return None;
+    }
+    let scaled = (amount as u128)
+        .saturating_mul(target_notional as u128)
+        .checked_div(base_notional as u128)?;
+    Some(scaled.min(u64::MAX as u128) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::stages::graph_manager::PoolPath;
     use crate::stages::types::{PoolBidirectionalQuotes, PoolQuoteSide, PoolUpdateExtensions};
+    use crate::template::TemplateContext;
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -271,6 +681,11 @@ mod tests {
             fee_bps: 30,
             effective_price: price,
             estimated_slippage_bps: 5.0,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: Some(30),
+            context: TemplateContext::default(),
         }
     }
 
@@ -344,28 +759,43 @@ struct AdapterBook {
 }
 
 impl AdapterBook {
-    fn new(config: Arc<AppConfig>) -> Self {
+    fn new(config: Arc<AppConfig>, builder: BuilderHandle) -> Self {
         let mut adapters: HashMap<String, Arc<dyn ProtocolAdapter>> = HashMap::new();
 
         register_adapter(
             &mut adapters,
-            Arc::new(RaydiumV3Adapter::new(raydium_config(config.as_ref()))),
+            Arc::new(RaydiumV3Adapter::new(
+                raydium_config(config.as_ref()),
+                Some(builder.clone()),
+            )),
         );
         register_adapter(
             &mut adapters,
-            Arc::new(CpAmmAdapter::new(cp_amm_config(config.as_ref()))),
+            Arc::new(CpAmmAdapter::new(
+                cp_amm_config(config.as_ref()),
+                Some(builder.clone()),
+            )),
         );
         register_adapter(
             &mut adapters,
-            Arc::new(LbClmmAdapter::new(lb_clmm_config(config.as_ref()))),
+            Arc::new(LbClmmAdapter::new(
+                lb_clmm_config(config.as_ref()),
+                Some(builder.clone()),
+            )),
         );
         register_adapter(
             &mut adapters,
-            Arc::new(LifinityAdapter::new(lifinity_config(config.as_ref()))),
+            Arc::new(LifinityAdapter::new(
+                lifinity_config(config.as_ref()),
+                Some(builder.clone()),
+            )),
         );
         register_adapter(
             &mut adapters,
-            Arc::new(WhirlpoolAdapter::new(whirlpool_config(config.as_ref()))),
+            Arc::new(WhirlpoolAdapter::new(
+                whirlpool_config(config.as_ref()),
+                Some(builder.clone()),
+            )),
         );
 
         Self { adapters }

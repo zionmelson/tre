@@ -194,9 +194,18 @@ fn emit_cp_amm_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::erro
         let Some(ix) = idl.instructions.iter().find(|ix| ix.name == *instr_name) else {
             return Err(format!("missing instruction {instr_name} in cp_amm idl").into());
         };
-        for direction in [TemplateDirection::BaseIn, TemplateDirection::BaseOut] {
-            let rendered = render_cp_amm_template(ix, program_id, direction)?;
-            buffer.push_str(&rendered);
+
+        match *instr_name {
+            "swap" => {
+                let rendered = render_cp_amm_template(ix, program_id, TemplateDirection::BaseIn)?;
+                buffer.push_str(&rendered);
+            }
+            _ => {
+                for direction in [TemplateDirection::BaseIn, TemplateDirection::BaseOut] {
+                    let rendered = render_cp_amm_template(ix, program_id, direction)?;
+                    buffer.push_str(&rendered);
+                }
+            }
         }
     }
 
@@ -336,11 +345,18 @@ fn lifinity_accounts_with_pdas(accounts: &[IdlAccount]) -> Vec<IdlAccount> {
             let mut cloned = account.clone();
             if cloned.name == "authority" && cloned.pda.is_none() {
                 cloned.pda = Some(IdlPda {
-                    seeds: vec![IdlSeed {
-                        kind: "account".to_string(),
-                        path: Some("amm".to_string()),
-                        value: None,
-                    }],
+                    seeds: vec![
+                        IdlSeed {
+                            kind: "const".to_string(),
+                            value: Some(serde_json::Value::String("authority".to_string())),
+                            path: None,
+                        },
+                        IdlSeed {
+                            kind: "account".to_string(),
+                            path: Some("amm".to_string()),
+                            value: None,
+                        },
+                    ],
                 });
             }
             cloned

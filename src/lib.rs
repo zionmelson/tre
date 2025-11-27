@@ -9,4 +9,6 @@ pub mod proto;
 pub mod runtime;
 pub mod stages;
 pub mod strategy;
+pub mod telemetry;
+pub mod template;
 pub mod token_pair;

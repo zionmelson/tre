@@ -1,5 +1,5 @@
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 const NEGATIVE_CYCLE_EPSILON: f64 = 1e-12;
 
@@ -26,6 +26,38 @@ pub struct PoolPath {
 impl PoolPath {
     pub fn len(&self) -> usize {
         self.legs.len()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RankedPath {
+    ratio: f64,
+    hop_count: usize,
+    path: PoolPath,
+}
+
+impl PartialEq for RankedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.ratio.to_bits() == other.ratio.to_bits()
+            && self.hop_count == other.hop_count
+            && self.path == other.path
+    }
+}
+
+impl Eq for RankedPath {}
+
+impl PartialOrd for RankedPath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedPath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.ratio.total_cmp(&other.ratio) {
+            Ordering::Equal => other.hop_count.cmp(&self.hop_count),
+            other => other,
+        }
     }
 }
 
@@ -106,19 +138,25 @@ impl GraphManager {
         if max_hops == 0 || max_results == 0 || start_mint == target_mint {
             return Vec::new();
         }
-        let mut results = Vec::new();
+        let mut best_paths: BinaryHeap<Reverse<RankedPath>> = BinaryHeap::new();
         let mut queue = VecDeque::new();
         queue.push_back(SearchState::new(start_mint));
 
         while let Some(state) = queue.pop_front() {
             if state.current_mint == target_mint && !state.legs.is_empty() {
-                results.push(PoolPath {
+                let path = PoolPath {
                     start_mint: start_mint.to_string(),
                     end_mint: target_mint.to_string(),
                     legs: state.legs.clone(),
-                });
-                if results.len() >= max_results {
-                    break;
+                };
+                let ratio = self.path_price_ratio(&path).unwrap_or(1.0);
+                best_paths.push(Reverse(RankedPath {
+                    ratio,
+                    hop_count: path.len(),
+                    path,
+                }));
+                if best_paths.len() > max_results {
+                    best_paths.pop();
                 }
                 continue;
             }
@@ -149,18 +187,94 @@ impl GraphManager {
             }
         }
 
-        if results.len() > 1 {
-            results.sort_by(|a, b| {
-                let a_ratio = self.path_price_ratio(a).unwrap_or(1.0);
-                let b_ratio = self.path_price_ratio(b).unwrap_or(1.0);
-                match b_ratio.partial_cmp(&a_ratio).unwrap_or(Ordering::Equal) {
-                    Ordering::Equal => a.len().cmp(&b.len()),
-                    other => other,
-                }
-            });
+        let mut ordered = Vec::with_capacity(best_paths.len());
+        while let Some(Reverse(entry)) = best_paths.pop() {
+            ordered.push(entry.path);
+        }
+        ordered.reverse();
+        ordered
+    }
+
+    pub fn find_cycles_through(
+        &self,
+        anchor_mint: &str,
+        max_hops: usize,
+        max_results: usize,
+    ) -> Vec<PoolPath> {
+        if max_hops < 2 || max_results == 0 || !self.token_known(anchor_mint) {
+            return Vec::new();
         }
 
-        results
+        let anchor = anchor_mint.to_string();
+        let mut best_paths: BinaryHeap<Reverse<RankedPath>> = BinaryHeap::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(SearchState::new(anchor_mint));
+
+        while let Some(state) = queue.pop_front() {
+            if state.current_mint == anchor && !state.legs.is_empty() {
+                let path = PoolPath {
+                    start_mint: anchor.clone(),
+                    end_mint: anchor.clone(),
+                    legs: state.legs.clone(),
+                };
+                if path.len() > max_hops {
+                    continue;
+                }
+                if let Some(ratio) = self.path_price_ratio(&path) {
+                    if ratio <= 1.0 {
+                        continue;
+                    }
+                    best_paths.push(Reverse(RankedPath {
+                        ratio,
+                        hop_count: path.len(),
+                        path,
+                    }));
+                    if best_paths.len() > max_results {
+                        best_paths.pop();
+                    }
+                }
+                continue;
+            }
+
+            if state.legs.len() == max_hops {
+                continue;
+            }
+
+            let edges = match self.adjacency.get(&state.current_mint) {
+                Some(edges) => edges,
+                None => continue,
+            };
+
+            for edge in edges {
+                let mut next = state.clone();
+                let neighbor = edge.neighbor_mint.clone();
+                let is_return_leg = !next.legs.is_empty() && neighbor == anchor;
+                if next.legs.len() + 1 > max_hops {
+                    continue;
+                }
+                if !is_return_leg && next.visited.contains(&neighbor) {
+                    continue;
+                }
+                if !is_return_leg {
+                    next.visited.insert(neighbor.clone());
+                }
+                next.legs.push(PathLeg {
+                    pool_id: edge.pool_id.clone(),
+                    program_id: edge.program_id.clone(),
+                    input_mint: next.current_mint.clone(),
+                    output_mint: neighbor.clone(),
+                });
+                next.current_mint = neighbor;
+                queue.push_back(next);
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(best_paths.len());
+        while let Some(Reverse(entry)) = best_paths.pop() {
+            ordered.push(entry.path);
+        }
+        ordered.reverse();
+        ordered
     }
 
     /// Returns the multiplicative price ratio (product of spot prices) for a path, if prices are known.
@@ -218,12 +332,13 @@ impl GraphManager {
 
     fn upsert_edge(&mut self, token: &str, edge: GraphEdge) {
         let edges = self.adjacency.entry(token.to_string()).or_default();
-        if let Some(existing) = edges.iter_mut().find(|entry| entry.pool_id == edge.pool_id) {
-            *existing = edge;
-        } else {
-            edges.push(edge);
+        if let Some(pos) = edges.iter().position(|entry| entry.pool_id == edge.pool_id) {
+            edges.remove(pos);
         }
-        edges.sort_by(|a, b| b.liquidity_score.cmp(&a.liquidity_score));
+        let insert_pos = edges
+            .binary_search_by(|probe| edge.liquidity_score.cmp(&probe.liquidity_score))
+            .unwrap_or_else(|idx| idx);
+        edges.insert(insert_pos, edge);
     }
 
     fn detach_edge(&mut self, token: &str, pool_id: &str) {
@@ -238,9 +353,9 @@ impl GraphManager {
     fn index_pair_membership(&mut self, pool_id: &str, summary: &PoolSummary) {
         let key = TokenPair::new(&summary.base_mint, &summary.quote_mint);
         let pools = self.pair_index.entry(key).or_default();
-        if !pools.iter().any(|entry| entry == pool_id) {
-            pools.push(pool_id.to_string());
-            pools.sort();
+        match pools.binary_search_by(|existing| existing.as_str().cmp(pool_id)) {
+            Ok(_) => {}
+            Err(pos) => pools.insert(pos, pool_id.to_string()),
         }
     }
 

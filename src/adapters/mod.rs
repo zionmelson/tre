@@ -8,6 +8,7 @@ mod lifinity_v2;
 mod raydium_v3;
 mod whirlpool;
 
+pub use crate::template::TemplateContext;
 pub use cp_amm::{CpAmmAdapter, CpAmmAdapterConfig, CpAmmState};
 pub use lb_clmm::{LbClmmAdapter, LbClmmAdapterConfig, LbClmmState};
 pub use lifinity_v2::{LifinityAdapter, LifinityAdapterConfig, LifinityPoolState};
@@ -74,7 +75,9 @@ pub struct QuoteResponse {
     pub amount_out: u64,
     pub edge_bps: f64,
     pub sqrt_price_limit: Option<u128>,
+    pub min_output_amount: Option<u64>,
     pub status: QuoteStatus,
+    pub context: TemplateContext,
 }
 
 #[derive(Debug, Clone)]
@@ -84,12 +87,6 @@ pub struct SwapTemplate {
     pub accounts: Vec<AccountMeta>,
     pub data: Vec<u8>,
     pub context: TemplateContext,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TemplateContext {
-    pub payer: Option<Pubkey>,
-    pub requires_memo: bool,
 }
 
 pub(crate) fn quote_from_price(
@@ -117,8 +114,10 @@ pub(crate) fn build_quote_response(req: QuoteRequest, amount_out: u64) -> QuoteR
         amount_out,
         edge_bps: 0.0,
         sqrt_price_limit: None,
+        min_output_amount: None,
         status: QuoteStatus::Ok,
         request: req,
+        context: TemplateContext::default(),
     }
 }
 
