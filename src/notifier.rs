@@ -69,7 +69,7 @@ impl Notifier {
         let route = candidate
             .route_plan
             .as_ref()
-            .map(|plan| describe_route_plan(plan))
+            .map(describe_route_plan)
             .unwrap_or_else(|| vec![candidate.pool_id.clone()]);
         self.dispatch(NotificationEvent::BundleCandidate {
             environment: self.environment.clone(),

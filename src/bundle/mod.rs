@@ -184,7 +184,7 @@ impl BundleClient {
                     })
                     .await
             })
-            .map_err(|status| anyhow!("gRPC send_bundle failed: {status}"))?;
+            .map_err(|status| anyhow!(status))?;
         Ok(response.into_inner().uuid)
     }
 

@@ -4,6 +4,7 @@ use std::{
     ops::Bound::{Included, Unbounded},
     str::FromStr,
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -26,7 +27,10 @@ use crate::stages::types::{
 };
 use crate::template::TemplateContext;
 
-use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
+use super::{
+    build_quote_response, hydration::AsyncHydrator, ProtocolAdapter, QuoteRequest, QuoteResponse,
+    SwapDirection,
+};
 
 const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -46,6 +50,7 @@ const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const PRICE_IMPACT_FLOOR_BPS: u16 = 25;
 const PRICE_IMPACT_PADDING_BPS: u16 = 10;
 const LB_CLMM_DEFAULT_CU_LIMIT: u32 = 420_000;
+const DEFAULT_LB_CLMM_HYDRATION_RETRY_MS: u64 = 60_000;
 
 static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program id should be valid")
@@ -61,6 +66,7 @@ pub struct LbClmmAdapterConfig {
     pub stale_after_ms: u64,
     pub rpc_endpoints: Vec<String>,
     pub rpc_timeout_ms: u64,
+    pub hydration_retry_ms: u64,
 }
 
 impl Default for LbClmmAdapterConfig {
@@ -71,6 +77,7 @@ impl Default for LbClmmAdapterConfig {
             rpc_endpoints: Vec::new(),
             // lb_clmm bin array/bitmap fetches can be slow; give RPC plenty of time.
             rpc_timeout_ms: 15_000,
+            hydration_retry_ms: DEFAULT_LB_CLMM_HYDRATION_RETRY_MS,
         }
     }
 }
@@ -451,8 +458,6 @@ fn needs_hydration(extras: &LbClmmPoolExtras) -> bool {
         || extras.token_y_program.is_none()
         || extras.bin_step.is_none()
         || extras.active_bin_id.is_none()
-        || extras.bin_arrays.is_empty()
-        || extras.active_bitmap.is_none()
 }
 
 fn build_bin_liquidity_map(extras: &LbClmmPoolExtras) -> BTreeMap<i32, LbClmmBinSnapshot> {
@@ -840,9 +845,10 @@ struct HydratedPoolMeta {
 }
 
 struct LbClmmPoolHydrator {
-    program_id: Pubkey,
-    clients: Vec<Arc<RpcClient>>,
-    cache: DashMap<Pubkey, HydratedPoolMeta>,
+    hydrator: AsyncHydrator<Pubkey, HydratedPoolMeta>,
+    cache: Arc<DashMap<Pubkey, HydratedPoolMeta>>,
+    extensions_pending: Arc<DashSet<Pubkey>>,
+    endpoint_count: usize,
 }
 
 impl LbClmmPoolHydrator {
@@ -862,139 +868,205 @@ impl LbClmmPoolHydrator {
             return None;
         }
 
+        let endpoint_count = clients.len();
+        let clients = Arc::new(clients);
+        let fetch_clients = clients.clone();
+        let cache = Arc::new(DashMap::new());
+        let cache_for_fetch = cache.clone();
+        let extensions_pending = Arc::new(DashSet::new());
+        let pending_for_fetch = extensions_pending.clone();
+        let hydrator = AsyncHydrator::with_cache(
+            "lb_clmm_pool",
+            endpoint_count,
+            move |pool| {
+                fetch_lb_clmm_meta(
+                    program_id,
+                    fetch_clients.as_ref(),
+                    pool,
+                    cache_for_fetch.clone(),
+                    pending_for_fetch.clone(),
+                )
+            },
+            cache.clone(),
+        );
+
         Some(Self {
-            program_id,
-            clients,
-            cache: DashMap::new(),
+            hydrator,
+            cache,
+            extensions_pending,
+            endpoint_count,
         })
     }
 
     fn client_count(&self) -> usize {
-        self.clients.len()
+        self.endpoint_count
     }
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        if let Some(entry) = self.cache.get(&pool) {
+        if let Some(entry) = self.hydrator.cached(&pool) {
             if entry.bin_arrays.is_empty() {
-                drop(entry);
-                if let Some(fresh) = self.fetch_from_rpc(pool) {
-                    return Some(fresh);
-                }
-                return self.cache.get(&pool).map(|value| value.clone());
+                self.hydrator.schedule(pool);
             }
-            return Some(entry.clone());
+            return Some(entry);
         }
-        self.fetch_from_rpc(pool)
+        self.hydrator.get_or_schedule(pool)
     }
+}
 
-    fn fetch_from_rpc(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        for client in &self.clients {
-            match client.get_account(&pool) {
-                Ok(account) => {
-                    if let Some(mut meta) = parse_lb_pair_account(&account.data) {
-                        let bin_arrays = self.fetch_bin_arrays(client, pool);
-                        if !bin_arrays.is_empty() {
-                            meta.bin_arrays = bin_arrays;
-                        }
-                        if let Some(extension) = self.fetch_bitmap_extension(client, pool) {
-                            meta.active_bitmap.bitmap.extend(extension.bitmap);
-                        }
-                        self.cache.insert(pool, meta.clone());
-                        return Some(meta);
-                    } else {
-                        warn!(
-                            target = "adapter::lb_clmm",
-                            pool = %pool,
-                            "unexpected lb_clmm pool account layout"
-                        );
-                    }
-                }
-                Err(error) => {
+fn fetch_lb_clmm_meta(
+    program_id: Pubkey,
+    clients: &[Arc<RpcClient>],
+    pool: Pubkey,
+    cache: Arc<DashMap<Pubkey, HydratedPoolMeta>>,
+    pending_extensions: Arc<DashSet<Pubkey>>,
+) -> Option<HydratedPoolMeta> {
+    for client in clients {
+        match client.get_account(&pool) {
+            Ok(account) => {
+                if let Some(mut meta) = parse_lb_pair_account(&account.data) {
+                    cache.insert(pool, meta.clone());
+                    stream_lb_clmm_extensions(
+                        program_id,
+                        clients.iter().cloned().collect(),
+                        pool,
+                        cache.clone(),
+                        pending_extensions.clone(),
+                    );
+                    return Some(meta);
+                } else {
                     warn!(
                         target = "adapter::lb_clmm",
                         pool = %pool,
-                        %error,
-                        "failed to fetch lb_clmm pool account"
+                        "unexpected lb_clmm pool account layout"
                     );
                 }
             }
-        }
-
-        None
-    }
-
-    fn fetch_bin_arrays(&self, client: &RpcClient, pool: Pubkey) -> Vec<LbClmmBinArrayExtras> {
-        let filters = Some(vec![
-            RpcFilterType::DataSize(BIN_ARRAY_ACCOUNT_LEN as u64),
-            RpcFilterType::Memcmp(Memcmp::new(
-                BIN_ARRAY_LB_PAIR_OFFSET,
-                MemcmpEncodedBytes::Bytes(pool.to_bytes().to_vec()),
-            )),
-        ]);
-        let mut account_config = RpcAccountInfoConfig::default();
-        account_config.encoding = Some(UiAccountEncoding::Base64);
-        let config = RpcProgramAccountsConfig {
-            filters,
-            account_config,
-            with_context: None,
-            sort_results: None,
-        };
-
-        match client.get_program_ui_accounts_with_config(&self.program_id, config) {
-            Ok(accounts) => accounts
-                .into_iter()
-                .filter_map(|(_, account)| {
-                    let data = decode_ui_account_bytes(&account)?;
-                    parse_bin_array_account(pool, &data)
-                })
-                .collect(),
             Err(error) => {
                 warn!(
                     target = "adapter::lb_clmm",
                     pool = %pool,
                     %error,
-                    "failed to fetch lb_clmm bin arrays"
+                    "failed to fetch lb_clmm pool account"
                 );
-                Vec::new()
             }
         }
     }
 
-    fn fetch_bitmap_extension(
-        &self,
-        client: &RpcClient,
-        pool: Pubkey,
-    ) -> Option<LbClmmBitmapExtras> {
-        let filters = Some(vec![
-            RpcFilterType::DataSize(BITMAP_EXTENSION_ACCOUNT_LEN as u64),
-            RpcFilterType::Memcmp(Memcmp::new(
-                0,
-                MemcmpEncodedBytes::Bytes(pool.to_bytes().to_vec()),
-            )),
-        ]);
-        let mut account_config = RpcAccountInfoConfig::default();
-        account_config.encoding = Some(UiAccountEncoding::Base64);
-        let config = RpcProgramAccountsConfig {
-            filters,
-            account_config,
-            with_context: None,
-            sort_results: None,
-        };
+    None
+}
 
-        match client.get_program_ui_accounts_with_config(&self.program_id, config) {
-            Ok(mut accounts) => accounts.drain(..).find_map(|(_, account)| {
+fn stream_lb_clmm_extensions(
+    program_id: Pubkey,
+    clients: Vec<Arc<RpcClient>>,
+    pool: Pubkey,
+    cache: Arc<DashMap<Pubkey, HydratedPoolMeta>>,
+    pending_extensions: Arc<DashSet<Pubkey>>,
+) {
+    if !pending_extensions.insert(pool) {
+        return;
+    }
+
+    debug!(
+        target = "adapter::lb_clmm",
+        pool = %pool,
+        "scheduling async lb_clmm bin array hydration"
+    );
+
+    thread::spawn(move || {
+        for client in &clients {
+            let mut updated = match cache.get(&pool) {
+                Some(entry) => entry.clone(),
+                None => continue,
+            };
+            let bin_arrays = fetch_bin_arrays(program_id, client, pool);
+            if !bin_arrays.is_empty() {
+                updated.bin_arrays = bin_arrays;
+            }
+            if let Some(extension) = fetch_bitmap_extension(program_id, client, pool) {
+                updated.active_bitmap.bitmap.extend(extension.bitmap);
+            }
+            cache.insert(pool, updated);
+            break;
+        }
+        pending_extensions.remove(&pool);
+    });
+}
+
+fn fetch_bin_arrays(
+    program_id: Pubkey,
+    client: &RpcClient,
+    pool: Pubkey,
+) -> Vec<LbClmmBinArrayExtras> {
+    let filters = Some(vec![
+        RpcFilterType::DataSize(BIN_ARRAY_ACCOUNT_LEN as u64),
+        RpcFilterType::Memcmp(Memcmp::new(
+            BIN_ARRAY_LB_PAIR_OFFSET,
+            MemcmpEncodedBytes::Bytes(pool.to_bytes().to_vec()),
+        )),
+    ]);
+    let mut account_config = RpcAccountInfoConfig::default();
+    account_config.encoding = Some(UiAccountEncoding::Base64);
+    let config = RpcProgramAccountsConfig {
+        filters,
+        account_config,
+        with_context: None,
+        sort_results: None,
+    };
+
+    match client.get_program_ui_accounts_with_config(&program_id, config) {
+        Ok(accounts) => accounts
+            .into_iter()
+            .filter_map(|(_, account)| {
                 let data = decode_ui_account_bytes(&account)?;
-                parse_bitmap_extension_account(pool, &data)
-            }),
-            Err(error) => {
-                warn!(
-                    target = "adapter::lb_clmm",
-                    pool = %pool,
-                    %error,
-                    "failed to fetch lb_clmm bitmap extension"
-                );
-                None
-            }
+                parse_bin_array_account(pool, &data)
+            })
+            .collect(),
+        Err(error) => {
+            warn!(
+                target = "adapter::lb_clmm",
+                pool = %pool,
+                %error,
+                "failed to fetch lb_clmm bin arrays"
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn fetch_bitmap_extension(
+    program_id: Pubkey,
+    client: &RpcClient,
+    pool: Pubkey,
+) -> Option<LbClmmBitmapExtras> {
+    let filters = Some(vec![
+        RpcFilterType::DataSize(BITMAP_EXTENSION_ACCOUNT_LEN as u64),
+        RpcFilterType::Memcmp(Memcmp::new(
+            0,
+            MemcmpEncodedBytes::Bytes(pool.to_bytes().to_vec()),
+        )),
+    ]);
+    let mut account_config = RpcAccountInfoConfig::default();
+    account_config.encoding = Some(UiAccountEncoding::Base64);
+    let config = RpcProgramAccountsConfig {
+        filters,
+        account_config,
+        with_context: None,
+        sort_results: None,
+    };
+
+    match client.get_program_ui_accounts_with_config(&program_id, config) {
+        Ok(mut accounts) => accounts.drain(..).find_map(|(_, account)| {
+            let data = decode_ui_account_bytes(&account)?;
+            parse_bitmap_extension_account(pool, &data)
+        }),
+        Err(error) => {
+            warn!(
+                target = "adapter::lb_clmm",
+                pool = %pool,
+                %error,
+                "failed to fetch lb_clmm bitmap extension"
+            );
+            None
         }
     }
 }

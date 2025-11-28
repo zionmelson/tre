@@ -9,6 +9,7 @@ use tokio::{signal, task};
 
 use crate::builder::BuilderHandle;
 use crate::bundle::{BundleClient, BundleTracker};
+use crate::cluster::{self, LeaderScheduleGate};
 use crate::config::AppConfig;
 use crate::core::{Lease, SlabPool, SpscRing};
 use crate::notifier::Notifier;
@@ -39,11 +40,18 @@ impl ExecutorRuntime {
             SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
                 .into_split();
 
+        let mut handles = Vec::new();
         let builder = BuilderHandle::new(config.clone())?;
         let strategy = Arc::new(StrategyEngine::new(config.clone())?);
         let notifier = Arc::new(Notifier::new(strategy.clone(), config.clone()));
+        let bam_allowlist = Arc::new(cluster::BamValidatorSet::load_from_csv(
+            config.bam_validator_csv_path(),
+        )?);
+        let (leader_state, leader_handle) =
+            cluster::spawn_leader_schedule_watcher(stop.clone(), config.quicknode_rpcs.clone())?;
+        handles.push(leader_handle);
+        let leader_gate = Arc::new(LeaderScheduleGate::new(leader_state.clone(), bam_allowlist));
 
-        let mut handles = Vec::new();
         handles.push(stages::spawn_ingest_stage(
             stop.clone(),
             Some(config.perf.ingest_core),
@@ -88,6 +96,8 @@ impl ExecutorRuntime {
             bundle_client,
             notifier.clone(),
             tracker,
+            leader_gate,
+            config.quicknode_rpcs.clone(),
         )?);
 
         Ok(Self {
@@ -126,7 +136,7 @@ fn describe_panic(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
 
 pub async fn run(config: Arc<AppConfig>) -> Result<()> {
     let config_for_executor = config.clone();
-    let mut executor = task::spawn_blocking(move || ExecutorRuntime::spawn(config_for_executor))
+    let executor = task::spawn_blocking(move || ExecutorRuntime::spawn(config_for_executor))
         .await
         .map_err(|err| anyhow!("executor initialization panicked: {err}"))??;
 

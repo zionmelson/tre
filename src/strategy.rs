@@ -9,25 +9,36 @@ use anyhow::{anyhow, Context, Result};
 use once_cell::sync::Lazy;
 use reqwest::blocking::Client as BlockingClient;
 use serde::Deserialize;
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::native_token::LAMPORTS_PER_SOL;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::{read_keypair_file, Signer};
 use tracing::{debug, info, warn};
 
+use crate::builder::compute_flash_loan_fee;
 use crate::config::AppConfig;
 use crate::stages::{ArbitrageOpportunity, BundleCandidate, Opportunity};
+use crate::telemetry;
+use crate::tip_pressure;
 
 const DEFAULT_MIN_EDGE_BPS: f64 = 2.5;
 const DEFAULT_MAX_STALE_MS: u64 = 750;
 const DEFAULT_MAX_DUPLICATES_PER_SIGNATURE: usize = 2;
 const DEFAULT_MAX_ROUTE_HOPS: usize = 4;
 const DEFAULT_MIN_PROFIT_LAMPORTS: u64 = 50_000; // 0.00005 SOL
-const DEFAULT_MIN_TIP_LAMPORTS: u64 = 10_000; // 0.00001 SOL
-const DEFAULT_MAX_TIP_LAMPORTS: u64 = 5_000_000; // 0.005 SOL
+const DEFAULT_MIN_TIP_LAMPORTS: u64 = 50_000; // 0.00005 SOL
+const DEFAULT_MAX_TIP_LAMPORTS: u64 = 20_000_000; // 0.02 SOL
 const DEFAULT_TIP_PROFIT_SHARE_BPS: u64 = 1500; // 15%
-const DEFAULT_TIP_FLOOR_MARKUP_BPS: u64 = 2000; // 20%
-const DEFAULT_TIP_FLOOR_FALLBACK_LAMPORTS: u64 = 25_000;
+const DEFAULT_TIP_FLOOR_MARKUP_BPS: u64 = 3_500; // 35%
+const DEFAULT_TIP_FLOOR_FALLBACK_LAMPORTS: u64 = 75_000;
+const DEFAULT_TIP_FLOOR_MIN_LAMPORTS: u64 = 75_000;
+const DEFAULT_TIP_TARGET_STAGE3_LATENCY_MS: u64 = 600;
+const DEFAULT_TIP_CONGESTION_MAX_MULTIPLIER: f64 = 10.0;
+const DEFAULT_TIP_CONGESTION_EXPIRED_WEIGHT_BPS: u64 = 7_500; // 75%
 const TIP_POLL_INTERVAL_SECS: u64 = 1;
 const TIP_FETCH_TIMEOUT_SECS: u64 = 3;
+const WALLET_BALANCE_POLL_INTERVAL_SECS: u64 = 5;
+const WALLET_BALANCE_RPC_TIMEOUT_SECS: u64 = 6;
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 static TIP_RECIPIENTS: Lazy<Vec<Pubkey>> = Lazy::new(|| {
@@ -58,6 +69,11 @@ pub struct StrategyConfig {
     pub tip_profit_share_bps: u64,
     pub tip_floor_markup_bps: u64,
     pub tip_floor_fallback_lamports: u64,
+    pub tip_floor_min_lamports: u64,
+    pub wallet_tip_cap_bps: Option<u64>,
+    pub tip_congestion_target_latency_ms: u64,
+    pub tip_congestion_max_multiplier: f64,
+    pub tip_congestion_expired_weight_bps: u64,
 }
 
 impl Default for StrategyConfig {
@@ -73,6 +89,11 @@ impl Default for StrategyConfig {
             tip_profit_share_bps: DEFAULT_TIP_PROFIT_SHARE_BPS,
             tip_floor_markup_bps: DEFAULT_TIP_FLOOR_MARKUP_BPS,
             tip_floor_fallback_lamports: DEFAULT_TIP_FLOOR_FALLBACK_LAMPORTS,
+            tip_floor_min_lamports: DEFAULT_TIP_FLOOR_MIN_LAMPORTS,
+            wallet_tip_cap_bps: None,
+            tip_congestion_target_latency_ms: DEFAULT_TIP_TARGET_STAGE3_LATENCY_MS,
+            tip_congestion_max_multiplier: DEFAULT_TIP_CONGESTION_MAX_MULTIPLIER,
+            tip_congestion_expired_weight_bps: DEFAULT_TIP_CONGESTION_EXPIRED_WEIGHT_BPS,
         }
     }
 }
@@ -111,6 +132,21 @@ impl StrategyConfig {
         if let Some(value) = overrides.tip_floor_fallback_lamports {
             cfg.tip_floor_fallback_lamports = value;
         }
+        if let Some(value) = overrides.tip_floor_min_lamports {
+            cfg.tip_floor_min_lamports = value;
+        }
+        if let Some(value) = overrides.wallet_tip_cap_bps {
+            cfg.wallet_tip_cap_bps = Some(value);
+        }
+        if let Some(value) = overrides.tip_congestion_target_latency_ms {
+            cfg.tip_congestion_target_latency_ms = value;
+        }
+        if let Some(value) = overrides.tip_congestion_max_multiplier {
+            cfg.tip_congestion_max_multiplier = value;
+        }
+        if let Some(value) = overrides.tip_congestion_expired_weight_bps {
+            cfg.tip_congestion_expired_weight_bps = value;
+        }
         cfg
     }
 }
@@ -141,16 +177,45 @@ pub struct StrategyEngine {
 impl StrategyEngine {
     pub fn new(app_config: Arc<AppConfig>) -> Result<Self> {
         let config = StrategyConfig::from_app_config(app_config.as_ref());
+        let payer = read_keypair_file(&app_config.wallets.payer.path).map_err(|err| {
+            anyhow!(
+                "failed to read payer wallet {}: {err}",
+                app_config.wallets.payer.path.display()
+            )
+        })?;
+        let payer_pubkey = payer.pubkey();
+        drop(payer);
+
+        let wallet_tracker = if let Some(cap_bps) = config.wallet_tip_cap_bps {
+            if cap_bps == 0 {
+                None
+            } else {
+                Some(WalletBalanceTracker::spawn(
+                    payer_pubkey,
+                    app_config.quicknode_rpcs.clone(),
+                )?)
+            }
+        } else {
+            None
+        };
+
+        let wallet_cap = wallet_tracker.as_ref().and_then(|tracker| {
+            config
+                .wallet_tip_cap_bps
+                .map(|bps| WalletTipCap::new(bps, Arc::clone(tracker)))
+        });
+
         let tip_oracle = TipOracle::from_url(
             &app_config.jito.tip_floor_url,
             config.tip_floor_fallback_lamports,
+            wallet_cap,
         )?;
         Ok(Self::with_tip_oracle(config, tip_oracle))
     }
 
     pub fn with_config(config: StrategyConfig) -> Self {
         let fallback = config.tip_floor_fallback_lamports;
-        Self::with_tip_oracle(config, TipOracle::stub_with_fallback(fallback))
+        Self::with_tip_oracle(config, TipOracle::stub_with_fallback(fallback, None))
     }
 
     fn with_tip_oracle(config: StrategyConfig, tip_oracle: TipOracle) -> Self {
@@ -274,6 +339,23 @@ impl StrategyEngine {
             .tip_oracle
             .recommended_tip(&self.config, profit_lamports)
         {
+            if let Some(lamports) = profit_lamports {
+                let carry_fee = tip_carry_fee(&route.start_mint, tip_lamports);
+                let net_profit = lamports.saturating_sub(tip_lamports.saturating_add(carry_fee));
+                if net_profit < self.config.min_profit_lamports {
+                    self.rejected_count.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        seq = opportunity.seq,
+                        profit_lamports = lamports,
+                        net_profit_lamports = net_profit,
+                        tip_lamports,
+                        carry_fee,
+                        min_profit_lamports = self.config.min_profit_lamports,
+                        "opportunity rejected: net profit below threshold after tip"
+                    );
+                    return None;
+                }
+            }
             candidate.tip_lamports = Some(tip_lamports);
             candidate.tip_account = Some(tip_account);
         }
@@ -423,31 +505,45 @@ fn lamports_if_wsol(mint: &str, amount: u64) -> Option<u64> {
     }
 }
 
+fn tip_carry_fee(start_mint: &str, tip_lamports: u64) -> u64 {
+    if start_mint == WSOL_MINT {
+        compute_flash_loan_fee(tip_lamports)
+    } else {
+        0
+    }
+}
+
 struct TipOracle {
     state: Arc<TipOracleState>,
     recipients: &'static [Pubkey],
     cursor: AtomicUsize,
+    wallet_cap: Option<WalletTipCap>,
 }
 
 impl TipOracle {
-    fn from_url(url: &str, fallback_lamports: u64) -> Result<Self> {
+    fn from_url(
+        url: &str,
+        fallback_lamports: u64,
+        wallet_cap: Option<WalletTipCap>,
+    ) -> Result<Self> {
         if url.trim().is_empty() {
-            return Ok(Self::stub_with_fallback(fallback_lamports));
+            return Ok(Self::stub_with_fallback(fallback_lamports, wallet_cap));
         }
         let state = Arc::new(TipOracleState::new(fallback_lamports));
         spawn_tip_fetcher(url.to_string(), Arc::clone(&state))?;
-        Ok(Self::with_state(state))
+        Ok(Self::with_state(state, wallet_cap))
     }
 
-    fn stub_with_fallback(fallback_lamports: u64) -> Self {
-        Self::with_state(Arc::new(TipOracleState::new(fallback_lamports)))
+    fn stub_with_fallback(fallback_lamports: u64, wallet_cap: Option<WalletTipCap>) -> Self {
+        Self::with_state(Arc::new(TipOracleState::new(fallback_lamports)), wallet_cap)
     }
 
-    fn with_state(state: Arc<TipOracleState>) -> Self {
+    fn with_state(state: Arc<TipOracleState>, wallet_cap: Option<WalletTipCap>) -> Self {
         Self {
             state,
             recipients: TIP_RECIPIENTS.as_slice(),
             cursor: AtomicUsize::new(0),
+            wallet_cap,
         }
     }
 
@@ -460,14 +556,30 @@ impl TipOracle {
             return None;
         }
 
-        let floor = self.state.floor_lamports.load(Ordering::Relaxed);
+        let mut floor = self.state.floor_lamports.load(Ordering::Relaxed);
+        if floor < config.tip_floor_min_lamports {
+            floor = config.tip_floor_min_lamports;
+        }
         let mut tip = floor.max(config.min_tip_lamports);
-        let markup = floor + floor.saturating_mul(config.tip_floor_markup_bps as u64) / 10_000;
+        let markup = floor + floor.saturating_mul(config.tip_floor_markup_bps) / 10_000;
         tip = tip.max(markup);
 
         if let Some(profit) = profit_lamports {
-            let share = profit.saturating_mul(config.tip_profit_share_bps as u64) / 10_000;
+            let share = profit.saturating_mul(config.tip_profit_share_bps) / 10_000;
             tip = tip.max(share);
+        }
+
+        let pressure_multiplier = tip_pressure::congestion_multiplier(
+            config.tip_congestion_target_latency_ms,
+            config.tip_congestion_max_multiplier,
+            config.tip_congestion_expired_weight_bps,
+        );
+        telemetry::record_tip_multiplier(pressure_multiplier);
+        if pressure_multiplier.is_finite() && pressure_multiplier > 1.0 {
+            let scaled = (tip as f64) * pressure_multiplier;
+            if scaled.is_finite() && scaled > 0.0 {
+                tip = scaled.min(u64::MAX as f64).round() as u64;
+            }
         }
 
         tip = tip.clamp(config.min_tip_lamports, config.max_tip_lamports);
@@ -475,9 +587,43 @@ impl TipOracle {
             return None;
         }
 
+        if let Some(cap) = self.wallet_cap.as_ref() {
+            match cap.apply(tip) {
+                Some(clamped) if clamped > 0 => tip = clamped,
+                _ => return None,
+            }
+        }
+
         let idx = self.cursor.fetch_add(1, Ordering::Relaxed);
         let recipient = self.recipients[idx % self.recipients.len()];
         Some((tip, recipient))
+    }
+}
+
+#[derive(Clone)]
+struct WalletTipCap {
+    tracker: Arc<WalletBalanceTracker>,
+    max_bps: u64,
+}
+
+impl WalletTipCap {
+    fn new(max_bps: u64, tracker: Arc<WalletBalanceTracker>) -> Self {
+        Self { tracker, max_bps }
+    }
+
+    fn apply(&self, tip: u64) -> Option<u64> {
+        let balance = self.tracker.current();
+        if balance == 0 {
+            return None;
+        }
+        let cap = balance
+            .saturating_mul(self.max_bps)
+            .checked_div(10_000)
+            .unwrap_or(u64::MAX);
+        if cap == 0 {
+            return None;
+        }
+        Some(tip.min(cap))
     }
 }
 
@@ -495,6 +641,50 @@ impl TipOracleState {
     fn update_floor(&self, lamports: u64) -> bool {
         let previous = self.floor_lamports.swap(lamports, Ordering::Relaxed);
         previous != lamports
+    }
+}
+
+struct WalletBalanceTracker {
+    balance: AtomicU64,
+}
+
+impl WalletBalanceTracker {
+    fn spawn(payer: Pubkey, rpc_urls: Vec<String>) -> Result<Arc<Self>> {
+        anyhow::ensure!(
+            !rpc_urls.is_empty(),
+            "wallet_tip_cap_bps requires at least one RPC endpoint"
+        );
+        let tracker = Arc::new(Self {
+            balance: AtomicU64::new(0),
+        });
+        let urls = rpc_urls;
+        let handle_tracker = Arc::clone(&tracker);
+        thread::Builder::new()
+            .name("wallet_balance_monitor".into())
+            .spawn(move || {
+                let timeout = Duration::from_secs(WALLET_BALANCE_RPC_TIMEOUT_SECS);
+                let mut idx = 0usize;
+                loop {
+                    let url = &urls[idx % urls.len()];
+                    let client = RpcClient::new_with_timeout(url.clone(), timeout);
+                    match client.get_balance(&payer) {
+                        Ok(balance) => {
+                            handle_tracker.balance.store(balance, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            warn!(rpc = %url, error = %err, "wallet balance refresh failed");
+                        }
+                    }
+                    idx = idx.wrapping_add(1);
+                    thread::sleep(Duration::from_secs(WALLET_BALANCE_POLL_INTERVAL_SECS));
+                }
+            })
+            .context("failed to spawn wallet balance monitor")?;
+        Ok(tracker)
+    }
+
+    fn current(&self) -> u64 {
+        self.balance.load(Ordering::Relaxed)
     }
 }
 

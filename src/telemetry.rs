@@ -29,9 +29,11 @@ struct TelemetryState {
     stage3_submissions: Family<Stage3StatusLabels, Counter>,
     stage3_tip_lamports: Gauge,
     stage3_bundle_hash: Gauge,
+    tip_multiplier_milli: Gauge,
     bundle_result_latency: Histogram,
     bundle_result_status: Family<BundleResultLabels, Counter>,
     stage1_backpressure_events: Family<Stage1BackpressureLabels, Counter>,
+    stage1_pool_drain_events: Family<Stage1PoolDrainLabels, Counter>,
     stage2_plan_events: Family<Stage2PlanLabels, Counter>,
     stage3_retry_events: Family<Stage3RetryLabels, Counter>,
     stage1_feed_gap_events: Family<Stage1FeedGapLabels, Counter>,
@@ -90,6 +92,13 @@ impl TelemetryState {
             stage3_bundle_hash.clone(),
         );
 
+        let tip_multiplier_milli = Gauge::default();
+        registry.register(
+            "bundle_stage3_tip_multiplier_milli",
+            "Tip multiplier applied to the last bundle (scaled by 1e3)",
+            tip_multiplier_milli.clone(),
+        );
+
         let bundle_result_latency = Histogram::new(exponential_buckets(0.1, 2.0, 20));
         registry.register(
             "bundle_result_latency_ms",
@@ -109,6 +118,13 @@ impl TelemetryState {
             "stage1_backpressure_events_total",
             "Stage1 bundle candidate backpressure events grouped by reason",
             stage1_backpressure_events.clone(),
+        );
+
+        let stage1_pool_drain_events = Family::default();
+        registry.register(
+            "stage1_pool_drain_events_total",
+            "Stage1 pool-consumer drain patterns grouped by mode",
+            stage1_pool_drain_events.clone(),
         );
 
         let stage2_plan_events = Family::default();
@@ -141,9 +157,11 @@ impl TelemetryState {
             stage3_submissions,
             stage3_tip_lamports,
             stage3_bundle_hash,
+            tip_multiplier_milli,
             bundle_result_latency,
             bundle_result_status,
             stage1_backpressure_events,
+            stage1_pool_drain_events,
             stage2_plan_events,
             stage3_retry_events,
             stage1_feed_gap_events,
@@ -244,6 +262,16 @@ pub fn record_stage3_latency(duration: Duration) {
     }
 }
 
+pub fn record_tip_multiplier(multiplier: f64) {
+    if let Some(state) = TELEMETRY.get() {
+        if multiplier.is_finite() {
+            let scaled = (multiplier * 1_000.0).round();
+            let clamped = scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+            state.tip_multiplier_milli.set(clamped);
+        }
+    }
+}
+
 pub enum Stage3SubmissionStatus {
     Success,
     Failure,
@@ -262,6 +290,11 @@ struct BundleResultLabels {
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 struct Stage1BackpressureLabels {
     reason: &'static str,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct Stage1PoolDrainLabels {
+    mode: &'static str,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
@@ -447,6 +480,7 @@ pub enum Stage1BackpressureEvent {
     OverflowQueued,
     OverflowDropped,
     OverflowFlushed,
+    TradeIntakePaused,
 }
 
 impl Stage1BackpressureEvent {
@@ -457,6 +491,7 @@ impl Stage1BackpressureEvent {
             Stage1BackpressureEvent::OverflowQueued => "overflow_queued",
             Stage1BackpressureEvent::OverflowDropped => "overflow_dropped",
             Stage1BackpressureEvent::OverflowFlushed => "overflow_flushed",
+            Stage1BackpressureEvent::TradeIntakePaused => "trade_intake_paused",
         }
     }
 }
@@ -470,6 +505,29 @@ pub fn record_stage1_backpressure(event: Stage1BackpressureEvent) {
             .stage1_backpressure_events
             .get_or_create(&labels)
             .inc();
+    }
+}
+
+pub enum Stage1PoolDrainEvent {
+    Single,
+    Multiple,
+}
+
+impl Stage1PoolDrainEvent {
+    fn label(&self) -> &'static str {
+        match self {
+            Stage1PoolDrainEvent::Single => "single",
+            Stage1PoolDrainEvent::Multiple => "multiple",
+        }
+    }
+}
+
+pub fn record_stage1_pool_drain(event: Stage1PoolDrainEvent) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = Stage1PoolDrainLabels {
+            mode: event.label(),
+        };
+        state.stage1_pool_drain_events.get_or_create(&labels).inc();
     }
 }
 

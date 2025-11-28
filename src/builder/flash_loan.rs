@@ -6,17 +6,17 @@ use std::sync::{
 };
 
 use anyhow::{anyhow, ensure, Context, Result};
-use solana_sdk::instruction::{AccountMeta, Instruction};
-use solana_sdk::pubkey;
+use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::sysvar;
+use solend::{
+    flash_borrow_instruction, flash_repay_instruction, FLASH_BORROW_OPCODE, FLASH_REPAY_OPCODE,
+};
 
 use crate::config::{AppConfig, FlashLoanConfig};
 
-const SOLEND_FLASH_LOAN_FEE_BPS: u64 = 5; // 0.05% per Solend fee schedule
-const BASIS_POINTS_DENOMINATOR: u64 = 10_000;
-const LENDING_FLASH_LOAN_TAG: u8 = 13;
-const SPL_TOKEN_TRANSFER_TAG: u8 = 3;
-const SPL_TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+pub const SOLEND_FLASH_LOAN_FEE_BPS: u64 = 5; // 0.05% per Solend fee schedule
+pub const FLASH_LOAN_BPS_DENOMINATOR: u64 = 10_000;
 
 #[derive(Clone)]
 pub struct FlashLoanPlanner {
@@ -130,7 +130,7 @@ impl FlashLoanPlanner {
             borrow_amount > 0,
             "flash-loan borrow amount must be greater than zero"
         );
-        let fee_amount = compute_fee(borrow_amount);
+        let fee_amount = compute_flash_loan_fee(borrow_amount);
         let repay_amount = borrow_amount
             .checked_add(fee_amount)
             .ok_or_else(|| anyhow!("flash-loan repayment overflowed u64"))?;
@@ -167,12 +167,12 @@ impl FlashLoanPlanner {
     }
 }
 
-fn compute_fee(amount: u64) -> u64 {
+pub fn compute_flash_loan_fee(amount: u64) -> u64 {
     if amount == 0 {
         return 0;
     }
     let numerator = amount.saturating_mul(SOLEND_FLASH_LOAN_FEE_BPS);
-    (numerator + (BASIS_POINTS_DENOMINATOR - 1)) / BASIS_POINTS_DENOMINATOR
+    numerator.div_ceil(FLASH_LOAN_BPS_DENOMINATOR)
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +195,18 @@ impl TryFrom<&FlashLoanConfig> for FlashLoanAccounts {
         let program_id = parse_pubkey("flash_loan.program_id", &config.program_id)?;
         let lending_market = parse_pubkey("flash_loan.lending_market", &config.lending_market)?;
         let (authority, _) = Pubkey::find_program_address(&[lending_market.as_ref()], &program_id);
+        let borrow_supply = parse_pubkey(
+            "flash_loan.borrow.reserve_liquidity_supply",
+            &config.borrow.reserve_liquidity_supply,
+        )?;
+        let repay_supply = parse_pubkey(
+            "flash_loan.repay.reserve_liquidity_supply",
+            &config.repay.reserve_liquidity_supply,
+        )?;
+        ensure!(
+            borrow_supply == repay_supply,
+            "flash_loan borrow/repay reserve_liquidity_supply must match"
+        );
         Ok(Self {
             program_id,
             lending_market,
@@ -204,17 +216,14 @@ impl TryFrom<&FlashLoanConfig> for FlashLoanAccounts {
                 "flash_loan.reserve_liquidity_mint",
                 &config.reserve_liquidity_mint,
             )?,
-            reserve_liquidity_supply: parse_pubkey(
-                "flash_loan.reserve_liquidity_supply",
-                &config.reserve_liquidity_supply,
-            )?,
+            reserve_liquidity_supply: borrow_supply,
             reserve_liquidity_fee_receiver: parse_pubkey(
-                "flash_loan.reserve_liquidity_fee_receiver",
-                &config.reserve_liquidity_fee_receiver,
+                "flash_loan.repay.reserve_liquidity_fee_receiver",
+                &config.repay.reserve_liquidity_fee_receiver,
             )?,
             host_fee_receiver: parse_pubkey(
-                "flash_loan.host_fee_receiver",
-                &config.host_fee_receiver,
+                "flash_loan.repay.host_fee_receiver",
+                &config.repay.host_fee_receiver,
             )?,
             allowed_receiver_programs: parse_allowlist(&config.receiver_program_allowlist)?,
         })
@@ -252,27 +261,26 @@ impl FlashLoanRoutePlan {
         self.repay_amount
     }
 
-    pub fn borrow_instruction(
-        &self,
-        destination_liquidity: Pubkey,
-        receiver_program_id: Pubkey,
-        receiver_accounts: &[AccountMeta],
-    ) -> Instruction {
-        self.accounts.borrow_instruction(
-            self.borrow_amount,
-            destination_liquidity,
-            receiver_program_id,
-            receiver_accounts,
-        )
+    pub fn borrow_instruction(&self, destination_liquidity: Pubkey) -> Instruction {
+        self.accounts
+            .borrow_instruction(self.borrow_amount, destination_liquidity)
     }
 
     pub fn repay_instruction(
         &self,
         source_liquidity: Pubkey,
         authority: Pubkey,
-    ) -> Result<Instruction> {
-        self.accounts
-            .repay_instruction(self.repay_amount, source_liquidity, authority)
+        borrow_instruction_index: u8,
+    ) -> Instruction {
+        // The Solend flash repay instruction expects the principal (borrowed
+        // amount) in its data payload; protocol fees are implicitly derived
+        // inside the program and debited from the same source account.
+        self.accounts.repay_instruction(
+            self.borrow_amount,
+            source_liquidity,
+            authority,
+            borrow_instruction_index,
+        )
     }
 
     pub fn allows_receiver_program(&self, program: &Pubkey) -> bool {
@@ -294,37 +302,16 @@ pub struct FlashLoanLegPlan {
 }
 
 impl FlashLoanAccounts {
-    pub fn borrow_instruction(
-        &self,
-        amount: u64,
-        destination_liquidity: Pubkey,
-        receiver_program_id: Pubkey,
-        receiver_accounts: &[AccountMeta],
-    ) -> Instruction {
-        // Solend validates the receiver program via this readonly account slot, so ensure callers
-        // only attempt programs that are explicitly allowed (or allow all when list is empty).
-        let mut accounts = vec![
-            AccountMeta::new(self.reserve_liquidity_supply, false),
-            AccountMeta::new(destination_liquidity, false),
-            AccountMeta::new(self.reserve, false),
-            AccountMeta::new(self.reserve_liquidity_fee_receiver, false),
-            AccountMeta::new(self.host_fee_receiver, false),
-            AccountMeta::new_readonly(self.lending_market, false),
-            AccountMeta::new_readonly(self.lending_market_authority, false),
-            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
-            AccountMeta::new_readonly(receiver_program_id, false),
-        ];
-        accounts.extend(receiver_accounts.iter().cloned());
-
-        let mut data = Vec::with_capacity(1 + std::mem::size_of::<u64>());
-        data.push(LENDING_FLASH_LOAN_TAG);
-        data.extend_from_slice(&amount.to_le_bytes());
-
-        Instruction {
-            program_id: self.program_id,
-            accounts,
-            data,
-        }
+    pub fn borrow_instruction(&self, amount: u64, destination_liquidity: Pubkey) -> Instruction {
+        flash_borrow_instruction(
+            self.program_id,
+            amount,
+            self.reserve_liquidity_supply,
+            destination_liquidity,
+            self.reserve,
+            self.lending_market,
+            self.lending_market_authority,
+        )
     }
 
     pub fn repay_instruction(
@@ -332,20 +319,20 @@ impl FlashLoanAccounts {
         amount: u64,
         source_liquidity: Pubkey,
         authority: Pubkey,
-    ) -> Result<Instruction> {
-        let mut data = Vec::with_capacity(1 + std::mem::size_of::<u64>());
-        data.push(SPL_TOKEN_TRANSFER_TAG);
-        data.extend_from_slice(&amount.to_le_bytes());
-
-        Ok(Instruction {
-            program_id: SPL_TOKEN_PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new(source_liquidity, false),
-                AccountMeta::new(self.reserve_liquidity_supply, false),
-                AccountMeta::new_readonly(authority, true),
-            ],
-            data,
-        })
+        borrow_instruction_index: u8,
+    ) -> Instruction {
+        flash_repay_instruction(
+            self.program_id,
+            amount,
+            source_liquidity,
+            self.reserve_liquidity_supply,
+            self.reserve_liquidity_fee_receiver,
+            self.host_fee_receiver,
+            self.reserve,
+            self.lending_market,
+            authority,
+            borrow_instruction_index,
+        )
     }
 
     pub fn allows_receiver_program(&self, program: &Pubkey) -> bool {
@@ -362,7 +349,6 @@ impl FlashLoanAccounts {
 mod tests {
     use super::*;
     use serde_json::json;
-    use solana_sdk::instruction::AccountMeta;
 
     fn test_config() -> Arc<AppConfig> {
         test_config_with_allowlist(Vec::new())
@@ -396,9 +382,14 @@ mod tests {
                     "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
                     "reserve": "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36",
                     "reserve_liquidity_mint": "So11111111111111111111111111111111111111112",
-                    "reserve_liquidity_supply": "8UviNr47S8eL6J3WfDxMRa3hvLta1VDJwNWqsDgtN3Cv",
-                    "reserve_liquidity_fee_receiver": "5wo1tFpi4HaVKnemqaXeQnBEpezrJXcXvuztYaPhvgC7",
-                    "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+                    "borrow": {
+                        "reserve_liquidity_supply": "8UviNr47S8eL6J3WfDxMRa3hvLta1VDJwNWqsDgtN3Cv"
+                    },
+                    "repay": {
+                        "reserve_liquidity_supply": "8UviNr47S8eL6J3WfDxMRa3hvLta1VDJwNWqsDgtN3Cv",
+                        "reserve_liquidity_fee_receiver": "5wo1tFpi4HaVKnemqaXeQnBEpezrJXcXvuztYaPhvgC7",
+                        "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+                    }
                 }
             },
             "quicknode_rpcs": ["https://example"],
@@ -442,33 +433,30 @@ mod tests {
         let planner = FlashLoanPlanner::new(test_config()).expect("planner");
         let plan = planner.plan_route("SOL", 1_000_000).expect("route");
         let destination = Pubkey::new_unique();
-        let receiver_program = Pubkey::new_unique();
-        let extra_account = Pubkey::new_unique();
-        let receiver_accounts = vec![AccountMeta::new(extra_account, false)];
-        let borrow_ix = plan.borrow_instruction(destination, receiver_program, &receiver_accounts);
+        let borrow_ix = plan.borrow_instruction(destination);
         assert_eq!(borrow_ix.program_id, plan.accounts.program_id);
-        assert_eq!(borrow_ix.data[0], LENDING_FLASH_LOAN_TAG);
+        assert_eq!(borrow_ix.data[0], FLASH_BORROW_OPCODE);
         let amount = u64::from_le_bytes(
             borrow_ix.data[1..1 + std::mem::size_of::<u64>()]
                 .try_into()
                 .expect("amount bytes"),
         );
         assert_eq!(amount, plan.borrow_amount);
-        assert_eq!(borrow_ix.accounts.len(), 9 + receiver_accounts.len());
-        assert_eq!(borrow_ix.accounts.last().unwrap().pubkey, extra_account);
+        assert_eq!(borrow_ix.accounts.len(), 7);
+        assert_eq!(borrow_ix.accounts[1].pubkey, destination);
 
         let authority = Pubkey::new_unique();
-        let repay_ix = plan
-            .repay_instruction(destination, authority)
-            .expect("repay instruction");
-        assert_eq!(repay_ix.program_id, SPL_TOKEN_PROGRAM_ID);
-        assert_eq!(repay_ix.data[0], SPL_TOKEN_TRANSFER_TAG);
+        let repay_ix = plan.repay_instruction(destination, authority, 3);
+        assert_eq!(repay_ix.program_id, plan.accounts.program_id);
+        assert_eq!(repay_ix.data[0], FLASH_REPAY_OPCODE);
         let repay_amount = u64::from_le_bytes(
             repay_ix.data[1..1 + std::mem::size_of::<u64>()]
                 .try_into()
                 .expect("repay amount bytes"),
         );
-        assert_eq!(repay_amount, plan.repay_amount);
+        assert_eq!(repay_amount, plan.borrow_amount);
+        assert_eq!(repay_ix.data.last().copied(), Some(3));
+        assert_eq!(repay_ix.accounts.len(), 9);
     }
 
     #[test]

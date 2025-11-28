@@ -47,6 +47,8 @@ dashmap = "5"
 uint = "0.9"
 sha2 = "0.10"
 prometheus-client = "0.22"
+csv = "1"
+solend = { path = "solend" }
 
 [build-dependencies]
 prost-build = "0.13"
@@ -68,5 +70,9 @@ strip = true
 
 [profile.dev]
 incremental = true
+
+
+[dev-dependencies]
+tempfile = "3"
 
 

@@ -9,6 +9,17 @@ use serde::Deserialize;
 
 use crate::token_pair::TokenPair;
 
+const ENV_CORECAST_AUTHORIZATION: &str = "TRE_CORECAST_AUTHORIZATION";
+const ENV_CORECAST_ADDRESS: &str = "TRE_CORECAST_ADDRESS";
+const ENV_BAM_VALIDATOR_CSV: &str = "TRE_BAM_VALIDATOR_CSV";
+const ENV_JITO_ENDPOINTS: &str = "TRE_JITO_ENDPOINTS";
+const ENV_JITO_API_TOKEN: &str = "TRE_JITO_API_TOKEN";
+const ENV_JITO_TIP_FLOOR_URL: &str = "TRE_JITO_TIP_FLOOR_URL";
+const ENV_JITO_TIP_STREAM_URL: &str = "TRE_JITO_TIP_STREAM_URL";
+const ENV_JITO_AUCTION_STREAM_URL: &str = "TRE_JITO_AUCTION_STREAM_URL";
+const ENV_JITO_CA_PEM: &str = "TRE_JITO_CA_PEM";
+const ENV_QUICKNODE_RPCS: &str = "TRE_QUICKNODE_RPCS";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub wallets: Wallets,
@@ -32,6 +43,8 @@ pub struct AppConfig {
     pub alerts: AlertingConfig,
     #[serde(default)]
     pub submission: SubmissionTrackingConfig,
+    #[serde(default, deserialize_with = "deserialize_optional_path")]
+    pub bam_validator_csv: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -40,6 +53,8 @@ impl AppConfig {
             .with_context(|| format!("failed reading config file {}", path.display()))?;
         let mut config: AppConfig = serde_json::from_str(&contents)
             .with_context(|| format!("failed parsing config file {}", path.display()))?;
+        config.hydrate_env_references()?;
+        config.apply_env_overrides();
         config.populate_token_pairs_from_tokens();
         config.normalize_token_pairs();
         config.apply_protocol_defaults();
@@ -53,9 +68,7 @@ impl AppConfig {
 
     fn apply_protocol_defaults(&mut self) {
         for protocol in KNOWN_PROTOCOLS {
-            self.protocols
-                .entry((*protocol).to_string())
-                .or_insert_with(ProtocolConfig::default);
+            self.protocols.entry((*protocol).to_string()).or_default();
         }
 
         for entry in self.protocols.values_mut() {
@@ -79,14 +92,20 @@ impl AppConfig {
             .and_then(|entry| entry.hydration_retry_ms)
     }
 
+    pub fn bam_validator_csv_path(&self) -> PathBuf {
+        self.bam_validator_csv
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("bam_validators.csv"))
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.token_pairs.is_empty(),
             "token_pairs must contain at least one allowed pair"
         );
         ensure!(
-            self.jito.endpoints.len() >= 2,
-            "jito.endpoints must contain at least two endpoints for failover"
+            !self.jito.endpoints.is_empty(),
+            "jito.endpoints must contain at least one endpoint"
         );
         ensure!(
             self.perf.ring_capacity > 0,
@@ -153,6 +172,58 @@ impl AppConfig {
         normalized.dedup();
         self.token_pairs = normalized;
     }
+
+    fn hydrate_env_references(&mut self) -> Result<()> {
+        hydrate_string(&mut self.corecast.authorization, "corecast.authorization")?;
+        hydrate_string(&mut self.corecast.address, "corecast.address")?;
+        hydrate_vec(&mut self.jito.endpoints, "jito.endpoints")?;
+        hydrate_string(&mut self.jito.tip_floor_url, "jito.tip_floor_url")?;
+        hydrate_string(&mut self.jito.tip_stream_url, "jito.tip_stream_url")?;
+        if let Some(url) = self.jito.auction_stream_url.as_mut() {
+            hydrate_string(url, "jito.auction_stream_url")?;
+        }
+        if let Some(token) = self.jito.api_token.as_mut() {
+            hydrate_string(token, "jito.api_token")?;
+        }
+        hydrate_vec(&mut self.quicknode_rpcs, "quicknode_rpcs")?;
+        if let Some(ref mut csv_path) = self.bam_validator_csv {
+            hydrate_path(csv_path, "bam_validator_csv")?;
+        }
+        Ok(())
+    }
+
+    fn apply_env_overrides(&mut self) {
+        if let Some(value) = env_string(ENV_CORECAST_AUTHORIZATION) {
+            self.corecast.authorization = value;
+        }
+        if let Some(value) = env_string(ENV_CORECAST_ADDRESS) {
+            self.corecast.address = value;
+        }
+        if let Some(path) = env_path(ENV_BAM_VALIDATOR_CSV) {
+            self.bam_validator_csv = Some(path);
+        }
+        if let Some(list) = env_list(ENV_JITO_ENDPOINTS) {
+            self.jito.endpoints = list;
+        }
+        if let Some(value) = env_string(ENV_JITO_API_TOKEN) {
+            self.jito.api_token = Some(value);
+        }
+        if let Some(value) = env_string(ENV_JITO_TIP_FLOOR_URL) {
+            self.jito.tip_floor_url = value;
+        }
+        if let Some(value) = env_string(ENV_JITO_TIP_STREAM_URL) {
+            self.jito.tip_stream_url = value;
+        }
+        if let Some(value) = env_string(ENV_JITO_AUCTION_STREAM_URL) {
+            self.jito.auction_stream_url = Some(value);
+        }
+        if let Some(path) = env_path(ENV_JITO_CA_PEM) {
+            self.jito.ca_pem = Some(path);
+        }
+        if let Some(list) = env_list(ENV_QUICKNODE_RPCS) {
+            self.quicknode_rpcs = list;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -186,11 +257,22 @@ pub struct FlashLoanConfig {
     pub lending_market: String,
     pub reserve: String,
     pub reserve_liquidity_mint: String,
+    pub borrow: FlashLoanBorrowAccounts,
+    pub repay: FlashLoanRepayAccounts,
+    #[serde(default)]
+    pub receiver_program_allowlist: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FlashLoanBorrowAccounts {
+    pub reserve_liquidity_supply: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FlashLoanRepayAccounts {
     pub reserve_liquidity_supply: String,
     pub reserve_liquidity_fee_receiver: String,
     pub host_fee_receiver: String,
-    #[serde(default)]
-    pub receiver_program_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -261,6 +343,11 @@ pub struct StrategyOverrides {
     pub tip_profit_share_bps: Option<u64>,
     pub tip_floor_markup_bps: Option<u64>,
     pub tip_floor_fallback_lamports: Option<u64>,
+    pub tip_floor_min_lamports: Option<u64>,
+    pub wallet_tip_cap_bps: Option<u64>,
+    pub tip_congestion_target_latency_ms: Option<u64>,
+    pub tip_congestion_max_multiplier: Option<f64>,
+    pub tip_congestion_expired_weight_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -305,6 +392,77 @@ impl Default for SubmissionTrackingConfig {
     }
 }
 
+fn hydrate_string(value: &mut String, field: &str) -> Result<()> {
+    if let Some(var) = parse_env_reference(value) {
+        let resolved = env::var(&var).with_context(|| {
+            format!(
+                "environment variable {} referenced by {} is not set",
+                var, field
+            )
+        })?;
+        *value = resolved;
+    }
+    Ok(())
+}
+
+fn hydrate_vec(values: &mut [String], field: &str) -> Result<()> {
+    for (idx, entry) in values.iter_mut().enumerate() {
+        let label = format!("{}[{}]", field, idx);
+        hydrate_string(entry, &label)?;
+    }
+    Ok(())
+}
+
+fn hydrate_path(path: &mut PathBuf, field: &str) -> Result<()> {
+    if let Some(raw) = path.to_str() {
+        if let Some(var) = parse_env_reference(raw) {
+            let resolved = env::var(&var).with_context(|| {
+                format!(
+                    "environment variable {} referenced by {} is not set",
+                    var, field
+                )
+            })?;
+            *path = expand_tilde(&resolved);
+        }
+    }
+    Ok(())
+}
+
+fn env_string(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_list(name: &str) -> Option<Vec<String>> {
+    let raw = env_string(name)?;
+    let entries: Vec<String> = raw
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.to_string())
+        .collect();
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env_string(name).map(|value| expand_tilde(&value))
+}
+
+fn parse_env_reference(value: &str) -> Option<String> {
+    value
+        .strip_prefix("$ENV{")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
+        .map(|inner| inner.to_string())
+}
+
 fn deserialize_path<'de, D>(deserializer: D) -> std::result::Result<PathBuf, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -341,12 +499,27 @@ fn expand_tilde(path: &str) -> PathBuf {
 mod tests {
     use std::env;
 
-    use super::expand_tilde;
+    use super::{env_list, expand_tilde, parse_env_reference};
 
     #[test]
     fn expands_home_prefix() {
         env::set_var("HOME", "/tmp/home");
         let path = expand_tilde("~/keys.json");
         assert_eq!(path, std::path::PathBuf::from("/tmp/home/keys.json"));
+    }
+
+    #[test]
+    fn parses_env_reference() {
+        assert_eq!(parse_env_reference("$ENV{FOO}"), Some("FOO".into()));
+        assert_eq!(parse_env_reference("$ENV{ BAR }"), Some("BAR".into()));
+        assert_eq!(parse_env_reference("$ENV{}"), None);
+        assert_eq!(parse_env_reference("FOO"), None);
+    }
+
+    #[test]
+    fn splits_env_list() {
+        env::set_var("TRE_TEST_LIST", "a,b, c\n d");
+        let entries = env_list("TRE_TEST_LIST").expect("list parsed");
+        assert_eq!(entries, vec!["a", "b", "c", "d"]);
     }
 }

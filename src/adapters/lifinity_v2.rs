@@ -15,7 +15,10 @@ use crate::stages::types::{
 };
 use crate::template::TemplateContext;
 
-use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
+use super::{
+    build_quote_response, hydration::AsyncHydrator, ProtocolAdapter, QuoteRequest, QuoteResponse,
+    SwapDirection,
+};
 
 const LIFINITY_PROGRAM_ID: &str = "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c";
 const BPS_DENOMINATOR: u64 = 10_000;
@@ -24,6 +27,8 @@ const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const LIFINITY_DEFAULT_CU_LIMIT: u32 = 320_000;
 
+const DEFAULT_LIFINITY_HYDRATION_RETRY_MS: u64 = 60_000;
+
 #[derive(Debug, Clone)]
 pub struct LifinityAdapterConfig {
     pub stale_slot_threshold: u64,
@@ -31,6 +36,7 @@ pub struct LifinityAdapterConfig {
     pub rpc_endpoints: Vec<String>,
     pub rpc_timeout_ms: u64,
     pub oracle_stale_after_ms: u64,
+    pub hydration_retry_ms: u64,
 }
 
 impl Default for LifinityAdapterConfig {
@@ -41,6 +47,7 @@ impl Default for LifinityAdapterConfig {
             rpc_endpoints: Vec::new(),
             rpc_timeout_ms: 15_000,
             oracle_stale_after_ms: 1_000,
+            hydration_retry_ms: DEFAULT_LIFINITY_HYDRATION_RETRY_MS,
         }
     }
 }
@@ -499,10 +506,9 @@ impl LifinityAdapter {
             min_output_amount: Some(expected_output),
             limit_price: None,
             price_impact_limit_bps: None,
-            context: {
-                let mut ctx = TemplateContext::default();
-                ctx.compute_unit_limit = Some(LIFINITY_DEFAULT_CU_LIMIT);
-                ctx
+            context: TemplateContext {
+                compute_unit_limit: Some(LIFINITY_DEFAULT_CU_LIMIT),
+                ..Default::default()
             },
         })
     }
@@ -689,16 +695,17 @@ fn lifinity_amount_out(amount_in: u64, ctx: SwapContext, state: &LifinityPoolSta
 
 fn base_fee_bps(state: &LifinityPoolState) -> u64 {
     let mut total = 0u64;
-    for component in [
+    for value in [
         state.fees_bps.map(|value| value as u64),
         state.owner_fee_bps.map(|value| value as u64),
         state.host_fee_bps.map(|value| value as u64),
         state.fee_trade_bps.map(|value| value as u64),
         state.fee_platform_bps.map(|value| value as u64),
-    ] {
-        if let Some(value) = component {
-            total = total.saturating_add(value);
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        total = total.saturating_add(value);
     }
 
     total.min(BPS_DENOMINATOR - 1)
@@ -759,7 +766,7 @@ fn snapshot_probe_amount(reserve: u128) -> Option<u64> {
     }
 
     probe = probe.min(reserve);
-    probe = probe.max(1u128).min(SNAPSHOT_MAX_PROBE_INPUT);
+    probe = probe.clamp(1u128, SNAPSHOT_MAX_PROBE_INPUT);
     Some(probe as u64)
 }
 
@@ -861,9 +868,9 @@ struct HydratedPoolMeta {
 }
 
 struct LifinityPoolHydrator {
-    clients: Vec<Arc<RpcClient>>,
-    cache: DashMap<Pubkey, HydratedPoolMeta>,
     program_id: Pubkey,
+    hydrator: AsyncHydrator<Pubkey, HydratedPoolMeta>,
+    endpoint_count: usize,
 }
 
 impl LifinityPoolHydrator {
@@ -873,62 +880,69 @@ impl LifinityPoolHydrator {
         }
 
         let timeout = Duration::from_millis(config.rpc_timeout_ms.max(100));
-        let clients: Vec<Arc<RpcClient>> = config
+        let client_list: Vec<Arc<RpcClient>> = config
             .rpc_endpoints
             .iter()
             .map(|url| Arc::new(RpcClient::new_with_timeout(url.clone(), timeout)))
             .collect();
 
-        if clients.is_empty() {
+        if client_list.is_empty() {
             return None;
         }
 
+        let endpoint_count = client_list.len();
+        let clients = Arc::new(client_list);
+        let fetch_clients = clients.clone();
+        let hydrator = AsyncHydrator::new("lifinity_pool", endpoint_count, move |pool| {
+            fetch_lifinity_meta(program_id, fetch_clients.as_ref(), pool)
+        });
+
         Some(Self {
-            clients,
-            cache: DashMap::new(),
             program_id,
+            hydrator,
+            endpoint_count,
         })
     }
 
     fn client_count(&self) -> usize {
-        self.clients.len()
+        self.endpoint_count
     }
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        if let Some(entry) = self.cache.get(&pool) {
-            return Some(entry.clone());
-        }
-        self.fetch_from_rpc(pool)
+        self.hydrator.get_or_schedule(pool)
     }
+}
 
-    fn fetch_from_rpc(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        for client in &self.clients {
-            match client.get_account(&pool) {
-                Ok(account) => {
-                    if let Some(meta) = parse_amm_account(&self.program_id, pool, &account.data) {
-                        self.cache.insert(pool, meta.clone());
-                        return Some(meta);
-                    } else {
-                        warn!(
-                            target = "adapter::lifinity",
-                            pool = %pool,
-                            "unexpected Lifinity Amm account layout"
-                        );
-                    }
-                }
-                Err(error) => {
+fn fetch_lifinity_meta(
+    program_id: Pubkey,
+    clients: &[Arc<RpcClient>],
+    pool: Pubkey,
+) -> Option<HydratedPoolMeta> {
+    for client in clients {
+        match client.get_account(&pool) {
+            Ok(account) => {
+                if let Some(meta) = parse_amm_account(&program_id, pool, &account.data) {
+                    return Some(meta);
+                } else {
                     warn!(
                         target = "adapter::lifinity",
                         pool = %pool,
-                        %error,
-                        "failed to fetch Lifinity Amm account"
+                        "unexpected Lifinity Amm account layout"
                     );
                 }
             }
+            Err(error) => {
+                warn!(
+                    target = "adapter::lifinity",
+                    pool = %pool,
+                    %error,
+                    "failed to fetch Lifinity Amm account"
+                );
+            }
         }
-
-        None
     }
+
+    None
 }
 
 struct LifinityOracleCache {
@@ -1002,10 +1016,10 @@ impl LifinityOracleCache {
 
 #[derive(Clone, Debug)]
 struct OracleSnapshot {
-    price: i64,
+    _price: i64,
     confidence: u64,
-    exponent: i32,
-    valid_slot: u64,
+    _exponent: i32,
+    _valid_slot: u64,
     publish_slot: u64,
     cached_at: Instant,
 }
@@ -1013,10 +1027,10 @@ struct OracleSnapshot {
 impl OracleSnapshot {
     fn from_parsed(parsed: ParsedOracleData) -> Self {
         Self {
-            price: parsed.price,
+            _price: parsed.price,
             confidence: parsed.confidence,
-            exponent: parsed.exponent,
-            valid_slot: parsed.valid_slot,
+            _exponent: parsed.exponent,
+            _valid_slot: parsed.valid_slot,
             publish_slot: parsed.publish_slot,
             cached_at: Instant::now(),
         }
@@ -1358,7 +1372,8 @@ mod tests {
     fn parses_lifinity_amm_account() {
         let program_id = Pubkey::new_unique();
         let pool = Pubkey::new_unique();
-        let bump = 9u8;
+        let (expected_authority, bump) =
+            Pubkey::find_program_address(&[pool.as_ref()], &program_id);
 
         let token_program = Pubkey::new_unique();
         let token_a_vault = Pubkey::new_unique();
@@ -1371,8 +1386,7 @@ mod tests {
         let oracle_sub = Pubkey::new_unique();
         let oracle_pc = Pubkey::new_unique();
 
-        let mut data = Vec::new();
-        data.resize(ANCHOR_DISCRIMINATOR_LEN, 0);
+        let mut data = vec![0u8; ANCHOR_DISCRIMINATOR_LEN];
 
         for _ in 0..3 {
             push_pubkey(&mut data, &Pubkey::new_unique());
@@ -1433,8 +1447,6 @@ mod tests {
         }
 
         let meta = parse_amm_account(&program_id, pool, &data).expect("should parse");
-        let expected_authority =
-            Pubkey::create_program_address(&[pool.as_ref(), &[bump]], &program_id).unwrap();
 
         assert_eq!(meta.authority, expected_authority);
         assert_eq!(meta.token_program, token_program);

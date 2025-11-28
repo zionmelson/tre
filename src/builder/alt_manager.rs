@@ -145,12 +145,12 @@ impl AltManager {
         Ok(Self { state })
     }
 
-    pub fn refresh_warm_cache(&self) {
+    pub fn refresh_warm_cache(&self) -> Result<()> {
         self.state.refresh_count.fetch_add(1, Ordering::Relaxed);
         self.state
             .last_refresh_unix_ms
             .store(now_millis(), Ordering::Relaxed);
-        self.state.persist_snapshot_safely();
+        self.state.persist_snapshot()
     }
 
     pub fn stats(&self) -> AltManagerStats {
@@ -252,7 +252,7 @@ impl From<AltTableBacking> for AltTableInfo {
 }
 
 struct AltEntrySnapshot {
-    pool: Pubkey,
+    _pool: Pubkey,
     handle: AltHandleId,
     accounts: Vec<Pubkey>,
     version: u64,
@@ -408,7 +408,7 @@ impl AltWorker {
             .registry
             .get(&pool)
             .map(|entry| AltEntrySnapshot {
-                pool,
+                _pool: pool,
                 handle: entry.handle,
                 accounts: entry.accounts.clone(),
                 version: entry.version,

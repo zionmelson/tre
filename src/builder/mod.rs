@@ -16,6 +16,7 @@ use crate::config::AppConfig;
 use blockhash::BlockhashCache;
 use solana_sdk::hash::Hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
+use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Keypair, Signer};
 use solana_sdk::transaction::VersionedTransaction;
@@ -23,7 +24,7 @@ use tracing::warn;
 
 pub use alt_manager::{AltManager, AltManagerStats};
 pub use bundle_builder::{BundleBuildContext, BundleInstructionPlan, BundleLookupTablePlan};
-pub use flash_loan::{FlashLoanPlanner, FlashLoanRoutePlan};
+pub use flash_loan::{compute_flash_loan_fee, FlashLoanPlanner, FlashLoanRoutePlan};
 pub use mev_guard::MevGuard;
 pub use template_cache::{
     AltHandleId, AmmV3Field, AmmV3FieldLayout, AmmV3TemplateParams, CpAmmField, CpAmmFieldLayout,
@@ -116,15 +117,18 @@ impl BuilderHandle {
         &self,
         plan: &bundle_builder::BundleInstructionPlan,
     ) -> Result<Vec<AccountMeta>> {
-        bundle_builder::hydrate_accounts_for_plan(&self.0.template_cache, plan)
+        bundle_builder::hydrate_accounts_for_plan(&self.0.template_cache, plan, self.0.payer_pubkey)
     }
 
     pub fn sign_bundle(
         &self,
         ctx: &bundle_builder::BundleBuildContext,
     ) -> Result<VersionedTransaction> {
+        let latest_hash = self.recent_blockhash()?;
+        let mut message = ctx.message.clone();
+        update_message_blockhash(&mut message, latest_hash);
         let signers = [&*self.0.payer];
-        VersionedTransaction::try_new(ctx.message.clone(), &signers)
+        VersionedTransaction::try_new(message, &signers)
             .map_err(|err| anyhow!("failed to sign bundle {}: {err}", ctx.seq))
     }
 
@@ -214,6 +218,13 @@ impl BuilderHandle {
         if let Err(err) = template_loader::register_whirlpool_pool(&self.0.template_cache, &meta) {
             warn!(error = ?err, pool = %meta.pool_id, fee_bps = meta.fee_tier_bps, "failed to register whirlpool templates");
         }
+    }
+}
+
+fn update_message_blockhash(message: &mut VersionedMessage, new_hash: Hash) {
+    match message {
+        VersionedMessage::Legacy(legacy) => legacy.recent_blockhash = new_hash,
+        VersionedMessage::V0(v0) => v0.recent_blockhash = new_hash,
     }
 }
 

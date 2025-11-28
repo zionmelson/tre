@@ -134,10 +134,12 @@ fn parse_raydium_v3_extras(event: &PoolLiquidityChangeEvent) -> Option<RaydiumV3
     let program = instruction.program.as_ref()?;
     let account_lookup = InstructionAccountLookup::new(program, &instruction.accounts);
 
-    let mut extras = RaydiumV3PoolExtras::default();
-    extras.amm_config = account_lookup.pubkey_with_aliases(&["ammConfig", "amm_config"]);
-    extras.observation_state =
-        account_lookup.pubkey_with_aliases(&["observationState", "observation_state"]);
+    let mut extras = RaydiumV3PoolExtras {
+        amm_config: account_lookup.pubkey_with_aliases(&["ammConfig", "amm_config"]),
+        observation_state: account_lookup
+            .pubkey_with_aliases(&["observationState", "observation_state"]),
+        ..Default::default()
+    };
 
     let market = match event.market.as_ref() {
         Some(market) => market,
@@ -218,27 +220,33 @@ fn parse_cp_amm_extras(event: &PoolLiquidityChangeEvent) -> Option<CpAmmPoolExtr
     let base_currency = market.and_then(|m| m.base_currency.as_ref());
     let quote_currency = market.and_then(|m| m.quote_currency.as_ref());
 
-    let mut extras = CpAmmPoolExtras::default();
-    extras.pool_authority =
-        lookup_account_string(&account_lookup, &["pool_authority", "poolAuthority"]);
-    extras.token_a_vault =
-        lookup_account_string(&account_lookup, &["token_a_vault", "tokenAVault"]);
-    extras.token_b_vault =
-        lookup_account_string(&account_lookup, &["token_b_vault", "tokenBVault"]);
-    extras.token_a_mint = lookup_account_string(&account_lookup, &["token_a_mint", "tokenAMint"])
-        .or_else(|| currency_mint(base_currency).map(|pk| pk.to_string()));
-    extras.token_b_mint = lookup_account_string(&account_lookup, &["token_b_mint", "tokenBMint"])
-        .or_else(|| currency_mint(quote_currency).map(|pk| pk.to_string()));
-    extras.token_a_program =
-        lookup_account_string(&account_lookup, &["token_a_program", "tokenAProgram"])
-            .or_else(|| currency_program(base_currency).map(|pk| pk.to_string()));
-    extras.token_b_program =
-        lookup_account_string(&account_lookup, &["token_b_program", "tokenBProgram"])
-            .or_else(|| currency_program(quote_currency).map(|pk| pk.to_string()));
-    extras.referral_token_account = lookup_account_string(
-        &account_lookup,
-        &["referral_token_account", "referralTokenAccount"],
-    );
+    let extras = CpAmmPoolExtras {
+        pool_authority: lookup_account_string(
+            &account_lookup,
+            &["pool_authority", "poolAuthority"],
+        ),
+        token_a_vault: lookup_account_string(&account_lookup, &["token_a_vault", "tokenAVault"]),
+        token_b_vault: lookup_account_string(&account_lookup, &["token_b_vault", "tokenBVault"]),
+        token_a_mint: lookup_account_string(&account_lookup, &["token_a_mint", "tokenAMint"])
+            .or_else(|| currency_mint(base_currency).map(|pk| pk.to_string())),
+        token_b_mint: lookup_account_string(&account_lookup, &["token_b_mint", "tokenBMint"])
+            .or_else(|| currency_mint(quote_currency).map(|pk| pk.to_string())),
+        token_a_program: lookup_account_string(
+            &account_lookup,
+            &["token_a_program", "tokenAProgram"],
+        )
+        .or_else(|| currency_program(base_currency).map(|pk| pk.to_string())),
+        token_b_program: lookup_account_string(
+            &account_lookup,
+            &["token_b_program", "tokenBProgram"],
+        )
+        .or_else(|| currency_program(quote_currency).map(|pk| pk.to_string())),
+        referral_token_account: lookup_account_string(
+            &account_lookup,
+            &["referral_token_account", "referralTokenAccount"],
+        ),
+        ..Default::default()
+    };
 
     Some(extras)
 }
@@ -259,23 +267,25 @@ fn parse_lb_clmm_extras(event: &PoolLiquidityChangeEvent) -> Option<LbClmmPoolEx
     let base_side = event.base_currency.as_ref();
     let quote_side = event.quote_currency.as_ref();
 
-    let mut extras = LbClmmPoolExtras::default();
-    extras.reserve_x = lookup_account_string(&lookup, &["reserve_x", "reserveX"]);
-    extras.reserve_y = lookup_account_string(&lookup, &["reserve_y", "reserveY"]);
-    extras.token_x_mint = lookup_account_string(&lookup, &["token_x_mint", "tokenXMint"])
-        .or_else(|| currency_mint(base_currency).map(|pk| pk.to_string()));
-    extras.token_y_mint = lookup_account_string(&lookup, &["token_y_mint", "tokenYMint"])
-        .or_else(|| currency_mint(quote_currency).map(|pk| pk.to_string()));
-    extras.token_x_program = lookup_account_string(&lookup, &["token_x_program", "tokenXProgram"])
-        .or_else(|| currency_program(base_currency).map(|pk| pk.to_string()));
-    extras.token_y_program = lookup_account_string(&lookup, &["token_y_program", "tokenYProgram"])
-        .or_else(|| currency_program(quote_currency).map(|pk| pk.to_string()));
-    extras.oracle = lookup_account_string(&lookup, &["oracle"]);
-    extras.bin_array_bitmap_extension = lookup_account_string(
-        &lookup,
-        &["bin_array_bitmap_extension", "binArrayBitmapExtension"],
-    );
-    extras.host_fee_account = lookup_account_string(&lookup, &["host_fee_in", "hostFeeIn"]);
+    let mut extras = LbClmmPoolExtras {
+        reserve_x: lookup_account_string(&lookup, &["reserve_x", "reserveX"]),
+        reserve_y: lookup_account_string(&lookup, &["reserve_y", "reserveY"]),
+        token_x_mint: lookup_account_string(&lookup, &["token_x_mint", "tokenXMint"])
+            .or_else(|| currency_mint(base_currency).map(|pk| pk.to_string())),
+        token_y_mint: lookup_account_string(&lookup, &["token_y_mint", "tokenYMint"])
+            .or_else(|| currency_mint(quote_currency).map(|pk| pk.to_string())),
+        token_x_program: lookup_account_string(&lookup, &["token_x_program", "tokenXProgram"])
+            .or_else(|| currency_program(base_currency).map(|pk| pk.to_string())),
+        token_y_program: lookup_account_string(&lookup, &["token_y_program", "tokenYProgram"])
+            .or_else(|| currency_program(quote_currency).map(|pk| pk.to_string())),
+        oracle: lookup_account_string(&lookup, &["oracle"]),
+        bin_array_bitmap_extension: lookup_account_string(
+            &lookup,
+            &["bin_array_bitmap_extension", "binArrayBitmapExtension"],
+        ),
+        host_fee_account: lookup_account_string(&lookup, &["host_fee_in", "hostFeeIn"]),
+        ..Default::default()
+    };
 
     if let Some(side) = base_side {
         extras.reserve_x_balance = Some(side.post_amount as u128);
@@ -317,36 +327,38 @@ fn parse_lifinity_extras(event: &PoolLiquidityChangeEvent) -> Option<LifinityPoo
     let program = instruction.program.as_ref()?;
     let lookup = InstructionAccountLookup::new(program, &instruction.accounts);
 
-    let mut extras = LifinityPoolExtras::default();
-    extras.authority = lookup_account_string(&lookup, &["authority", "Authority"]);
-    extras.token_program = lookup_account_string(&lookup, &["tokenProgram", "token_program"]);
-    extras.token_a_vault = lookup_account_string(
-        &lookup,
-        &["swapSource", "tokenA", "token_a_vault", "tokenAAccount"],
-    );
-    extras.token_b_vault = lookup_account_string(
-        &lookup,
-        &[
-            "swapDestination",
-            "tokenB",
-            "token_b_vault",
-            "tokenBAccount",
-        ],
-    );
-    extras.pool_mint = lookup_account_string(&lookup, &["poolMint", "pool_mint"]);
-    extras.fee_account = lookup_account_string(&lookup, &["feeAccount", "fee_account"]);
-    extras.oracle_main = lookup_account_string(
-        &lookup,
-        &["oracleMainAccount", "oracle_main_account", "oracleMain"],
-    );
-    extras.oracle_sub = lookup_account_string(
-        &lookup,
-        &["oracleSubAccount", "oracle_sub_account", "oracleSub"],
-    );
-    extras.oracle_pc = lookup_account_string(
-        &lookup,
-        &["oraclePcAccount", "oracle_pc_account", "oraclePc"],
-    );
+    let mut extras = LifinityPoolExtras {
+        authority: lookup_account_string(&lookup, &["authority", "Authority"]),
+        token_program: lookup_account_string(&lookup, &["tokenProgram", "token_program"]),
+        token_a_vault: lookup_account_string(
+            &lookup,
+            &["swapSource", "tokenA", "token_a_vault", "tokenAAccount"],
+        ),
+        token_b_vault: lookup_account_string(
+            &lookup,
+            &[
+                "swapDestination",
+                "tokenB",
+                "token_b_vault",
+                "tokenBAccount",
+            ],
+        ),
+        pool_mint: lookup_account_string(&lookup, &["poolMint", "pool_mint"]),
+        fee_account: lookup_account_string(&lookup, &["feeAccount", "fee_account"]),
+        oracle_main: lookup_account_string(
+            &lookup,
+            &["oracleMainAccount", "oracle_main_account", "oracleMain"],
+        ),
+        oracle_sub: lookup_account_string(
+            &lookup,
+            &["oracleSubAccount", "oracle_sub_account", "oracleSub"],
+        ),
+        oracle_pc: lookup_account_string(
+            &lookup,
+            &["oraclePcAccount", "oracle_pc_account", "oraclePc"],
+        ),
+        ..Default::default()
+    };
 
     if let Some(base_side) = event.base_currency.as_ref() {
         extras.vault_a_balance = Some(base_side.post_amount as u128);
@@ -388,13 +400,15 @@ fn parse_whirlpool_extras(event: &PoolLiquidityChangeEvent) -> Option<WhirlpoolP
     let program = instruction.program.as_ref()?;
     let lookup = InstructionAccountLookup::new(program, &instruction.accounts);
 
-    let mut extras = WhirlpoolPoolExtras::default();
-    extras.token_vault_a = lookup_account_string(&lookup, &["tokenVaultA", "token_vault_a"]);
-    extras.token_vault_b = lookup_account_string(&lookup, &["tokenVaultB", "token_vault_b"]);
-    extras.oracle = lookup_account_string(&lookup, &["oracle"]);
-    extras.tick_array0 = lookup_account_string(&lookup, &["tickArray0", "tick_array0"]);
-    extras.tick_array1 = lookup_account_string(&lookup, &["tickArray1", "tick_array1"]);
-    extras.tick_array2 = lookup_account_string(&lookup, &["tickArray2", "tick_array2"]);
+    let extras = WhirlpoolPoolExtras {
+        token_vault_a: lookup_account_string(&lookup, &["tokenVaultA", "token_vault_a"]),
+        token_vault_b: lookup_account_string(&lookup, &["tokenVaultB", "token_vault_b"]),
+        oracle: lookup_account_string(&lookup, &["oracle"]),
+        tick_array0: lookup_account_string(&lookup, &["tickArray0", "tick_array0"]),
+        tick_array1: lookup_account_string(&lookup, &["tickArray1", "tick_array1"]),
+        tick_array2: lookup_account_string(&lookup, &["tickArray2", "tick_array2"]),
+        ..Default::default()
+    };
 
     whirlpool_extras_if_any(extras)
 }
@@ -460,9 +474,9 @@ fn currency_program(currency: Option<&Currency>) -> Option<Pubkey> {
 
 fn order_mints(a: &Pubkey, b: &Pubkey) -> (Pubkey, Pubkey) {
     if a.to_bytes() <= b.to_bytes() {
-        (a.clone(), b.clone())
+        (*a, *b)
     } else {
-        (b.clone(), a.clone())
+        (*b, *a)
     }
 }
 
@@ -1109,8 +1123,10 @@ pub struct BundleCandidate {
     pub bundle_context: Option<BundleBuildContext>,
     pub tip_lamports: Option<u64>,
     pub tip_account: Option<Pubkey>,
+    pub flash_loan: Option<FlashLoanSummary>,
     pub stage2_attempts: u8,
     pub stage3_attempts: u8,
+    pub stage3_ready_at: Option<Instant>,
 }
 
 impl BundleCandidate {
@@ -1127,8 +1143,10 @@ impl BundleCandidate {
             bundle_context: None,
             tip_lamports: None,
             tip_account: None,
+            flash_loan: None,
             stage2_attempts: 0,
             stage3_attempts: 0,
+            stage3_ready_at: None,
         }
     }
 }
@@ -1178,6 +1196,19 @@ pub struct PlannedInstruction {
     pub limit_price: Option<i64>,
     pub price_impact_limit_bps: Option<u16>,
     pub context: TemplateContext,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashLoanSummary {
+    pub plan_id: u64,
+    pub token: String,
+    pub liquidity_mint: String,
+    pub borrow_amount: u64,
+    pub repay_amount: u64,
+    pub fee_amount: u64,
+    pub program_id: String,
+    pub lending_market: String,
+    pub reserve: String,
 }
 
 #[derive(Debug, Clone)]

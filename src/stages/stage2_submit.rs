@@ -7,11 +7,13 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use bincode::serialize;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::rent::Rent;
+use solana_sdk::sysvar;
 use solana_system_interface::{instruction as system_instruction, program as system_program};
 use tracing::{debug, info, warn};
 
@@ -23,8 +25,8 @@ use crate::core::{pin_current_thread, Lease, RingConsumer, RingProducer};
 use crate::telemetry::{self, Stage2PlanEvent};
 
 use super::types::{
-    BundleCandidate, PlannedInstruction, PlannedLookupTable, PoolQuoteDirection, RouteLegPlan,
-    RoutePlan,
+    BundleCandidate, FlashLoanSummary, PlannedInstruction, PlannedLookupTable, PoolQuoteDirection,
+    RouteLegPlan, RoutePlan,
 };
 
 pub fn spawn_submit_stage(
@@ -219,6 +221,16 @@ fn build_tip_instruction(bundle: &BundleCandidate, payer: Pubkey) -> Option<Inst
     })
 }
 
+fn compute_budget_instruction_count(swaps: &[PlannedInstruction]) -> usize {
+    swaps
+        .iter()
+        .filter_map(|ix| ix.context.compute_unit_limit)
+        .max()
+        .map(|_| 1)
+        .unwrap_or(0)
+}
+
+#[derive(Debug)]
 enum Stage2Failure {
     Plan(anyhow::Error),
     Prepare(anyhow::Error),
@@ -229,7 +241,7 @@ struct PlannedRouteInstructions {
     swap_instructions: Vec<PlannedInstruction>,
     prefix_instructions: Vec<Instruction>,
     suffix_instructions: Vec<Instruction>,
-    flash_loan_plan: Option<FlashLoanRoutePlan>,
+    flash_loan_plan: Option<FlashLoanInstructionPlan>,
 }
 
 fn prepare_bundle(
@@ -242,7 +254,9 @@ fn prepare_bundle(
     }
 
     if let Some(route_plan) = bundle.route_plan.as_ref() {
-        let planned = planner.plan(route_plan).map_err(Stage2Failure::Plan)?;
+        let planned = planner
+            .plan(route_plan, bundle.seq, bundle.tip_lamports)
+            .map_err(Stage2Failure::Plan)?;
         build_multi_leg_bundle(bundle, planned, builder)
     } else {
         let detection_latency_ms = duration_ms(bundle.created_at.elapsed());
@@ -265,12 +279,47 @@ fn build_multi_leg_bundle(
     let PlannedRouteInstructions {
         swap_instructions,
         mut prefix_instructions,
-        suffix_instructions,
+        mut suffix_instructions,
         flash_loan_plan,
     } = planned;
 
     if let Some(tip_ix) = build_tip_instruction(bundle, builder.payer_pubkey()) {
         prefix_instructions.push(tip_ix);
+    }
+
+    let mut flash_loan_plan = flash_loan_plan;
+    if let Some(plan) = flash_loan_plan.as_mut() {
+        let borrow_prefix_index = match plan.borrow_prefix_index {
+            Some(idx) => idx,
+            None => {
+                builder.flash_loan_planner().release_route(&plan.route_plan);
+                return Err(Stage2Failure::Plan(anyhow!(
+                    "missing flash-loan borrow prefix index"
+                )));
+            }
+        };
+        let compute_budget_ixs = compute_budget_instruction_count(&swap_instructions);
+        let borrow_instruction_index = match compute_budget_ixs.checked_add(borrow_prefix_index) {
+            Some(idx) => idx,
+            None => {
+                builder.flash_loan_planner().release_route(&plan.route_plan);
+                return Err(Stage2Failure::Plan(anyhow!(
+                    "flash-loan borrow instruction index overflow"
+                )));
+            }
+        };
+        if borrow_instruction_index > u8::MAX as usize {
+            builder.flash_loan_planner().release_route(&plan.route_plan);
+            return Err(Stage2Failure::Plan(anyhow!(
+                "flash-loan borrow instruction index exceeded u8"
+            )));
+        }
+        let repay_instruction = plan.route_plan.repay_instruction(
+            plan.repay_source_liquidity,
+            plan.repay_authority,
+            borrow_instruction_index as u8,
+        );
+        suffix_instructions.push(repay_instruction);
     }
 
     builder.mev_guard().record_protected_bundle();
@@ -279,6 +328,9 @@ fn build_multi_leg_bundle(
         .iter()
         .map(bundle_instruction_plan_from)
         .collect::<Vec<_>>();
+    let flash_summary = flash_loan_plan
+        .as_ref()
+        .map(|plan| flash_loan_summary_from(&plan.route_plan));
 
     match builder.prepare_bundle(
         bundle.seq,
@@ -288,17 +340,18 @@ fn build_multi_leg_bundle(
     ) {
         Ok(context) => {
             bundle.bundle_context = Some(context);
+            bundle.flash_loan = flash_summary;
         }
         Err(err) => {
-            if let Some(plan) = flash_loan_plan {
-                builder.flash_loan_planner().release_route(&plan);
+            if let Some(plan) = flash_loan_plan.as_ref() {
+                builder.flash_loan_planner().release_route(&plan.route_plan);
             }
             return Err(Stage2Failure::Prepare(err));
         }
     }
 
     if let Some(plan) = flash_loan_plan {
-        builder.flash_loan_planner().release_route(&plan);
+        builder.flash_loan_planner().release_route(&plan.route_plan);
     }
 
     let detection_latency_ms = duration_ms(bundle.created_at.elapsed());
@@ -345,11 +398,38 @@ impl PlannedRouteInstructions {
 struct FlashLoanInstructionPlan {
     route_plan: FlashLoanRoutePlan,
     borrow_instruction: Instruction,
-    repay_instruction: Instruction,
+    tip_funding: Option<TipFundingPlan>,
+    repay_source_liquidity: Pubkey,
+    repay_authority: Pubkey,
+    borrow_prefix_index: Option<usize>,
+}
+
+fn flash_loan_summary_from(plan: &FlashLoanRoutePlan) -> FlashLoanSummary {
+    FlashLoanSummary {
+        plan_id: plan.id,
+        token: plan.token.clone(),
+        liquidity_mint: plan.accounts.reserve_liquidity_mint.to_string(),
+        borrow_amount: plan.borrow_amount,
+        repay_amount: plan.repay_amount,
+        fee_amount: plan.fee_amount,
+        program_id: plan.accounts.program_id.to_string(),
+        lending_market: plan.accounts.lending_market.to_string(),
+        reserve: plan.accounts.reserve.to_string(),
+    }
+}
+
+struct TipFundingPlan {
+    create_account: Instruction,
+    init_account: Instruction,
+    siphon_instruction: Instruction,
+    close_account: Instruction,
 }
 
 const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvR93dthLvYbAphit9L8ZsfsZp7r4HQJDebg");
 const SPL_TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const WSOL_MINT_PUBKEY: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
+const TIP_BUFFER_SEED_PREFIX: &str = "tipbuf";
+const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
 
 fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
@@ -370,7 +450,12 @@ impl<'a> InstructionPlanner<'a> {
         Self { builder, payer }
     }
 
-    fn plan(&self, route: &RoutePlan) -> anyhow::Result<PlannedRouteInstructions> {
+    fn plan(
+        &self,
+        route: &RoutePlan,
+        bundle_seq: u64,
+        tip_lamports: Option<u64>,
+    ) -> anyhow::Result<PlannedRouteInstructions> {
         let mut instructions = Vec::with_capacity(route.legs.len());
         for leg in &route.legs {
             instructions.push(PlannedInstruction {
@@ -395,14 +480,31 @@ impl<'a> InstructionPlanner<'a> {
 
         let mut planned = PlannedRouteInstructions::with_swaps(instructions);
         if let Some(first_swap) = planned.swap_instructions.first() {
-            if let Some(flash_plan) = self.plan_flash_loan(route, first_swap)? {
+            if let Some(mut flash_plan) =
+                self.plan_flash_loan(route, first_swap, bundle_seq, tip_lamports)?
+            {
+                if let Some(tip_plan) = flash_plan.tip_funding.as_ref() {
+                    planned
+                        .prefix_instructions
+                        .push(tip_plan.create_account.clone());
+                    planned
+                        .prefix_instructions
+                        .push(tip_plan.init_account.clone());
+                }
+                let borrow_index = planned.prefix_instructions.len();
                 planned
                     .prefix_instructions
-                    .push(flash_plan.borrow_instruction);
-                planned
-                    .suffix_instructions
-                    .push(flash_plan.repay_instruction);
-                planned.flash_loan_plan = Some(flash_plan.route_plan);
+                    .push(flash_plan.borrow_instruction.clone());
+                flash_plan.borrow_prefix_index = Some(borrow_index);
+                if let Some(tip_plan) = flash_plan.tip_funding.as_ref() {
+                    planned
+                        .prefix_instructions
+                        .push(tip_plan.siphon_instruction.clone());
+                    planned
+                        .prefix_instructions
+                        .push(tip_plan.close_account.clone());
+                }
+                planned.flash_loan_plan = Some(flash_plan);
             }
         }
 
@@ -444,7 +546,9 @@ impl<'a> InstructionPlanner<'a> {
         &self,
         route: &RoutePlan,
         first_swap: &PlannedInstruction,
-    ) -> anyhow::Result<Option<FlashLoanInstructionPlan>> {
+        bundle_seq: u64,
+        tip_lamports: Option<u64>,
+    ) -> Result<Option<FlashLoanInstructionPlan>> {
         let builder = match self.builder {
             Some(handle) => handle,
             None => return Ok(None),
@@ -462,7 +566,7 @@ impl<'a> InstructionPlanner<'a> {
             return Ok(None);
         }
 
-        let borrow_amount = first_swap.amount;
+        let mut borrow_amount = first_swap.amount;
         if borrow_amount == 0 {
             return Ok(None);
         }
@@ -470,6 +574,12 @@ impl<'a> InstructionPlanner<'a> {
         let flash_planner = builder.flash_loan_planner();
         if !flash_planner.supports_mint(&start_mint) {
             return Ok(None);
+        }
+
+        let tip_lamports = tip_lamports.unwrap_or(0);
+        let enable_tip_funding = start_mint == WSOL_MINT_PUBKEY && tip_lamports > 0;
+        if enable_tip_funding {
+            borrow_amount = borrow_amount.saturating_add(tip_lamports);
         }
 
         let receiver_program = Pubkey::from_str(&first_swap.program_id).with_context(|| {
@@ -486,20 +596,27 @@ impl<'a> InstructionPlanner<'a> {
             route.start_mint,
             first_swap.program_id,
         );
-        let first_plan = bundle_instruction_plan_from(first_swap);
-        let receiver_accounts = builder
-            .instruction_accounts_for_plan(&first_plan)
-            .context("failed to resolve receiver accounts for flash-loan borrow")?;
-        let borrow_instruction =
-            route_plan.borrow_instruction(destination, receiver_program, &receiver_accounts);
-        let repay_instruction = route_plan
-            .repay_instruction(destination, payer)
-            .context("failed to build flash-loan repay instruction")?;
+        let borrow_instruction = route_plan.borrow_instruction(destination);
+
+        let tip_funding = if enable_tip_funding {
+            Some(build_tip_funding_plan(
+                payer,
+                start_mint,
+                destination,
+                tip_lamports,
+                bundle_seq,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Some(FlashLoanInstructionPlan {
             route_plan,
             borrow_instruction,
-            repay_instruction,
+            tip_funding,
+            repay_source_liquidity: destination,
+            repay_authority: payer,
+            borrow_prefix_index: None,
         }))
     }
 
@@ -526,6 +643,134 @@ impl<'a> InstructionPlanner<'a> {
     }
 }
 
+fn build_tip_funding_plan(
+    payer: Pubkey,
+    mint: Pubkey,
+    source_ata: Pubkey,
+    amount: u64,
+    bundle_seq: u64,
+) -> Result<TipFundingPlan> {
+    ensure!(amount > 0, "tip funding plan requires non-zero amount");
+    let seed = format!("{TIP_BUFFER_SEED_PREFIX}{bundle_seq:016x}");
+    let tip_account = Pubkey::create_with_seed(&payer, &seed, &SPL_TOKEN_PROGRAM_ID)
+        .context("failed to derive tip buffer address")?;
+    let rent = Rent::default().minimum_balance(SPL_TOKEN_ACCOUNT_LEN);
+    let create_account = create_account_with_seed_instruction(
+        &payer,
+        &tip_account,
+        &seed,
+        rent,
+        SPL_TOKEN_ACCOUNT_LEN as u64,
+        &SPL_TOKEN_PROGRAM_ID,
+    );
+    let init_account = build_initialize_token_account_instruction(
+        &SPL_TOKEN_PROGRAM_ID,
+        &tip_account,
+        &mint,
+        &payer,
+    );
+    let siphon_instruction = build_token_transfer_instruction(
+        &SPL_TOKEN_PROGRAM_ID,
+        &source_ata,
+        &tip_account,
+        &payer,
+        amount,
+    );
+    let close_account =
+        build_close_token_account_instruction(&SPL_TOKEN_PROGRAM_ID, &tip_account, &payer, &payer);
+
+    Ok(TipFundingPlan {
+        create_account,
+        init_account,
+        siphon_instruction,
+        close_account,
+    })
+}
+
+fn create_account_with_seed_instruction(
+    payer: &Pubkey,
+    new_account: &Pubkey,
+    seed: &str,
+    lamports: u64,
+    space: u64,
+    owner: &Pubkey,
+) -> Instruction {
+    let data = serialize(
+        &system_instruction::SystemInstruction::CreateAccountWithSeed {
+            base: *payer,
+            seed: seed.to_string(),
+            lamports,
+            space,
+            owner: *owner,
+        },
+    )
+    .expect("serialize create-account-with-seed instruction");
+    Instruction {
+        program_id: system_program::ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(*new_account, false),
+            AccountMeta::new_readonly(*payer, true),
+        ],
+        data,
+    }
+}
+
+fn build_initialize_token_account_instruction(
+    token_program: &Pubkey,
+    account: &Pubkey,
+    mint: &Pubkey,
+    owner: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: *token_program,
+        accounts: vec![
+            AccountMeta::new(*account, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+        ],
+        data: vec![1],
+    }
+}
+
+fn build_token_transfer_instruction(
+    token_program: &Pubkey,
+    source: &Pubkey,
+    destination: &Pubkey,
+    authority: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    let mut data = Vec::with_capacity(1 + std::mem::size_of::<u64>());
+    data.push(3);
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: *token_program,
+        accounts: vec![
+            AccountMeta::new(*source, false),
+            AccountMeta::new(*destination, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data,
+    }
+}
+
+fn build_close_token_account_instruction(
+    token_program: &Pubkey,
+    account: &Pubkey,
+    destination: &Pubkey,
+    authority: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: *token_program,
+        accounts: vec![
+            AccountMeta::new(*account, false),
+            AccountMeta::new(*destination, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data: vec![9],
+    }
+}
 fn log_alt_manager_status(builder: &BuilderHandle) {
     let stats = builder.alt_manager().stats();
     info!(
@@ -546,11 +791,95 @@ fn duration_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder::templates::SwapTemplateDirection;
+    use crate::builder::{InstructionTemplate, TemplateCacheKey, TemplatePatch};
+    use crate::config::AppConfig;
     use crate::core::SlabPool;
     use crate::stages::types::{BundleCandidate, Opportunity, TradeUpdate};
     use crate::stages::types::{PoolQuoteDirection, RouteLegPlan, RoutePlan};
     use crate::template::TemplateContext;
     use anyhow::anyhow;
+    use serde_json::json;
+    use solana_sdk::signature::{write_keypair_file, Keypair};
+    use std::sync::Arc;
+    use tempfile::{tempdir, TempDir};
+
+    struct BuilderTestFixture {
+        builder: BuilderHandle,
+        _temp_dir: TempDir,
+    }
+
+    impl BuilderTestFixture {
+        fn with_flash_loan_receiver(receiver_program: Pubkey) -> Self {
+            let temp_dir = tempdir().expect("tempdir");
+            let payer = Keypair::new();
+            let payer_path = temp_dir.path().join("payer.json");
+            write_keypair_file(&payer, &payer_path).expect("write payer");
+            let auth = Keypair::new();
+            let auth_path = temp_dir.path().join("auth.json");
+            write_keypair_file(&auth, &auth_path).expect("write auth");
+
+            let quote_mint = Pubkey::new_unique();
+            let config_path = temp_dir.path().join("config.json");
+            let config_json = json!({
+                "wallets": {
+                    "auth": {"path": auth_path.to_str().unwrap()},
+                    "payer": {"path": payer_path.to_str().unwrap()}
+                },
+                "jito": {
+                    "endpoints": ["https://example-rpc-1.sol", "https://example-rpc-2.sol"],
+                    "tip_floor_url": "https://example/tipfloor",
+                    "tip_stream_url": "wss://example/stream"
+                },
+                "corecast": {
+                    "address": "example",
+                    "authorization": "token",
+                    "cache": {"warm_capacity": 1, "channel_capacity": 1}
+                },
+                "tokens": {},
+                "token_pairs": [[WSOL_MINT_PUBKEY.to_string(), quote_mint.to_string()]],
+                "program_addresses": [],
+                "flash_loans": {
+                    "SOL": {
+                        "program_id": "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
+                        "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
+                        "reserve": "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36",
+                        "reserve_liquidity_mint": WSOL_MINT_PUBKEY.to_string(),
+                        "borrow": {
+                            "reserve_liquidity_supply": "8UviNr47S8eL6J3WfDxMRa3hvLta1VDJwNWqsDgtN3Cv"
+                        },
+                        "repay": {
+                            "reserve_liquidity_supply": "8UviNr47S8eL6J3WfDxMRa3hvLta1VDJwNWqsDgtN3Cv",
+                            "reserve_liquidity_fee_receiver": "5wo1tFpi4HaVKnemqaXeQnBEpezrJXcXvuztYaPhvgC7",
+                            "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+                        },
+                        "receiver_program_allowlist": [receiver_program.to_string()]
+                    }
+                },
+                "quicknode_rpcs": ["https://example-rpc.sol"],
+                "protocols": {},
+                "perf": {
+                    "ingest_core": 0,
+                    "eval_core": 1,
+                    "submit_core": 2,
+                    "ring_capacity": 8,
+                    "opportunity_slab": 8,
+                    "bundle_slab": 8
+                }
+            });
+            std::fs::write(&config_path, serde_json::to_vec(&config_json).unwrap()).unwrap();
+            let config = AppConfig::load(&config_path).expect("config");
+            let builder = BuilderHandle::new(Arc::new(config)).expect("builder");
+            Self {
+                builder,
+                _temp_dir: temp_dir,
+            }
+        }
+
+        fn builder(&self) -> BuilderHandle {
+            self.builder.clone()
+        }
+    }
 
     #[test]
     fn planner_builds_instructions_for_route() {
@@ -601,7 +930,7 @@ mod tests {
         };
 
         let planner = InstructionPlanner::new(None);
-        let planned = planner.plan(&route).expect("instructions");
+        let planned = planner.plan(&route, 0, None).expect("instructions");
         assert_eq!(planned.swap_instructions.len(), 2);
         assert_eq!(planned.swap_instructions[0].amount, 100);
         assert_eq!(planned.swap_instructions[1].amount, 200);
@@ -613,6 +942,111 @@ mod tests {
         assert!(planned.prefix_instructions.is_empty());
         assert!(planned.suffix_instructions.is_empty());
         assert!(planned.flash_loan_plan.is_none());
+    }
+
+    #[test]
+    fn planner_includes_tip_funding_in_flash_loan_route() {
+        let pool_id = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let fixture = BuilderTestFixture::with_flash_loan_receiver(program_id);
+        let builder = fixture.builder();
+
+        let template = InstructionTemplate {
+            key: TemplateCacheKey::new(pool_id, SwapTemplateDirection::BaseIn, 30),
+            program_id,
+            discriminator: [0; 8],
+            accounts: Arc::from(Vec::<AccountMeta>::new()),
+            data: Arc::new(Vec::new()),
+            patches: Arc::from(Vec::<TemplatePatch>::new()),
+            cu_budget: 0,
+            tlv_bytes: 0,
+            template_hash: [0; 32],
+            alt_handle: None,
+        };
+        builder.template_cache().insert(template);
+
+        let planner = InstructionPlanner::new(Some(&builder));
+        let leg = RouteLegPlan {
+            pool_id: pool_id.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: WSOL_MINT_PUBKEY.to_string(),
+            output_mint: WSOL_MINT_PUBKEY.to_string(),
+            input_amount: 1_000_000,
+            estimated_output_amount: 999_000,
+            effective_price: 1.0,
+            fee_bps: 30,
+            estimated_slippage_bps: 0.0,
+            direction: PoolQuoteDirection::BaseToQuote,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            context: TemplateContext::default(),
+            template_ready: true,
+            alt_ready: true,
+        };
+        let route = RoutePlan {
+            start_mint: WSOL_MINT_PUBKEY.to_string(),
+            end_mint: WSOL_MINT_PUBKEY.to_string(),
+            legs: vec![leg],
+            estimated_final_output_amount: Some(999_000),
+        };
+
+        let tip_lamports = 250_000;
+        let planned = planner
+            .plan(&route, 42, Some(tip_lamports))
+            .expect("planned route");
+
+        assert_eq!(planned.prefix_instructions.len(), 5);
+        assert!(planned.suffix_instructions.is_empty());
+        let flash_plan = planned.flash_loan_plan.expect("flash plan");
+        assert_eq!(
+            flash_plan.route_plan.borrow_amount,
+            1_000_000 + tip_lamports
+        );
+        assert_eq!(
+            planned.prefix_instructions[0].program_id,
+            system_program::ID
+        );
+        assert_eq!(
+            planned.prefix_instructions[3].program_id,
+            SPL_TOKEN_PROGRAM_ID
+        );
+        assert_eq!(
+            planned.prefix_instructions[4].program_id,
+            SPL_TOKEN_PROGRAM_ID
+        );
+    }
+
+    #[test]
+    fn flash_loan_summary_from_copies_route_details() {
+        let program_id = Pubkey::new_unique();
+        let fixture = BuilderTestFixture::with_flash_loan_receiver(program_id);
+        let builder = fixture.builder();
+        let planner = builder.flash_loan_planner();
+        let route_plan = planner
+            .plan_route_by_mint(&WSOL_MINT_PUBKEY, 2_000_000)
+            .expect("route plan");
+
+        let summary = flash_loan_summary_from(&route_plan);
+        assert_eq!(summary.plan_id, route_plan.id);
+        assert_eq!(summary.token, route_plan.token);
+        assert_eq!(summary.borrow_amount, route_plan.borrow_amount);
+        assert_eq!(summary.repay_amount, route_plan.repay_amount);
+        assert_eq!(summary.fee_amount, route_plan.fee_amount);
+        assert_eq!(
+            summary.program_id,
+            route_plan.accounts.program_id.to_string()
+        );
+        assert_eq!(
+            summary.lending_market,
+            route_plan.accounts.lending_market.to_string()
+        );
+        assert_eq!(summary.reserve, route_plan.accounts.reserve.to_string());
+        assert_eq!(
+            summary.liquidity_mint,
+            route_plan.accounts.reserve_liquidity_mint.to_string()
+        );
     }
 
     #[test]

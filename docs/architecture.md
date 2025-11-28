@@ -19,7 +19,7 @@
 
 ## Module Overview
 
-- `config` – JSON loader with tilde expansion, validation hooks, and perf tuning knobs (ring/slab sizes, CPU pinning).
+- `config` – JSON loader with tilde expansion, `$ENV{VAR}` placeholder hydration, optional environment overrides (see `config.template.json`), validation hooks, and perf tuning knobs (ring/slab sizes, CPU pinning).
 - `idl` – Reads all pool IDLs once so codegen can emit const instruction bytes consumed by the runtime.
 - `core` – Lock-free primitives (`core::ring`, `core::slab`) shared by every stage.
 - `codegen` – Build-time generated `pools_static.rs` that exposes `PoolTemplate` slices without runtime JSON parsing.
@@ -64,7 +64,7 @@
 
 - **Protos:** `build.rs` compiles Bitquery + Jito protos via `tonic-build`; ensure `protoc` is installed in both dev and CI environments.
 - **Cross-Compile:** Add `x86_64-unknown-linux-gnu` target (already done) and build with `cargo build --release --target x86_64-unknown-linux-gnu`. Optionally use `cargo zigbuild` for hermetic linking.
-- **Docker:** Planned multi-stage build (`rust:1.77-slim` builder + distroless runner) that copies the release binary plus configs/IDLs.
+- **Docker:** Multi-stage build (`rust:1.77-slim` builder + distroless runner/Ubuntu base) that copies the release binary plus configs/IDLs. CI builds re-use the same container definition so prod deployment stays reproducible.
 - **Perf Tooling:** Use `perf`, `flamegraph`, and network RTT probes on Ubuntu; instrument only via counters exported to an external collector (sidecar or host metrics).
 
 ## Future Work

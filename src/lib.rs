@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod builder;
 pub mod bundle;
+pub mod cluster;
 pub mod config;
 pub mod core;
 pub mod corecast;
@@ -11,4 +12,5 @@ pub mod stages;
 pub mod strategy;
 pub mod telemetry;
 pub mod template;
+pub mod tip_pressure;
 pub mod token_pair;

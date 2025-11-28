@@ -38,6 +38,12 @@ impl TxGraph {
     }
 }
 
+impl Default for TxGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -9,6 +9,7 @@ pub struct TemplateContext {
     pub compute_unit_limit: Option<u32>,
     pub host_fee_account: Option<Pubkey>,
     pub remaining_accounts: Vec<AccountMeta>,
+    pub slippage_tolerance_bps: Option<u16>,
     pub template_ready: bool,
     pub alt_ready: bool,
 }

@@ -27,6 +27,19 @@ cargo build
 
 # Build for production target (M1 -> Linux)
 cargo build --release --target x86_64-unknown-linux-gnu
+
+# Run locally with debug logging + Prometheus metrics
+./scripts/run-bot.sh
+
+# Use Docker (requires config volume mounted at /config)
+docker build -t tre-arb-bot .
+docker run --rm \
+  -e ARBITRAGE_CONFIG=/config/config.json \
+  -e PROMETHEUS_METRICS_ADDR=0.0.0.0:9898 \
+  -v $(pwd)/config.json:/config/config.json:ro \
+  -v $(pwd)/alt_registry.json:/data/alt_registry.json \
+  -p 9898:9898 \
+  tre-arb-bot
 ```
 
 Environment variables:
@@ -34,10 +47,27 @@ Environment variables:
 - `ARBITRAGE_CONFIG`: optional path override for `config.json` (defaults to repo root).
 - `RUST_LOG`: set to control tracing verbosity (defaults to `warn,tre-arb-bot=info`).
 - `TRE_ALT_REGISTRY`: optional path override for the persisted ALT registry snapshot. Defaults to `alt_registry.json` in the working directory and allows restarts to reuse existing lookup tables without rebuilding them.
-- `jito.endpoints`: configure at least two regionally distinct block engine URLs so bundle submission failover and cooldown logic stays effective.
+- `TRE_CORECAST_ADDRESS` / `TRE_CORECAST_AUTHORIZATION`: override `corecast.address` or `corecast.authorization` without editing JSON. Place `$ENV{TRE_CORECAST_AUTHORIZATION}` inside `config.json` or `config.template.json` to reference the variable directly.
+- `TRE_JITO_ENDPOINTS`: comma/line separated list that overrides `jito.endpoints`. Individual URLs can also be specified via `$ENV{...}` tokens.
+- `TRE_JITO_API_TOKEN`, `TRE_JITO_TIP_FLOOR_URL`, `TRE_JITO_TIP_STREAM_URL`, `TRE_JITO_CA_PEM`: override sensitive Jito parameters without storing them on disk.
+- `TRE_BAM_VALIDATOR_CSV`: override the BAM validator CSV path.
+- `TRE_QUICKNODE_RPCS`: override the Quicknode RPC list.
 - `alerts.webhook_url`: optional HTTPS endpoint that receives JSON bundle/arbitrage lifecycle events; pair with `alerts.environment` to tag messages by deployment.
 
-Submission tracking knobs live under the `submission` section of `config.json` and allow you to tune the pending TTL, sweep cadence, and reconnect backoffs for the Jito result stream and optional auction websocket (`jito.auction_stream_url`). Leave the auction URL empty if your deployment does not expose the feed; the runtime will continue to stream gRPC bundle results regardless.
+Submission tracking knobs live under the `submission` section of `config.json` (or `config.template.json`). You can safely check in the template that only contains `$ENV{VAR}` placeholders for secrets while keeping the real `config.json` ignored (see `.gitignore`). Use the template as the canonical reference in docs and CI.
+
+### Docker & CI
+
+- The repository ships a multi-stage `Dockerfile` that builds the release binary on Debian Bullseye and runs it inside a slim Debian runtime. Mount `/config` (for `config.json`) and `/data` (for persisted ALT state) when running the container. Default environment variables inside the image set `ARBITRAGE_CONFIG=/config/config.json`, `TRE_ALT_REGISTRY=/data/alt_registry.json`, `PROMETHEUS_METRICS_ADDR=0.0.0.0:9898`, and `RUST_LOG=warn,tre-arb-bot=info`.
+- GitHub Actions workflow (`.github/workflows/ci.yml`) enforces `cargo fmt`, `cargo clippy -D warnings`, `cargo test --locked`, and a Docker build on every push/pull request targeting `main`/`master`. Use the same workflow locally to reproduce CI by running the listed commands and `docker build`.
+- For Latitude.sh or other Ubuntu hosts, see `docs/deploy_latitude.md` for a step-by-step guide (server prep, env files, Docker run/systemd integration).
+
+### Leader Schedule Gating
+
+- Stage3 now consults a dedicated leader-schedule watcher that polls the configured `quicknode_rpcs` so bundles are only signed when the current slot’s leader is running Jito’s Blockspace Auction Mechanism (BAM).
+- Populate `bam_validators.csv` with the canonical identity/vote accounts for every BAM-enabled validator (a starter list lives in the repo root). Use the top-level `bam_validator_csv` entry in `config.json` to point at refreshed snapshots when you regenerate the allowlist.
+- When the watcher reports a non-BAM leader or the snapshot falls stale, Stage3 simply spins without dequeuing new bundles; logs make it obvious why submissions paused.
+- Refresh the CSV whenever Jito publishes new validators or you want to prioritize a different subset. A runtime restart is required so the new allowlist can be loaded at startup.
 
 ### Alerting
 

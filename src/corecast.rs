@@ -56,7 +56,7 @@ impl CoreCastClient {
     pub fn new(config: Arc<AppConfig>) -> Result<Self> {
         let endpoint = normalize_endpoint(&config.corecast.address)?;
         let domain = endpoint_host(&endpoint)?;
-        let mut http_builder = HttpClientBuilder::new().use_rustls_tls();
+        let http_builder = HttpClientBuilder::new().use_rustls_tls();
         let http_client = http_builder
             .build()
             .with_context(|| "failed to build CoreCast HTTP client")?;

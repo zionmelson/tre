@@ -9,6 +9,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
 
+use super::hydration::AsyncHydrator;
 use crate::builder::{BuilderHandle, CpAmmPoolMeta};
 use crate::stages::types::{
     CpAmmPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
@@ -25,12 +26,15 @@ const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 
+const DEFAULT_CP_AMM_HYDRATION_RETRY_MS: u64 = 60_000;
+
 #[derive(Debug, Clone)]
 pub struct CpAmmAdapterConfig {
     pub stale_slot_threshold: u64,
     pub stale_after_ms: u64,
     pub rpc_endpoints: Vec<String>,
     pub rpc_timeout_ms: u64,
+    pub hydration_retry_ms: u64,
 }
 
 impl Default for CpAmmAdapterConfig {
@@ -41,6 +45,7 @@ impl Default for CpAmmAdapterConfig {
             rpc_endpoints: Vec::new(),
             // initial hydration hits several large accounts; allow generous timeout
             rpc_timeout_ms: 15_000,
+            hydration_retry_ms: DEFAULT_CP_AMM_HYDRATION_RETRY_MS,
         }
     }
 }
@@ -301,12 +306,11 @@ impl CpAmmAdapter {
             min_output_amount: Some(expected_output),
             limit_price: None,
             price_impact_limit_bps: None,
-            context: {
-                let mut ctx = TemplateContext::default();
-                ctx.compute_unit_limit = Some(CP_AMM_DEFAULT_CU_LIMIT);
-                ctx.requires_memo = state.referral_token_account.is_some();
-                ctx.host_fee_account = state.referral_token_account;
-                ctx
+            context: TemplateContext {
+                compute_unit_limit: Some(CP_AMM_DEFAULT_CU_LIMIT),
+                requires_memo: state.referral_token_account.is_some(),
+                host_fee_account: state.referral_token_account,
+                ..Default::default()
             },
         })
     }
@@ -446,7 +450,7 @@ fn snapshot_probe_amount(reserve: u128) -> Option<u64> {
     }
 
     probe = probe.min(reserve);
-    probe = probe.max(1u128).min(SNAPSHOT_MAX_PROBE_INPUT);
+    probe = probe.clamp(1u128, SNAPSHOT_MAX_PROBE_INPUT);
     Some(probe as u64)
 }
 
@@ -466,8 +470,8 @@ struct HydratedPoolMeta {
 }
 
 struct CpAmmPoolHydrator {
-    clients: Vec<Arc<RpcClient>>,
-    cache: DashMap<Pubkey, HydratedPoolMeta>,
+    hydrator: AsyncHydrator<Pubkey, HydratedPoolMeta>,
+    endpoint_count: usize,
 }
 
 impl CpAmmPoolHydrator {
@@ -477,61 +481,64 @@ impl CpAmmPoolHydrator {
         }
 
         let timeout = Duration::from_millis(config.rpc_timeout_ms.max(100));
-        let clients: Vec<Arc<RpcClient>> = config
+        let client_list: Vec<Arc<RpcClient>> = config
             .rpc_endpoints
             .iter()
             .map(|url| Arc::new(RpcClient::new_with_timeout(url.clone(), timeout)))
             .collect();
 
-        if clients.is_empty() {
+        if client_list.is_empty() {
             return None;
         }
 
+        let endpoint_count = client_list.len();
+        let clients = Arc::new(client_list);
+        let fetch_clients = clients.clone();
+        let hydrator = AsyncHydrator::new("cp_amm_pool", endpoint_count, move |pool| {
+            fetch_cp_amm_meta(fetch_clients.as_ref(), pool)
+        });
+
         Some(Self {
-            clients,
-            cache: DashMap::new(),
+            hydrator,
+            endpoint_count,
         })
     }
 
     fn client_count(&self) -> usize {
-        self.clients.len()
+        self.endpoint_count
     }
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        if let Some(entry) = self.cache.get(&pool) {
-            return Some(entry.clone());
-        }
-        self.fetch_from_rpc(pool)
+        self.hydrator.get_or_schedule(pool)
     }
+}
 
-    fn fetch_from_rpc(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        for client in &self.clients {
-            match client.get_account(&pool) {
-                Ok(account) => {
-                    if let Some(meta) = parse_pool_account(&account.data) {
-                        self.cache.insert(pool, meta.clone());
-                        return Some(meta);
-                    } else {
-                        warn!(
-                            target = "adapter::cp_amm",
-                            pool = %pool,
-                            "unexpected cp_amm pool account layout"
-                        );
-                    }
-                }
-                Err(error) => {
+fn fetch_cp_amm_meta(clients: &[Arc<RpcClient>], pool: Pubkey) -> Option<HydratedPoolMeta> {
+    for client in clients {
+        match client.get_account(&pool) {
+            Ok(account) => {
+                if let Some(meta) = parse_pool_account(&account.data) {
+                    return Some(meta);
+                } else {
                     warn!(
                         target = "adapter::cp_amm",
                         pool = %pool,
-                        %error,
-                        "failed to fetch cp_amm pool account"
+                        "unexpected cp_amm pool account layout"
                     );
                 }
             }
+            Err(error) => {
+                warn!(
+                    target = "adapter::cp_amm",
+                    pool = %pool,
+                    %error,
+                    "failed to fetch cp_amm pool account"
+                );
+            }
         }
-
-        None
     }
+
+    None
 }
 
 const POOL_FEES_STRUCT_LEN: usize = 160;

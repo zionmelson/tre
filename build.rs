@@ -1,4 +1,9 @@
-use std::{env, fmt::Write, fs, path::PathBuf};
+use std::{
+    env,
+    fmt::Write,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use heck::ToSnakeCase;
 use serde::Deserialize;
@@ -50,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from("jito"),
     ];
 
-    cfg.compile(&[BITQUERY_PROTOS, JITO_PROTOS].concat(), &includes)?;
+    cfg.compile_protos(&[BITQUERY_PROTOS, JITO_PROTOS].concat(), &includes)?;
 
     emit_pool_templates(&out_dir)?;
     emit_swap_templates(&out_dir)?;
@@ -58,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn emit_pool_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn emit_pool_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut entries = fs::read_dir(IDL_POOL_DIR)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
@@ -103,7 +108,7 @@ fn emit_pool_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn emit_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn emit_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     emit_amm_v3_swap_templates(out_dir)?;
     emit_cp_amm_swap_templates(out_dir)?;
     emit_lb_clmm_swap_templates(out_dir)?;
@@ -112,7 +117,7 @@ fn emit_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn emit_amm_v3_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn emit_amm_v3_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let idl = load_idl("amm_v3")?;
     let program_id = idl
         .address
@@ -178,7 +183,7 @@ fn render_amm_v3_template(
     Ok(snippet)
 }
 
-fn emit_cp_amm_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn emit_cp_amm_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let idl = load_idl("cp_amm")?;
     let program_id = idl
         .address
@@ -251,7 +256,7 @@ fn render_cp_amm_template(
     Ok(snippet)
 }
 
-fn emit_lb_clmm_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn emit_lb_clmm_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let idl = load_idl("lb_clmm")?;
     let program_id = idl
         .address
@@ -286,7 +291,7 @@ fn emit_lb_clmm_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn emit_lifinity_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn emit_lifinity_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let idl = load_idl("lifinity_amm_v2")?;
     let program_id = idl
         .address
@@ -312,7 +317,7 @@ fn emit_lifinity_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-fn emit_whirlpool_swap_templates(out_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn emit_whirlpool_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let idl = load_idl("whirlpool")?;
     let program_id = idl
         .address

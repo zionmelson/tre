@@ -11,6 +11,8 @@ use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
+use super::hydration::AsyncHydrator;
+
 use crate::builder::{BuilderHandle, WhirlpoolPoolMeta};
 use crate::stages::types::{
     PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, WhirlpoolPoolExtras,
@@ -28,9 +30,17 @@ const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const WHIRLPOOL_DEFAULT_CU_LIMIT: u32 = 380_000;
 
-construct_uint! {
-    pub struct U256(4);
+#[allow(clippy::assign_op_pattern, clippy::manual_div_ceil)]
+mod u256 {
+    use super::construct_uint;
+
+    construct_uint! {
+        pub struct U256(4);
+    }
 }
+pub use u256::U256;
+
+const DEFAULT_WHIRLPOOL_HYDRATION_RETRY_MS: u64 = 60_000;
 
 #[derive(Debug, Clone)]
 pub struct WhirlpoolAdapterConfig {
@@ -38,6 +48,7 @@ pub struct WhirlpoolAdapterConfig {
     pub stale_after_ms: u64,
     pub rpc_endpoints: Vec<String>,
     pub rpc_timeout_ms: u64,
+    pub hydration_retry_ms: u64,
 }
 
 impl Default for WhirlpoolAdapterConfig {
@@ -47,6 +58,7 @@ impl Default for WhirlpoolAdapterConfig {
             stale_after_ms: 2_000,
             rpc_endpoints: Vec::new(),
             rpc_timeout_ms: 15_000,
+            hydration_retry_ms: DEFAULT_WHIRLPOOL_HYDRATION_RETRY_MS,
         }
     }
 }
@@ -272,19 +284,22 @@ impl WhirlpoolAdapter {
     }
 
     fn snapshot_template_context(&self, state: &WhirlpoolState) -> TemplateContext {
-        let mut context = TemplateContext::default();
-        context.compute_unit_limit = Some(WHIRLPOOL_DEFAULT_CU_LIMIT);
+        let mut context = TemplateContext {
+            compute_unit_limit: Some(WHIRLPOOL_DEFAULT_CU_LIMIT),
+            ..Default::default()
+        };
         if let Some(oracle) = state.oracle {
             context
                 .remaining_accounts
                 .push(AccountMeta::new_readonly(oracle, false));
         }
-        for account in [state.tick_array0, state.tick_array1, state.tick_array2] {
-            if let Some(key) = account {
-                context
-                    .remaining_accounts
-                    .push(AccountMeta::new(key, false));
-            }
+        for key in [state.tick_array0, state.tick_array1, state.tick_array2]
+            .into_iter()
+            .flatten()
+        {
+            context
+                .remaining_accounts
+                .push(AccountMeta::new(key, false));
         }
         context
     }
@@ -536,8 +551,8 @@ struct HydratedPoolMeta {
 
 #[derive(Clone, Debug)]
 struct HydratedTickArray {
-    address: Pubkey,
-    pool: Pubkey,
+    _address: Pubkey,
+    _pool: Pubkey,
     start_tick_index: i32,
     ticks: Vec<TickEntry>,
 }
@@ -557,9 +572,10 @@ struct InitializedTick {
 
 struct WhirlpoolPoolHydrator {
     program_id: Pubkey,
-    clients: Vec<Arc<RpcClient>>,
-    cache: DashMap<Pubkey, HydratedPoolMeta>,
+    hydrator: AsyncHydrator<Pubkey, HydratedPoolMeta>,
     tick_array_cache: DashMap<(Pubkey, i32), HydratedTickArray>,
+    clients: Arc<Vec<Arc<RpcClient>>>,
+    endpoint_count: usize,
 }
 
 impl WhirlpoolPoolHydrator {
@@ -569,64 +585,38 @@ impl WhirlpoolPoolHydrator {
         }
 
         let timeout = Duration::from_millis(config.rpc_timeout_ms.max(100));
-        let clients: Vec<Arc<RpcClient>> = config
+        let client_list: Vec<Arc<RpcClient>> = config
             .rpc_endpoints
             .iter()
             .map(|url| Arc::new(RpcClient::new_with_timeout(url.clone(), timeout)))
             .collect();
 
-        if clients.is_empty() {
+        if client_list.is_empty() {
             return None;
         }
 
+        let endpoint_count = client_list.len();
+        let clients = Arc::new(client_list);
+        let fetch_clients = clients.clone();
+        let hydrator = AsyncHydrator::new("whirlpool_pool", endpoint_count, move |pool| {
+            fetch_whirlpool_meta(program_id, fetch_clients.as_ref(), pool)
+        });
+
         Some(Self {
             program_id,
-            clients,
-            cache: DashMap::new(),
+            hydrator,
             tick_array_cache: DashMap::new(),
+            clients,
+            endpoint_count,
         })
     }
 
     fn client_count(&self) -> usize {
-        self.clients.len()
+        self.endpoint_count
     }
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        if let Some(entry) = self.cache.get(&pool) {
-            return Some(entry.clone());
-        }
-        self.fetch_from_rpc(pool)
-    }
-
-    fn fetch_from_rpc(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        for client in &self.clients {
-            match client.get_account(&pool) {
-                Ok(account) => {
-                    if let Some(meta) =
-                        parse_whirlpool_account(pool, &self.program_id, &account.data)
-                    {
-                        self.cache.insert(pool, meta.clone());
-                        return Some(meta);
-                    } else {
-                        warn!(
-                            target = "adapter::whirlpool",
-                            pool = %pool,
-                            "unexpected whirlpool pool account layout"
-                        );
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        target = "adapter::whirlpool",
-                        pool = %pool,
-                        %error,
-                        "failed to fetch whirlpool pool account"
-                    );
-                }
-            }
-        }
-
-        None
+        self.hydrator.get_or_schedule(pool)
     }
 
     fn hydrate_tick_array(&self, pool: Pubkey, start_tick_index: i32) -> Option<HydratedTickArray> {
@@ -697,7 +687,7 @@ impl WhirlpoolPoolHydrator {
         expected_start: Option<i32>,
         address: Pubkey,
     ) -> Option<HydratedTickArray> {
-        for client in &self.clients {
+        for client in self.clients.as_ref() {
             match client.get_account(&address) {
                 Ok(account) => {
                     if let Some(array) = parse_tick_array_account(address, pool, &account.data) {
@@ -737,6 +727,38 @@ impl WhirlpoolPoolHydrator {
         }
         None
     }
+}
+
+fn fetch_whirlpool_meta(
+    program_id: Pubkey,
+    clients: &[Arc<RpcClient>],
+    pool: Pubkey,
+) -> Option<HydratedPoolMeta> {
+    for client in clients {
+        match client.get_account(&pool) {
+            Ok(account) => {
+                if let Some(meta) = parse_whirlpool_account(pool, &program_id, &account.data) {
+                    return Some(meta);
+                } else {
+                    warn!(
+                        target = "adapter::whirlpool",
+                        pool = %pool,
+                        "unexpected whirlpool pool account layout"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    target = "adapter::whirlpool",
+                    pool = %pool,
+                    %error,
+                    "failed to fetch whirlpool pool account"
+                );
+            }
+        }
+    }
+
+    None
 }
 
 struct WhirlpoolTickArrayCursor<'a> {
@@ -963,8 +985,8 @@ fn parse_tick_array_account(
     }
 
     Some(HydratedTickArray {
-        address,
-        pool: whirlpool,
+        _address: address,
+        _pool: whirlpool,
         start_tick_index,
         ticks,
     })
@@ -1069,10 +1091,8 @@ pub struct WhirlpoolState {
 
 impl WhirlpoolState {
     pub fn mid_price(&self) -> Option<f64> {
-        self.sqrt_price_x64.map(|sqrt_price| {
-            let price = (sqrt_price as f64 / (1u128 << 64) as f64).powi(2);
-            price
-        })
+        self.sqrt_price_x64
+            .map(|sqrt_price| (sqrt_price as f64 / (1u128 << 64) as f64).powi(2))
     }
 }
 
@@ -1334,17 +1354,12 @@ fn find_input_for_exact_out(
         high = high.saturating_mul(2);
     }
 
-    let Some((mut best_input, mut best_sim)) = best else {
-        return None;
-    };
+    let (mut best_input, mut best_sim) = best?;
 
     let mut low = 1u64;
     while low < best_input {
         let mid = low + (best_input - low) / 2;
-        let simulation = match simulate_best_exact_in(hydrator, state, req, mid) {
-            Some(value) => value,
-            None => return None,
-        };
+        let simulation = simulate_best_exact_in(hydrator, state, req, mid)?;
         if simulation.amount_out >= target_out {
             best_input = mid;
             best_sim = simulation;
@@ -1416,7 +1431,7 @@ fn snapshot_probe_amount(reserve: u128) -> Option<u64> {
     }
 
     probe = probe.min(reserve);
-    probe = probe.max(1u128).min(SNAPSHOT_MAX_PROBE_INPUT);
+    probe = probe.clamp(1u128, SNAPSHOT_MAX_PROBE_INPUT);
     Some(probe as u64)
 }
 
@@ -1484,7 +1499,7 @@ mod math {
     }
 
     pub fn sqrt_price_at_tick_x96(tick: i32) -> Option<U256> {
-        if tick < MIN_TICK || tick > MAX_TICK {
+        if !(MIN_TICK..=MAX_TICK).contains(&tick) {
             return None;
         }
         let mut ratio = if (tick & 1) != 0 {
@@ -1653,7 +1668,7 @@ mod math {
     }
 
     fn mul_shift_128(value: U256, multiplier: U256) -> U256 {
-        value.checked_mul(multiplier).unwrap_or(U256::zero()) >> 128
+        value.checked_mul(multiplier).unwrap_or_default() >> 128
     }
 
     fn div_round_up(numerator: U256, denominator: U256) -> U256 {
@@ -1906,12 +1921,10 @@ mod tests {
         start_tick_index: i32,
         tick_index: usize,
     ) -> WhirlpoolPoolHydrator {
-        let hydrator = WhirlpoolPoolHydrator {
-            program_id: Pubkey::new_unique(),
-            clients: Vec::new(),
-            cache: DashMap::new(),
-            tick_array_cache: DashMap::new(),
-        };
+        let mut config = WhirlpoolAdapterConfig::default();
+        config.rpc_endpoints = vec!["http://localhost:8899".to_string()];
+        let program_id = Pubkey::new_unique();
+        let hydrator = WhirlpoolPoolHydrator::new(&config, program_id).expect("hydrator fixture");
         let mut ticks = vec![
             TickEntry {
                 initialized: false,
@@ -1928,8 +1941,8 @@ mod tests {
             };
         }
         let array = HydratedTickArray {
-            address: Pubkey::new_unique(),
-            pool,
+            _address: Pubkey::new_unique(),
+            _pool: pool,
             start_tick_index,
             ticks,
         };

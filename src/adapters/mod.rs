@@ -3,6 +3,7 @@ use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use crate::stages::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate};
 
 mod cp_amm;
+mod hydration;
 mod lb_clmm;
 mod lifinity_v2;
 mod raydium_v3;

@@ -26,6 +26,7 @@ use crate::notifier::{BundleSubmissionEvent, BundleSubmissionStatus, Notifier};
 use crate::proto::bundle::{self, bundle_result, BundleResult, DroppedReason};
 use crate::proto::searcher::SubscribeBundleResultsRequest;
 use crate::telemetry::{self, BundleResultStatus};
+use crate::tip_pressure;
 
 use super::{connect_searcher, load_jito_ca, normalize_endpoints};
 
@@ -125,7 +126,17 @@ impl BundleTracker {
                     url,
                     config.submission.clone(),
                 )?);
+            } else {
+                info!(
+                    target = "bundle_tracker",
+                    "auction stream listener disabled: URL empty"
+                );
             }
+        } else {
+            info!(
+                target = "bundle_tracker",
+                "auction stream listener disabled: no URL configured"
+            );
         }
 
         Ok((tracker, handles))
@@ -260,6 +271,10 @@ impl BundleTracker {
         if let Some(metric_status) = telemetry_status(status) {
             telemetry::record_bundle_result(metric_status, detection_latency);
         }
+        tip_pressure::record_bundle_result_expiry(matches!(
+            status,
+            BundleSubmissionStatus::Expired
+        ));
         let event = BundleSubmissionEvent {
             seq: entry.seq,
             status,

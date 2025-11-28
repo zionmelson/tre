@@ -8,21 +8,10 @@
     }
   },
   "jito": {
-    "endpoints": [
-      "https://mainnet.block-engine.jito.wtf",
-      "https://amsterdam.mainnet.block-engine.jito.wtf",
-      "https://dublin.mainnet.block-engine.jito.wtf",
-      "https://frankfurt.mainnet.block-engine.jito.wtf",
-      "https://london.mainnet.block-engine.jito.wtf",
-      "https://ny.mainnet.block-engine.jito.wtf",
-      "https://slc.mainnet.block-engine.jito.wtf",
-      "https://singapore.mainnet.block-engine.jito.wtf",
-      "https://tokyo.mainnet.block-engine.jito.wtf"
-    ],
+    "endpoints": ["https://ny.mainnet.block-engine.jito.wtf"],
     "ca_pem": "certs/jito_block_engine_ca.pem",
     "tip_floor_url": "https://bundles.jito.wtf/api/v1/bundles/tip_floor",
-    "tip_stream_url": "wss://bundles.jito.wtf/api/v1/bundles/tip_stream",
-    "auction_stream_url": "wss://bundles.jito.wtf/api/v1/bundles/auction_stream"
+    "tip_stream_url": "wss://bundles.jito.wtf/api/v1/bundles/tip_stream"
   },
   "alerts": {
     "environment": "local-dev",
@@ -34,6 +23,7 @@
     "result_stream_backoff_ms": 500,
     "auction_stream_backoff_ms": 1500
   },
+  "bam_validator_csv": "bam_validators.csv",
   "tokens": {
     "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
@@ -242,9 +232,14 @@
       "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
       "reserve": "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36",
       "reserve_liquidity_mint": "So11111111111111111111111111111111111111112",
-      "reserve_liquidity_supply": "8UviNr47S8eL6J3WfDxMRa3hvLta1VDJwNWqsDgtN3Cv",
-      "reserve_liquidity_fee_receiver": "5wo1tFpi4HaVKnemqaXeQnBEpezrJXcXvuztYaPhvgC7",
-      "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu",
+      "borrow": {
+        "reserve_liquidity_supply": "8UviNr47S8eL6J3WfDxMRa3hvLta1VDJwNWqsDgtN3Cv"
+      },
+      "repay": {
+        "reserve_liquidity_supply": "8UviNr47S8eL6J3WfDxMRa3hvLta1VDJwNWqsDgtN3Cv",
+        "reserve_liquidity_fee_receiver": "5wo1tFpi4HaVKnemqaXeQnBEpezrJXcXvuztYaPhvgC7",
+        "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+      },
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
@@ -258,9 +253,14 @@
       "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
       "reserve": "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw",
       "reserve_liquidity_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "reserve_liquidity_supply": "8SheGtsopRUDzdiD6v6BR9a6bqZ9QwywYQY99Fp5meNf",
-      "reserve_liquidity_fee_receiver": "5Gdxn4yquneifE6uk9tK8X4CqHfWKjW2BvYU25hAykwP",
-      "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu",
+      "borrow": {
+        "reserve_liquidity_supply": "8SheGtsopRUDzdiD6v6BR9a6bqZ9QwywYQY99Fp5meNf"
+      },
+      "repay": {
+        "reserve_liquidity_supply": "8SheGtsopRUDzdiD6v6BR9a6bqZ9QwywYQY99Fp5meNf",
+        "reserve_liquidity_fee_receiver": "5Gdxn4yquneifE6uk9tK8X4CqHfWKjW2BvYU25hAykwP",
+        "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+      },
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
@@ -274,9 +274,14 @@
       "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
       "reserve": "8K9WC8xoh2rtQNY7iEGXtPvfbDCi563SdWhCAhuMP2xE",
       "reserve_liquidity_mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-      "reserve_liquidity_supply": "3CdpSW5dxM7RTxBgxeyt8nnnjqoDbZe48tsBs9QUrmuN",
-      "reserve_liquidity_fee_receiver": "Cpyk5WRGmdK2yFGTJCrmgyABPiNEF5eCyCMMZLxpdkXu",
-      "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu",
+      "borrow": {
+        "reserve_liquidity_supply": "3CdpSW5dxM7RTxBgxeyt8nnnjqoDbZe48tsBs9QUrmuN"
+      },
+      "repay": {
+        "reserve_liquidity_supply": "3CdpSW5dxM7RTxBgxeyt8nnnjqoDbZe48tsBs9QUrmuN",
+        "reserve_liquidity_fee_receiver": "Cpyk5WRGmdK2yFGTJCrmgyABPiNEF5eCyCMMZLxpdkXu",
+        "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+      },
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
@@ -290,9 +295,14 @@
       "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
       "reserve": "CCpirWrgNuBVLdkP2haxLTbD6XqEgaYuVXixbbpxUB6",
       "reserve_liquidity_mint": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
-      "reserve_liquidity_supply": "3R5SVe3qABRUYozgeMNVkSotVoa4HhTFFgWgx2G2QMov",
-      "reserve_liquidity_fee_receiver": "83r2poRUiqaghyymPtfhhRtHdReFAKbgGGCQajkczW5w",
-      "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu",
+      "borrow": {
+        "reserve_liquidity_supply": "3R5SVe3qABRUYozgeMNVkSotVoa4HhTFFgWgx2G2QMov"
+      },
+      "repay": {
+        "reserve_liquidity_supply": "3R5SVe3qABRUYozgeMNVkSotVoa4HhTFFgWgx2G2QMov",
+        "reserve_liquidity_fee_receiver": "83r2poRUiqaghyymPtfhhRtHdReFAKbgGGCQajkczW5w",
+        "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+      },
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
@@ -306,9 +316,14 @@
       "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
       "reserve": "CPDiKagfozERtJ33p7HHhEfJERjvfk1VAjMXAFLrvrKP",
       "reserve_liquidity_mint": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
-      "reserve_liquidity_supply": "8HAaZSiCbVqrLDQHxg3yey8JWuGbeyC2tNTEmzgmt4C4",
-      "reserve_liquidity_fee_receiver": "86FvZEpX1y6pK5E6JPLbhoBvp6P2n1givZiikFGgi6Lj",
-      "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu",
+      "borrow": {
+        "reserve_liquidity_supply": "8HAaZSiCbVqrLDQHxg3yey8JWuGbeyC2tNTEmzgmt4C4"
+      },
+      "repay": {
+        "reserve_liquidity_supply": "8HAaZSiCbVqrLDQHxg3yey8JWuGbeyC2tNTEmzgmt4C4",
+        "reserve_liquidity_fee_receiver": "86FvZEpX1y6pK5E6JPLbhoBvp6P2n1givZiikFGgi6Lj",
+        "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+      },
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
@@ -322,9 +337,14 @@
       "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
       "reserve": "ASR6ULAZqTEFAfE3EQi5LpEo2iyR5YvC3tfeNqDp1wmn",
       "reserve_liquidity_mint": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
-      "reserve_liquidity_supply": "9nbeqZZnL21hqHKQRsqFK4A7hGHLrkNpiuanHK7c7KPD",
-      "reserve_liquidity_fee_receiver": "8hXY9a7r8GwqrY3GK3k5Uy7P9qACKQ8geJk5j49AQdbh",
-      "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu",
+      "borrow": {
+        "reserve_liquidity_supply": "9nbeqZZnL21hqHKQRsqFK4A7hGHLrkNpiuanHK7c7KPD"
+      },
+      "repay": {
+        "reserve_liquidity_supply": "9nbeqZZnL21hqHKQRsqFK4A7hGHLrkNpiuanHK7c7KPD",
+        "reserve_liquidity_fee_receiver": "8hXY9a7r8GwqrY3GK3k5Uy7P9qACKQ8geJk5j49AQdbh",
+        "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+      },
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
@@ -338,9 +358,14 @@
       "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
       "reserve": "HPDFoSZskyUGzo14oTuqMmoGNzavsLtU2WnPkzxAk6Sb",
       "reserve_liquidity_mint": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
-      "reserve_liquidity_supply": "3m5UiPrmtqzZsTxHdJ6DNfagXZVVqC3Eq6xugJN4wDWJ",
-      "reserve_liquidity_fee_receiver": "7KK7MTYa1dXTXXPtPEp2RDxzdVksdVvD3gPyYsyPY4Ht",
-      "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu",
+      "borrow": {
+        "reserve_liquidity_supply": "3m5UiPrmtqzZsTxHdJ6DNfagXZVVqC3Eq6xugJN4wDWJ"
+      },
+      "repay": {
+        "reserve_liquidity_supply": "3m5UiPrmtqzZsTxHdJ6DNfagXZVVqC3Eq6xugJN4wDWJ",
+        "reserve_liquidity_fee_receiver": "7KK7MTYa1dXTXXPtPEp2RDxzdVksdVvD3gPyYsyPY4Ht",
+        "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+      },
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
@@ -357,12 +382,20 @@
   ],
   "protocols": {
     "raydium_v3": {
-      "hydration_retry_ms": 60000
+      "hydration_retry_ms": 10000
     },
-    "cp_amm": {},
-    "lb_clmm": {},
-    "lifinity_v2": {},
-    "whirlpool": {}
+    "cp_amm": {
+      "hydration_retry_ms": 10000
+    },
+    "lb_clmm": {
+      "hydration_retry_ms": 10000
+    },
+    "lifinity_v2": {
+      "hydration_retry_ms": 10000
+    },
+    "whirlpool": {
+      "hydration_retry_ms": 10000
+    }
   },
   "corecast": {
     "address": "corecast.bitquery.io",
@@ -383,10 +416,14 @@
   "strategy": {
     "min_edge_bps": 1.0,
     "min_profit_lamports": 100000,
-    "min_tip_lamports": 25000,
-    "max_tip_lamports": 15000000,
-    "tip_profit_share_bps": 900,
-    "tip_floor_markup_bps": 1200,
-    "tip_floor_fallback_lamports": 75000
+    "min_tip_lamports": 75000,
+    "max_tip_lamports": 25000000,
+    "tip_profit_share_bps": 1500,
+    "tip_floor_markup_bps": 4000,
+    "tip_floor_fallback_lamports": 75000,
+    "tip_floor_min_lamports": 75000,
+    "tip_congestion_target_latency_ms": 400,
+    "tip_congestion_max_multiplier": 10.0,
+    "tip_congestion_expired_weight_bps": 8000
   }
 }

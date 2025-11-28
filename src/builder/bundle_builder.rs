@@ -36,6 +36,7 @@ static JITO_DONT_FRONT_ACCOUNT: Lazy<Pubkey> = Lazy::new(|| {
 
 const CP_AMM_HOST_FEE_INDEX: usize = 11;
 const LB_CLMM_HOST_FEE_INDEX: usize = 9;
+const DEFAULT_SLIPPAGE_TOLERANCE_BPS: u16 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleInstructionPlan {
@@ -96,7 +97,7 @@ pub fn build_bundle(
     instructions.extend_from_slice(prefix_instructions);
     for plan in plans {
         let template = resolve_template(cache, plan)?;
-        let instruction = hydrate_instruction(plan, template.as_ref())
+        let instruction = hydrate_instruction(plan, template.as_ref(), payer)
             .with_context(|| format!("failed to hydrate plan for pool {}", plan.pool_id))?;
         instructions.push(instruction);
     }
@@ -132,6 +133,7 @@ fn resolve_template(
 fn hydrate_instruction(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
+    payer: Pubkey,
 ) -> Result<Instruction> {
     let mut data = (*template.data).clone();
     for patch in template.patches.iter() {
@@ -140,6 +142,7 @@ fn hydrate_instruction(
 
     let mut accounts = template.accounts.as_ref().to_vec();
     apply_template_context(plan, template, &mut accounts)?;
+    rewrite_placeholder_signers(plan, &mut accounts, payer);
 
     Ok(Instruction {
         program_id: template.program_id,
@@ -159,7 +162,8 @@ fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [
         TemplateFieldKind::AmmV3(field) => match field {
             AmmV3Field::AmountSpecified => write_i128(plan.amount_in as i128, slice),
             AmmV3Field::OtherAmountThreshold => {
-                write_u128(plan.expected_output_amount as u128, slice)
+                let threshold = guarded_expected_output(plan);
+                write_u128(threshold as u128, slice)
             }
             AmmV3Field::SqrtPriceLimit => {
                 if let Some(limit) = plan.sqrt_price_limit {
@@ -172,7 +176,7 @@ fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [
             CpAmmField::MinimumOutput => {
                 let min_out = plan
                     .min_output_amount
-                    .unwrap_or(plan.expected_output_amount);
+                    .unwrap_or_else(|| guarded_expected_output(plan));
                 write_u128(min_out as u128, slice)
             }
         },
@@ -181,7 +185,7 @@ fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [
             LbClmmField::AmountOut => {
                 let threshold = plan
                     .min_output_amount
-                    .unwrap_or(plan.expected_output_amount);
+                    .unwrap_or_else(|| guarded_expected_output(plan));
                 write_u128(threshold as u128, slice)
             }
             LbClmmField::LimitPrice => {
@@ -200,7 +204,7 @@ fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [
             LifinityField::AmountOut => {
                 let min_out = plan
                     .min_output_amount
-                    .unwrap_or(plan.expected_output_amount);
+                    .unwrap_or_else(|| guarded_expected_output(plan));
                 write_u128(min_out as u128, slice)
             }
             LifinityField::SlotPadding => {
@@ -214,7 +218,7 @@ fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [
             WhirlpoolField::AmountOut => {
                 let threshold = plan
                     .min_output_amount
-                    .unwrap_or(plan.expected_output_amount);
+                    .unwrap_or_else(|| guarded_expected_output(plan));
                 write_u128(threshold as u128, slice)
             }
             WhirlpoolField::SqrtPriceLimit => {
@@ -255,13 +259,30 @@ fn write_option_i32(value: i64, dst: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+fn guarded_expected_output(plan: &BundleInstructionPlan) -> u64 {
+    let tolerance = u64::from(
+        plan.context
+            .slippage_tolerance_bps
+            .unwrap_or(DEFAULT_SLIPPAGE_TOLERANCE_BPS),
+    );
+    apply_slippage_guard(plan.expected_output_amount, tolerance)
+}
+
+fn apply_slippage_guard(amount: u64, tolerance_bps: u64) -> u64 {
+    if tolerance_bps == 0 || amount == 0 {
+        return amount;
+    }
+    let slip = amount.saturating_mul(tolerance_bps).saturating_div(10_000);
+    amount.saturating_sub(slip)
+}
+
 fn apply_template_context(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
     accounts: &mut Vec<AccountMeta>,
 ) -> Result<()> {
     if let Some(host_fee) = plan.context.host_fee_account {
-        apply_host_fee_account(template.program_id, accounts, host_fee)?;
+        apply_host_fee_account(template.program_id, accounts.as_mut_slice(), host_fee)?;
     }
 
     if plan.context.requires_memo {
@@ -280,11 +301,26 @@ fn apply_template_context(
 pub(crate) fn hydrate_accounts_for_plan(
     cache: &TemplateCache,
     plan: &BundleInstructionPlan,
+    payer: Pubkey,
 ) -> Result<Vec<AccountMeta>> {
     let template = resolve_template(cache, plan)?;
     let mut accounts = template.accounts.as_ref().to_vec();
     apply_template_context(plan, template.as_ref(), &mut accounts)?;
+    rewrite_placeholder_signers(plan, &mut accounts, payer);
     Ok(accounts)
+}
+
+fn rewrite_placeholder_signers(
+    plan: &BundleInstructionPlan,
+    accounts: &mut [AccountMeta],
+    default_payer: Pubkey,
+) {
+    let authority = plan.context.payer.unwrap_or(default_payer);
+    for meta in accounts.iter_mut().filter(|meta| meta.is_signer) {
+        if meta.pubkey == Pubkey::default() {
+            meta.pubkey = authority;
+        }
+    }
 }
 
 fn ensure_memo_account(accounts: &mut Vec<AccountMeta>) {
@@ -306,7 +342,7 @@ fn ensure_dont_front_account(accounts: &mut Vec<AccountMeta>) {
 
 fn apply_host_fee_account(
     program_id: Pubkey,
-    accounts: &mut Vec<AccountMeta>,
+    accounts: &mut [AccountMeta],
     host_fee: Pubkey,
 ) -> Result<()> {
     let index = if program_id == *CP_AMM_PROGRAM_ID {
@@ -369,6 +405,7 @@ mod tests {
     use crate::config::AppConfig;
     use serde_json::json;
     use solana_sdk::instruction::AccountMeta;
+    use std::convert::TryInto;
     use std::sync::Arc as StdArc;
 
     #[test]
@@ -684,6 +721,180 @@ mod tests {
     }
 
     #[test]
+    fn applies_default_slippage_guard_when_no_min_output_provided() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let accounts = vec![AccountMeta::new(Pubkey::new_unique(), false)];
+        insert_template_with_custom_patches(
+            &cache,
+            pool,
+            SwapTemplateDirection::BaseIn,
+            program_id,
+            accounts,
+            vec![TemplatePatch {
+                offset: 0,
+                length: 8,
+                kind: TemplateFieldKind::CpAmm(CpAmmField::MinimumOutput),
+            }],
+        );
+
+        let expected_output_amount = 1_000_000u64;
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: "mintA".into(),
+            output_mint: "mintB".into(),
+            amount_in: 10,
+            expected_output_amount,
+            fee_bps: 5,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context: TemplateContext::default(),
+            lookup_table: None,
+        };
+
+        let payer = Pubkey::new_unique();
+        let ctx =
+            build_bundle(21, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let encoded = u64::from_le_bytes(ctx.instructions[0].data[..8].try_into().unwrap());
+        let tolerance = u64::from(DEFAULT_SLIPPAGE_TOLERANCE_BPS);
+        let slip = expected_output_amount
+            .saturating_mul(tolerance)
+            .saturating_div(10_000);
+        assert_eq!(encoded, expected_output_amount.saturating_sub(slip));
+    }
+
+    #[test]
+    fn honors_explicit_min_output_amount() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let accounts = vec![AccountMeta::new(Pubkey::new_unique(), false)];
+        insert_template_with_custom_patches(
+            &cache,
+            pool,
+            SwapTemplateDirection::BaseIn,
+            program_id,
+            accounts,
+            vec![TemplatePatch {
+                offset: 0,
+                length: 8,
+                kind: TemplateFieldKind::CpAmm(CpAmmField::MinimumOutput),
+            }],
+        );
+
+        let explicit_min = 900_000u64;
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: "mintA".into(),
+            output_mint: "mintB".into(),
+            amount_in: 10,
+            expected_output_amount: 1_000_000,
+            fee_bps: 5,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: Some(explicit_min),
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context: TemplateContext::default(),
+            lookup_table: None,
+        };
+
+        let payer = Pubkey::new_unique();
+        let ctx =
+            build_bundle(23, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let encoded = u64::from_le_bytes(ctx.instructions[0].data[..8].try_into().unwrap());
+        assert_eq!(encoded, explicit_min);
+    }
+
+    #[test]
+    fn replaces_placeholder_signers_with_payer() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let placeholder = AccountMeta::new(Pubkey::default(), true);
+        let accounts = vec![placeholder];
+        let program_id = insert_template_with_program(
+            &cache,
+            pool,
+            SwapTemplateDirection::BaseIn,
+            Pubkey::new_unique(),
+            accounts,
+        );
+
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: "mintA".into(),
+            output_mint: "mintB".into(),
+            amount_in: 1,
+            expected_output_amount: 1,
+            fee_bps: 5,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context: TemplateContext::default(),
+            lookup_table: None,
+        };
+
+        let payer = Pubkey::new_unique();
+        let ctx =
+            build_bundle(17, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        assert_eq!(ctx.instructions[0].accounts[0].pubkey, payer);
+    }
+
+    #[test]
+    fn honors_template_context_payer_override() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let placeholder = AccountMeta::new(Pubkey::default(), true);
+        let accounts = vec![placeholder];
+        let program_id = insert_template_with_program(
+            &cache,
+            pool,
+            SwapTemplateDirection::BaseIn,
+            Pubkey::new_unique(),
+            accounts,
+        );
+
+        let override_authority = Pubkey::new_unique();
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: "mintA".into(),
+            output_mint: "mintB".into(),
+            amount_in: 1,
+            expected_output_amount: 1,
+            fee_bps: 5,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context: TemplateContext {
+                payer: Some(override_authority),
+                ..TemplateContext::default()
+            },
+            lookup_table: None,
+        };
+
+        let payer = Pubkey::new_unique();
+        let ctx =
+            build_bundle(19, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        assert_eq!(ctx.instructions[0].accounts[0].pubkey, override_authority);
+    }
+
+    #[test]
     fn hydrates_accounts_for_plan_respects_context() {
         let cache = TemplateCache::new(test_config());
         let pool = Pubkey::new_unique();
@@ -724,7 +935,8 @@ mod tests {
             lookup_table: None,
         };
 
-        let hydrated = hydrate_accounts_for_plan(&cache, &plan).expect("accounts");
+        let hydrated =
+            hydrate_accounts_for_plan(&cache, &plan, Pubkey::new_unique()).expect("accounts");
         assert_eq!(hydrated[CP_AMM_HOST_FEE_INDEX].pubkey, host_fee);
         let memo_pos = hydrated
             .iter()
@@ -756,12 +968,23 @@ mod tests {
         program_id: Pubkey,
         accounts: Vec<AccountMeta>,
     ) -> Pubkey {
-        let key = TemplateCacheKey::new(pool, direction, 5);
         let patches = vec![TemplatePatch {
             offset: 0,
             length: 8,
             kind: TemplateFieldKind::CpAmm(CpAmmField::AmountIn),
         }];
+        insert_template_with_custom_patches(cache, pool, direction, program_id, accounts, patches)
+    }
+
+    fn insert_template_with_custom_patches(
+        cache: &TemplateCache,
+        pool: Pubkey,
+        direction: SwapTemplateDirection,
+        program_id: Pubkey,
+        accounts: Vec<AccountMeta>,
+        patches: Vec<TemplatePatch>,
+    ) -> Pubkey {
+        let key = TemplateCacheKey::new(pool, direction, 5);
         let template = InstructionTemplate {
             key,
             program_id,
@@ -802,9 +1025,14 @@ mod tests {
                     "lending_market": "Flash1111111111111111111111111111111111",
                     "reserve": "Flash1111111111111111111111111111111111",
                     "reserve_liquidity_mint": "Flash1111111111111111111111111111111111",
-                    "reserve_liquidity_supply": "Flash1111111111111111111111111111111111",
-                    "reserve_liquidity_fee_receiver": "Flash1111111111111111111111111111111111",
-                    "host_fee_receiver": "Flash1111111111111111111111111111111111"
+                    "borrow": {
+                        "reserve_liquidity_supply": "Flash1111111111111111111111111111111111"
+                    },
+                    "repay": {
+                        "reserve_liquidity_supply": "Flash1111111111111111111111111111111111",
+                        "reserve_liquidity_fee_receiver": "Flash1111111111111111111111111111111111",
+                        "host_fee_receiver": "Flash1111111111111111111111111111111111"
+                    }
                 }
             },
             "quicknode_rpcs": ["https://example"],

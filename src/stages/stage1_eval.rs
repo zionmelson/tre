@@ -22,7 +22,7 @@ use crate::config::AppConfig;
 use crate::core::{pin_current_thread, Lease, RingConsumer, RingProducer, SlabPool};
 use crate::notifier::Notifier;
 use crate::strategy::StrategyEngine;
-use crate::telemetry::{self, Stage1BackpressureEvent, Stage1FeedGapEvent};
+use crate::telemetry::{self, Stage1BackpressureEvent, Stage1FeedGapEvent, Stage1PoolDrainEvent};
 
 use super::graph_manager::{ArbitrageOpportunity, GraphManager, PathLeg, PoolPath};
 use super::types::{
@@ -140,7 +140,24 @@ fn run(
     }
 
     builder.template_cache().prewarm();
-    builder.alt_manager().refresh_warm_cache();
+    let alt_manager = builder.alt_manager();
+    match alt_manager.refresh_warm_cache() {
+        Ok(()) => {
+            let stats = alt_manager.stats();
+            info!(
+                target = "alt_manager",
+                ready_tables = stats.ready_tables,
+                registered_handles = stats.registered_handles,
+                pending_jobs = stats.pending_jobs,
+                refresh_count = stats.refresh_count,
+                last_refresh_unix_ms = stats.last_refresh_unix_ms,
+                "ALT warm cache refreshed"
+            );
+        }
+        Err(err) => {
+            warn!(target = "alt_manager", error = ?err, "failed to refresh ALT warm cache");
+        }
+    }
     builder.flash_loan_planner().prepare_default_routes();
 
     let mut pool_snapshots: HashMap<String, PoolSnapshot> = HashMap::new();
@@ -152,6 +169,70 @@ fn run(
     let adapters = AdapterBook::new(config, builder.clone());
     let mut graph_manager = GraphManager::new();
     let mut last_cycle_signatures: HashSet<String> = HashSet::new();
+    let handle_pool_update = |update: PoolUpdate,
+                              pool_snapshots: &mut HashMap<String, PoolSnapshot>,
+                              pending_trades: &mut HashMap<String, VecDeque<TradeUpdate>>,
+                              graph_manager: &mut GraphManager,
+                              last_cycle_signatures: &mut HashSet<String>,
+                              adapters: &AdapterBook,
+                              notifier: &Notifier,
+                              path_profile: &mut PathSearchProfile,
+                              builder: &BuilderHandle,
+                              strategy: &StrategyEngine,
+                              bundle_pool: &SlabPool<BundleCandidate>,
+                              producer: &RingProducer<Lease<BundleCandidate>>,
+                              overflow_queue: &mut VecDeque<BundleCandidate>,
+                              opportunity_seq: &mut u64| {
+        adapters.ingest(&update);
+        let mut snapshot = update.into_snapshot();
+        if let Some(quotes) = adapters.snapshot_quotes(&snapshot) {
+            snapshot.quotes = Some(quotes);
+        }
+        graph_manager.index_pool(&snapshot);
+        let pool_id = snapshot.pool_id.clone();
+        pool_snapshots.insert(pool_id.clone(), snapshot);
+        let cycles = graph_manager.latest_profitable_cycles();
+        let cycle_signatures: HashSet<String> = cycles.iter().map(cycle_signature).collect();
+        if cycles.is_empty() {
+            last_cycle_signatures.clear();
+        } else if cycle_signatures != *last_cycle_signatures {
+            if let Err(err) = notifier.notify_arbitrage(cycles) {
+                warn!(error = ?err, "failed to forward arbitrage notification");
+            } else {
+                *last_cycle_signatures = cycle_signatures;
+            }
+        }
+
+        if let Some(mut queue) = pending_trades.remove(&pool_id) {
+            while let Some(trade) = queue.pop_front() {
+                telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::BacklogFlushed);
+                match process_trade_update(
+                    trade,
+                    pool_snapshots.get(&pool_id).cloned(),
+                    path_profile,
+                    graph_manager,
+                    pool_snapshots,
+                    adapters,
+                    builder,
+                    strategy,
+                    notifier,
+                    bundle_pool,
+                    producer,
+                    overflow_queue,
+                    opportunity_seq,
+                ) {
+                    TradeProcessResult::Processed => {}
+                    TradeProcessResult::MissingSnapshot(trade) => {
+                        enqueue_pending_trade(pending_trades, trade);
+                        break;
+                    }
+                }
+            }
+            if !queue.is_empty() {
+                pending_trades.insert(pool_id, queue);
+            }
+        }
+    };
 
     info!("stage1 eval online");
     while !stop.load(Ordering::Relaxed) {
@@ -162,86 +243,88 @@ fn run(
             made_progress = true;
         }
 
-        if let Some(pool_lease) = pool_consumer.pop() {
-            let update = pool_lease.into_inner();
-            adapters.ingest(&update);
-            let mut snapshot = update.into_snapshot();
-            if let Some(quotes) = adapters.snapshot_quotes(&snapshot) {
-                snapshot.quotes = Some(quotes);
+        if pending_trades.is_empty() {
+            if let Some(pool_lease) = pool_consumer.pop() {
+                handle_pool_update(
+                    pool_lease.into_inner(),
+                    &mut pool_snapshots,
+                    &mut pending_trades,
+                    &mut graph_manager,
+                    &mut last_cycle_signatures,
+                    &adapters,
+                    notifier.as_ref(),
+                    &mut path_profile,
+                    &builder,
+                    strategy.as_ref(),
+                    &bundle_pool,
+                    &producer,
+                    &mut overflow_queue,
+                    &mut opportunity_seq,
+                );
+                made_progress = true;
             }
-            graph_manager.index_pool(&snapshot);
-            let pool_id = snapshot.pool_id.clone();
-            pool_snapshots.insert(pool_id.clone(), snapshot);
-            let cycles = graph_manager.latest_profitable_cycles();
-            let cycle_signatures: HashSet<String> = cycles.iter().map(cycle_signature).collect();
-            if cycles.is_empty() {
-                last_cycle_signatures.clear();
-            } else if cycle_signatures != last_cycle_signatures {
-                if let Err(err) = notifier.notify_arbitrage(cycles) {
-                    warn!(error = ?err, "failed to forward arbitrage notification");
+        } else {
+            let mut drained_count = 0;
+            while let Some(pool_lease) = pool_consumer.pop() {
+                handle_pool_update(
+                    pool_lease.into_inner(),
+                    &mut pool_snapshots,
+                    &mut pending_trades,
+                    &mut graph_manager,
+                    &mut last_cycle_signatures,
+                    &adapters,
+                    notifier.as_ref(),
+                    &mut path_profile,
+                    &builder,
+                    strategy.as_ref(),
+                    &bundle_pool,
+                    &producer,
+                    &mut overflow_queue,
+                    &mut opportunity_seq,
+                );
+                drained_count += 1;
+            }
+            if drained_count > 0 {
+                let drain_event = if drained_count == 1 {
+                    Stage1PoolDrainEvent::Single
                 } else {
-                    last_cycle_signatures = cycle_signatures;
-                }
+                    Stage1PoolDrainEvent::Multiple
+                };
+                telemetry::record_stage1_pool_drain(drain_event);
+                made_progress = true;
             }
-
-            if let Some(mut queue) = pending_trades.remove(&pool_id) {
-                while let Some(trade) = queue.pop_front() {
-                    telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::BacklogFlushed);
-                    match process_trade_update(
-                        trade,
-                        pool_snapshots.get(&pool_id).cloned(),
-                        &mut path_profile,
-                        &mut graph_manager,
-                        &pool_snapshots,
-                        &adapters,
-                        &builder,
-                        strategy.as_ref(),
-                        notifier.as_ref(),
-                        &bundle_pool,
-                        &producer,
-                        &mut overflow_queue,
-                        &mut opportunity_seq,
-                    ) {
-                        TradeProcessResult::Processed => {}
-                        TradeProcessResult::MissingSnapshot(trade) => {
-                            enqueue_pending_trade(&mut pending_trades, trade);
-                            break;
-                        }
-                    }
-                }
-                if !queue.is_empty() {
-                    pending_trades.insert(pool_id.clone(), queue);
-                }
-            }
-            made_progress = true;
         }
 
-        if let Some(trade_lease) = trade_consumer.pop() {
-            let trade = trade_lease.into_inner();
-            let snapshot = pool_snapshots.get(&trade.pool_id).cloned();
-            match process_trade_update(
-                trade,
-                snapshot,
-                &mut path_profile,
-                &mut graph_manager,
-                &pool_snapshots,
-                &adapters,
-                &builder,
-                strategy.as_ref(),
-                notifier.as_ref(),
-                &bundle_pool,
-                &producer,
-                &mut overflow_queue,
-                &mut opportunity_seq,
-            ) {
-                TradeProcessResult::Processed => {}
-                TradeProcessResult::MissingSnapshot(trade) => {
-                    telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::MissingSnapshot);
-                    enqueue_pending_trade(&mut pending_trades, trade);
+        if pending_trades.is_empty() {
+            if let Some(trade_lease) = trade_consumer.pop() {
+                let trade = trade_lease.into_inner();
+                let snapshot = pool_snapshots.get(&trade.pool_id).cloned();
+                match process_trade_update(
+                    trade,
+                    snapshot,
+                    &mut path_profile,
+                    &mut graph_manager,
+                    &pool_snapshots,
+                    &adapters,
+                    &builder,
+                    strategy.as_ref(),
+                    notifier.as_ref(),
+                    &bundle_pool,
+                    &producer,
+                    &mut overflow_queue,
+                    &mut opportunity_seq,
+                ) {
+                    TradeProcessResult::Processed => {}
+                    TradeProcessResult::MissingSnapshot(trade) => {
+                        telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::MissingSnapshot);
+                        enqueue_pending_trade(&mut pending_trades, trade);
+                    }
                 }
-            }
 
-            made_progress = true;
+                made_progress = true;
+            }
+        } else {
+            telemetry::record_stage1_backpressure(Stage1BackpressureEvent::TradeIntakePaused);
         }
 
         if !made_progress {
@@ -839,31 +922,56 @@ fn register_adapter(
 }
 
 fn raydium_config(config: &AppConfig) -> RaydiumV3AdapterConfig {
-    let mut adapter_config = RaydiumV3AdapterConfig::default();
-    adapter_config.rpc_endpoints = config.protocol_rpc_endpoints("raydium_v3");
+    let mut adapter_config = RaydiumV3AdapterConfig {
+        rpc_endpoints: config.protocol_rpc_endpoints("raydium_v3"),
+        ..Default::default()
+    };
+    if let Some(retry_ms) = config.protocol_hydration_retry_ms("raydium_v3") {
+        adapter_config.hydration_retry_ms = retry_ms.max(1);
+    }
     adapter_config
 }
 
 fn cp_amm_config(config: &AppConfig) -> CpAmmAdapterConfig {
-    let mut adapter_config = CpAmmAdapterConfig::default();
-    adapter_config.rpc_endpoints = config.protocol_rpc_endpoints("cp_amm");
+    let mut adapter_config = CpAmmAdapterConfig {
+        rpc_endpoints: config.protocol_rpc_endpoints("cp_amm"),
+        ..Default::default()
+    };
+    if let Some(retry_ms) = config.protocol_hydration_retry_ms("cp_amm") {
+        adapter_config.hydration_retry_ms = retry_ms.max(1);
+    }
     adapter_config
 }
 
 fn lb_clmm_config(config: &AppConfig) -> LbClmmAdapterConfig {
-    let mut adapter_config = LbClmmAdapterConfig::default();
-    adapter_config.rpc_endpoints = config.protocol_rpc_endpoints("lb_clmm");
+    let mut adapter_config = LbClmmAdapterConfig {
+        rpc_endpoints: config.protocol_rpc_endpoints("lb_clmm"),
+        ..Default::default()
+    };
+    if let Some(retry_ms) = config.protocol_hydration_retry_ms("lb_clmm") {
+        adapter_config.hydration_retry_ms = retry_ms.max(1);
+    }
     adapter_config
 }
 
 fn lifinity_config(config: &AppConfig) -> LifinityAdapterConfig {
-    let mut adapter_config = LifinityAdapterConfig::default();
-    adapter_config.rpc_endpoints = config.protocol_rpc_endpoints("lifinity_v2");
+    let mut adapter_config = LifinityAdapterConfig {
+        rpc_endpoints: config.protocol_rpc_endpoints("lifinity_v2"),
+        ..Default::default()
+    };
+    if let Some(retry_ms) = config.protocol_hydration_retry_ms("lifinity_v2") {
+        adapter_config.hydration_retry_ms = retry_ms.max(1);
+    }
     adapter_config
 }
 
 fn whirlpool_config(config: &AppConfig) -> WhirlpoolAdapterConfig {
-    let mut adapter_config = WhirlpoolAdapterConfig::default();
-    adapter_config.rpc_endpoints = config.protocol_rpc_endpoints("whirlpool");
+    let mut adapter_config = WhirlpoolAdapterConfig {
+        rpc_endpoints: config.protocol_rpc_endpoints("whirlpool"),
+        ..Default::default()
+    };
+    if let Some(retry_ms) = config.protocol_hydration_retry_ms("whirlpool") {
+        adapter_config.hydration_retry_ms = retry_ms.max(1);
+    }
     adapter_config
 }
