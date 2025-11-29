@@ -7,7 +7,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use bincode::serialize;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey;
@@ -182,6 +182,7 @@ fn bundle_instruction_plan_from(ix: &PlannedInstruction) -> BundleInstructionPla
         amount_in: ix.amount,
         expected_output_amount: ix.estimated_output_amount,
         fee_bps: u16::try_from(ix.fee_bps).unwrap_or(u16::MAX),
+        template_fee_bps: ix.template_fee_bps,
         direction: match ix.direction {
             PoolQuoteDirection::BaseToQuote => SwapTemplateDirection::BaseIn,
             PoolQuoteDirection::QuoteToBase => SwapTemplateDirection::BaseOut,
@@ -458,6 +459,7 @@ impl<'a> InstructionPlanner<'a> {
     ) -> anyhow::Result<PlannedRouteInstructions> {
         let mut instructions = Vec::with_capacity(route.legs.len());
         for leg in &route.legs {
+            self.ensure_leg_ready(leg)?;
             instructions.push(PlannedInstruction {
                 pool_id: leg.pool_id.clone(),
                 program_id: leg.program_id.clone(),
@@ -466,6 +468,7 @@ impl<'a> InstructionPlanner<'a> {
                 amount: leg.input_amount,
                 estimated_output_amount: leg.estimated_output_amount,
                 fee_bps: leg.fee_bps,
+                template_fee_bps: leg.template_fee_bps,
                 direction: leg.direction,
                 lookup_table: self.lookup_table_for_leg(leg),
                 sqrt_price_limit: leg.sqrt_price_limit,
@@ -479,36 +482,50 @@ impl<'a> InstructionPlanner<'a> {
         self.warn_missing_lookup_tables(&instructions);
 
         let mut planned = PlannedRouteInstructions::with_swaps(instructions);
-        if let Some(first_swap) = planned.swap_instructions.first() {
-            if let Some(mut flash_plan) =
-                self.plan_flash_loan(route, first_swap, bundle_seq, tip_lamports)?
-            {
-                if let Some(tip_plan) = flash_plan.tip_funding.as_ref() {
+        if route.flash_loan_permitted {
+            if let Some(first_swap) = planned.swap_instructions.first() {
+                if let Some(mut flash_plan) =
+                    self.plan_flash_loan(route, first_swap, bundle_seq, tip_lamports)?
+                {
+                    if let Some(tip_plan) = flash_plan.tip_funding.as_ref() {
+                        planned
+                            .prefix_instructions
+                            .push(tip_plan.create_account.clone());
+                        planned
+                            .prefix_instructions
+                            .push(tip_plan.init_account.clone());
+                    }
+                    let borrow_index = planned.prefix_instructions.len();
                     planned
                         .prefix_instructions
-                        .push(tip_plan.create_account.clone());
-                    planned
-                        .prefix_instructions
-                        .push(tip_plan.init_account.clone());
+                        .push(flash_plan.borrow_instruction.clone());
+                    flash_plan.borrow_prefix_index = Some(borrow_index);
+                    if let Some(tip_plan) = flash_plan.tip_funding.as_ref() {
+                        planned
+                            .prefix_instructions
+                            .push(tip_plan.siphon_instruction.clone());
+                        planned
+                            .prefix_instructions
+                            .push(tip_plan.close_account.clone());
+                    }
+                    planned.flash_loan_plan = Some(flash_plan);
                 }
-                let borrow_index = planned.prefix_instructions.len();
-                planned
-                    .prefix_instructions
-                    .push(flash_plan.borrow_instruction.clone());
-                flash_plan.borrow_prefix_index = Some(borrow_index);
-                if let Some(tip_plan) = flash_plan.tip_funding.as_ref() {
-                    planned
-                        .prefix_instructions
-                        .push(tip_plan.siphon_instruction.clone());
-                    planned
-                        .prefix_instructions
-                        .push(tip_plan.close_account.clone());
-                }
-                planned.flash_loan_plan = Some(flash_plan);
             }
         }
 
         Ok(planned)
+    }
+
+    fn ensure_leg_ready(&self, leg: &RouteLegPlan) -> Result<()> {
+        if !leg.template_ready {
+            telemetry::record_stage2_pool_block(&leg.pool_id);
+            bail!("template not ready for pool {}", leg.pool_id);
+        }
+        if !leg.alt_ready {
+            telemetry::record_stage2_pool_block(&leg.pool_id);
+            bail!("ALT not ready for pool {}", leg.pool_id);
+        }
+        Ok(())
     }
 
     fn lookup_table_for_leg(&self, leg: &RouteLegPlan) -> Option<PlannedLookupTable> {
@@ -792,7 +809,7 @@ fn duration_ms(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use crate::builder::templates::SwapTemplateDirection;
-    use crate::builder::{InstructionTemplate, TemplateCacheKey, TemplatePatch};
+    use crate::builder::{InstructionTemplate, TemplateCacheKey, TemplateMetadata, TemplatePatch};
     use crate::config::AppConfig;
     use crate::core::SlabPool;
     use crate::stages::types::{BundleCandidate, Opportunity, TradeUpdate};
@@ -896,6 +913,7 @@ mod tests {
                     estimated_output_amount: 200,
                     effective_price: 2.0,
                     fee_bps: 30,
+                    template_fee_bps: 30,
                     estimated_slippage_bps: 5.0,
                     direction: PoolQuoteDirection::BaseToQuote,
                     sqrt_price_limit: None,
@@ -903,8 +921,8 @@ mod tests {
                     limit_price: None,
                     price_impact_limit_bps: None,
                     context: TemplateContext::default(),
-                    template_ready: false,
-                    alt_ready: false,
+                    template_ready: true,
+                    alt_ready: true,
                 },
                 RouteLegPlan {
                     pool_id: "pool-bc".into(),
@@ -915,6 +933,7 @@ mod tests {
                     estimated_output_amount: 190,
                     effective_price: 0.95,
                     fee_bps: 30,
+                    template_fee_bps: 30,
                     estimated_slippage_bps: 6.0,
                     direction: PoolQuoteDirection::BaseToQuote,
                     sqrt_price_limit: None,
@@ -922,11 +941,12 @@ mod tests {
                     limit_price: None,
                     price_impact_limit_bps: None,
                     context: TemplateContext::default(),
-                    template_ready: false,
-                    alt_ready: false,
+                    template_ready: true,
+                    alt_ready: true,
                 },
             ],
             estimated_final_output_amount: Some(190),
+            flash_loan_permitted: false,
         };
 
         let planner = InstructionPlanner::new(None);
@@ -952,7 +972,7 @@ mod tests {
         let builder = fixture.builder();
 
         let template = InstructionTemplate {
-            key: TemplateCacheKey::new(pool_id, SwapTemplateDirection::BaseIn, 30),
+            key: TemplateCacheKey::new(pool_id, SwapTemplateDirection::BaseIn),
             program_id,
             discriminator: [0; 8],
             accounts: Arc::from(Vec::<AccountMeta>::new()),
@@ -962,6 +982,7 @@ mod tests {
             tlv_bytes: 0,
             template_hash: [0; 32],
             alt_handle: None,
+            metadata: TemplateMetadata::None,
         };
         builder.template_cache().insert(template);
 
@@ -975,6 +996,7 @@ mod tests {
             estimated_output_amount: 999_000,
             effective_price: 1.0,
             fee_bps: 30,
+            template_fee_bps: 30,
             estimated_slippage_bps: 0.0,
             direction: PoolQuoteDirection::BaseToQuote,
             sqrt_price_limit: None,
@@ -990,6 +1012,7 @@ mod tests {
             end_mint: WSOL_MINT_PUBKEY.to_string(),
             legs: vec![leg],
             estimated_final_output_amount: Some(999_000),
+            flash_loan_permitted: true,
         };
 
         let tip_lamports = 250_000;

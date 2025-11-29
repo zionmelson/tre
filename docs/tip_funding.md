@@ -38,6 +38,8 @@ As a result, Stage 3 builds signed bundles that immediately fail with `Insuffici
   - Append conversion legs that swap the reserved amount into WSOL (whichever pool in the strategy allowlist has liquidity) and then use the same unwrap scaffold above.
   - The conversion cost (slippage + fees) becomes part of the strategy’s net-profit check so we never submit if the round trip can’t pay the validator.
 
+Keep the Solend `flash_loans.<token>.receiver_program_allowlist` in sync with the programs you expect to call. Whirlpool swaps must list `whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN` (now included in the default template). The loader will automatically add this program to any custom allowlist that omits it and emit a warning so operators can update long-lived configs.
+
 ### 3. Wallet-Aware Tip Clamp
 
 - `TipOracle` now tracks an optional `WalletBalanceTracker` which polls RPC every few seconds. When `wallet_tip_cap_bps` is configured, `recommended_tip` becomes `min(strategy_tip, balance * cap)`.

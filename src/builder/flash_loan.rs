@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -6,17 +6,37 @@ use std::sync::{
 };
 
 use anyhow::{anyhow, ensure, Context, Result};
+use once_cell::sync::Lazy;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::sysvar;
-use solend::{
-    flash_borrow_instruction, flash_repay_instruction, FLASH_BORROW_OPCODE, FLASH_REPAY_OPCODE,
-};
+use solend::{flash_borrow_instruction, flash_repay_instruction};
+use tracing::warn;
 
 use crate::config::{AppConfig, FlashLoanConfig};
 
 pub const SOLEND_FLASH_LOAN_FEE_BPS: u64 = 5; // 0.05% per Solend fee schedule
 pub const FLASH_LOAN_BPS_DENOMINATOR: u64 = 10_000;
+const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN";
+
+static DEFAULT_FLASH_LOAN_ALLOWED_PROGRAMS: Lazy<Vec<Pubkey>> = Lazy::new(|| {
+    [
+        LB_CLMM_PROGRAM_ID,
+        SPL_TOKEN_PROGRAM_ID,
+        WHIRLPOOL_PROGRAM_ID,
+    ]
+    .iter()
+    .filter_map(|id| Pubkey::from_str(id).ok())
+    .collect()
+});
+
+static REQUIRED_FLASH_LOAN_RECEIVER_PROGRAMS: Lazy<Vec<Pubkey>> = Lazy::new(|| {
+    [WHIRLPOOL_PROGRAM_ID]
+        .iter()
+        .filter_map(|id| Pubkey::from_str(id).ok())
+        .collect()
+});
 
 #[derive(Clone)]
 pub struct FlashLoanPlanner {
@@ -30,6 +50,47 @@ struct PlannerState {
     prepared_routes: AtomicU64,
     outstanding_borrow_lamports: AtomicU64,
     issued_plan_seq: AtomicU64,
+    reserve_capacity: HashMap<Pubkey, ReserveCapacity>,
+}
+
+struct ReserveCapacity {
+    available_lamports: AtomicU64,
+    outstanding_lamports: AtomicU64,
+}
+
+impl ReserveCapacity {
+    fn new() -> Self {
+        Self {
+            available_lamports: AtomicU64::new(u64::MAX),
+            outstanding_lamports: AtomicU64::new(0),
+        }
+    }
+
+    fn set_available(&self, amount: u64) {
+        self.available_lamports.store(amount, Ordering::Relaxed);
+    }
+
+    fn headroom(&self) -> Option<u64> {
+        let available = self.available_lamports.load(Ordering::Relaxed);
+        if available == u64::MAX {
+            return None;
+        }
+        let outstanding = self.outstanding_lamports.load(Ordering::Relaxed);
+        Some(available.saturating_sub(outstanding))
+    }
+
+    fn increase_outstanding(&self, amount: u64) {
+        self.outstanding_lamports
+            .fetch_add(amount, Ordering::Relaxed);
+    }
+
+    fn decrease_outstanding(&self, amount: u64) {
+        let _ = self.outstanding_lamports.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_sub(amount),
+        );
+    }
 }
 
 impl FlashLoanPlanner {
@@ -41,11 +102,15 @@ impl FlashLoanPlanner {
 
         let mut accounts: HashMap<String, FlashLoanAccounts> = HashMap::new();
         let mut accounts_by_mint: HashMap<Pubkey, FlashLoanAccounts> = HashMap::new();
+        let mut reserve_capacity: HashMap<Pubkey, ReserveCapacity> = HashMap::new();
         for (token, entry) in &config.flash_loans {
             let parsed = FlashLoanAccounts::try_from(entry)
                 .with_context(|| format!("invalid flash loan entry for token {token}"))?;
             accounts.insert(token.clone(), parsed.clone());
-            accounts_by_mint.insert(parsed.reserve_liquidity_mint, parsed);
+            accounts_by_mint.insert(parsed.reserve_liquidity_mint, parsed.clone());
+            reserve_capacity
+                .entry(parsed.reserve_liquidity_supply)
+                .or_insert_with(ReserveCapacity::new);
         }
 
         let mut route_keys: Vec<String> = accounts.keys().cloned().collect();
@@ -59,6 +124,7 @@ impl FlashLoanPlanner {
                 prepared_routes: AtomicU64::new(0),
                 outstanding_borrow_lamports: AtomicU64::new(0),
                 issued_plan_seq: AtomicU64::new(0),
+                reserve_capacity,
             }),
         })
     }
@@ -111,6 +177,14 @@ impl FlashLoanPlanner {
         self.state.accounts_by_mint.contains_key(mint)
     }
 
+    pub fn receiver_program_allowed(&self, mint: &Pubkey, program: &Pubkey) -> bool {
+        self.state
+            .accounts_by_mint
+            .get(mint)
+            .map(|accounts| accounts.allows_receiver_program(program))
+            .unwrap_or(false)
+    }
+
     pub fn release_route(&self, plan: &FlashLoanRoutePlan) {
         self.state
             .outstanding_borrow_lamports
@@ -118,6 +192,7 @@ impl FlashLoanPlanner {
                 current.checked_sub(plan.borrow_amount)
             })
             .ok();
+        self.release_reserve_allocation(&plan.accounts, plan.borrow_amount);
     }
 
     fn plan_with_accounts(
@@ -140,9 +215,11 @@ impl FlashLoanPlanner {
             .issued_plan_seq
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
+        self.ensure_reserve_capacity(&accounts, borrow_amount)?;
         self.state
             .outstanding_borrow_lamports
             .fetch_add(borrow_amount, Ordering::Relaxed);
+        self.track_reserve_allocation(&accounts, borrow_amount);
 
         Ok(FlashLoanRoutePlan {
             id: plan_id,
@@ -164,6 +241,72 @@ impl FlashLoanPlanner {
             ],
             accounts,
         })
+    }
+
+    pub fn refresh_reserve_liquidity<F>(&self, mut fetcher: F) -> Result<()>
+    where
+        F: FnMut(&Pubkey) -> Result<u64>,
+    {
+        let mut visited = HashSet::new();
+        for accounts in self.state.accounts.values() {
+            let supply = accounts.reserve_liquidity_supply;
+            if !visited.insert(supply) {
+                continue;
+            }
+            let amount = fetcher(&supply)?;
+            if let Some(capacity) = self.state.reserve_capacity.get(&supply) {
+                capacity.set_available(amount);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reserve_headroom_for_mint(&self, mint: &Pubkey) -> Option<u64> {
+        let accounts = self.state.accounts_by_mint.get(mint)?;
+        self.state
+            .reserve_capacity
+            .get(&accounts.reserve_liquidity_supply)
+            .and_then(|capacity| capacity.headroom())
+    }
+
+    fn ensure_reserve_capacity(
+        &self,
+        accounts: &FlashLoanAccounts,
+        borrow_amount: u64,
+    ) -> Result<()> {
+        if let Some(capacity) = self
+            .state
+            .reserve_capacity
+            .get(&accounts.reserve_liquidity_supply)
+        {
+            if let Some(headroom) = capacity.headroom() {
+                ensure!(
+                    borrow_amount <= headroom,
+                    "insufficient reserve liquidity: need {borrow_amount} lamports, headroom {headroom}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn track_reserve_allocation(&self, accounts: &FlashLoanAccounts, amount: u64) {
+        if let Some(capacity) = self
+            .state
+            .reserve_capacity
+            .get(&accounts.reserve_liquidity_supply)
+        {
+            capacity.increase_outstanding(amount);
+        }
+    }
+
+    fn release_reserve_allocation(&self, accounts: &FlashLoanAccounts, amount: u64) {
+        if let Some(capacity) = self
+            .state
+            .reserve_capacity
+            .get(&accounts.reserve_liquidity_supply)
+        {
+            capacity.decrease_outstanding(amount);
+        }
     }
 }
 
@@ -235,14 +378,32 @@ fn parse_pubkey(label: &str, value: &str) -> Result<Pubkey> {
 }
 
 fn parse_allowlist(entries: &[String]) -> Result<Vec<Pubkey>> {
-    let mut programs = Vec::with_capacity(entries.len());
+    let mut programs =
+        Vec::with_capacity(entries.len() + DEFAULT_FLASH_LOAN_ALLOWED_PROGRAMS.len());
+    let mut seen = HashSet::new();
     for value in entries {
-        programs.push(parse_pubkey(
-            "flash_loan.receiver_program_allowlist",
-            value,
-        )?);
+        let pk = parse_pubkey("flash_loan.receiver_program_allowlist", value)?;
+        if seen.insert(pk) {
+            programs.push(pk);
+        }
     }
+    for pk in DEFAULT_FLASH_LOAN_ALLOWED_PROGRAMS.iter() {
+        if seen.insert(*pk) {
+            programs.push(*pk);
+        }
+    }
+    ensure_required_receiver_programs(&mut programs);
     Ok(programs)
+}
+
+fn ensure_required_receiver_programs(programs: &mut Vec<Pubkey>) {
+    for required in REQUIRED_FLASH_LOAN_RECEIVER_PROGRAMS.iter() {
+        if programs.contains(required) {
+            continue;
+        }
+        warn!(program = %required, "flash-loan receiver allowlist missing required program; auto-inserting");
+        programs.push(*required);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -349,6 +510,7 @@ impl FlashLoanAccounts {
 mod tests {
     use super::*;
     use serde_json::json;
+    use solend::{FLASH_BORROW_OPCODE, FLASH_REPAY_OPCODE};
 
     fn test_config() -> Arc<AppConfig> {
         test_config_with_allowlist(Vec::new())
@@ -408,6 +570,34 @@ mod tests {
                 serde_json::Value::Array(programs.into_iter().map(|p| json!(p)).collect());
         }
         Arc::new(serde_json::from_value(raw).expect("app config"))
+    }
+
+    #[test]
+    fn default_receiver_allowlist_permits_lb_clmm() {
+        let planner = FlashLoanPlanner::new(test_config_with_allowlist(vec![
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        ]))
+        .expect("planner");
+        let plan = planner.plan_route("SOL", 1_000).expect("plan");
+        let lb_program = Pubkey::from_str(LB_CLMM_PROGRAM_ID).expect("lb program");
+        assert!(plan.allows_receiver_program(&lb_program));
+    }
+
+    #[test]
+    fn default_receiver_allowlist_permits_whirlpool() {
+        let planner = FlashLoanPlanner::new(test_config_with_allowlist(vec![])).expect("planner");
+        let plan = planner.plan_route("SOL", 1_000).expect("plan");
+        let whirlpool_program = Pubkey::from_str(WHIRLPOOL_PROGRAM_ID).expect("whirlpool program");
+        assert!(plan.allows_receiver_program(&whirlpool_program));
+    }
+
+    #[test]
+    fn custom_allowlist_without_whirlpool_gets_required_programs() {
+        let planner = FlashLoanPlanner::new(test_config_with_allowlist(vec![LB_CLMM_PROGRAM_ID]))
+            .expect("planner");
+        let plan = planner.plan_route("SOL", 1_000).expect("plan");
+        let whirlpool_program = Pubkey::from_str(WHIRLPOOL_PROGRAM_ID).expect("whirlpool program");
+        assert!(plan.allows_receiver_program(&whirlpool_program));
     }
 
     #[test]

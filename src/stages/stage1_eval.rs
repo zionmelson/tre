@@ -7,7 +7,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, warn};
 
@@ -36,12 +37,23 @@ const MAX_CLOSING_PATHS: usize = 2;
 const PATH_PROFILE_LOG_INTERVAL_SECS: u64 = 10;
 const OVERFLOW_QUEUE_CAPACITY: usize = 256;
 const MAX_DEFERRED_TRADES_PER_POOL: usize = 64;
+const RESERVE_HYDRATE_TIMEOUT_SECS: u64 = 8;
+const RESERVE_HYDRATE_INTERVAL_SECS: u64 = 15;
+const READINESS_RETRY_DELAY_MS: u64 = 50;
+const MAX_PENDING_READINESS_TRADES: usize = 512;
+const MAX_READINESS_RETRIES: u32 = 24;
 
 struct PathSearchProfile {
     total_duration: Duration,
     max_duration: Duration,
     sample_count: u64,
     last_log: Instant,
+}
+
+struct PendingReadinessTrade {
+    trade: TradeUpdate,
+    attempt: u32,
+    ready_at: Instant,
 }
 
 impl PathSearchProfile {
@@ -159,11 +171,17 @@ fn run(
         }
     }
     builder.flash_loan_planner().prepare_default_routes();
+    if !hydrate_flash_loan_reserves(&builder, config.as_ref()) {
+        warn!("initial flash-loan reserve hydration failed");
+    }
+    let reserve_hydrator = spawn_reserve_hydrator(stop.clone(), builder.clone(), config.clone());
 
     let mut pool_snapshots: HashMap<String, PoolSnapshot> = HashMap::new();
     let mut pending_trades: HashMap<String, VecDeque<TradeUpdate>> = HashMap::new();
     let mut overflow_queue: VecDeque<BundleCandidate> =
         VecDeque::with_capacity(OVERFLOW_QUEUE_CAPACITY);
+    let mut pending_readiness: VecDeque<PendingReadinessTrade> =
+        VecDeque::with_capacity(MAX_PENDING_READINESS_TRADES);
     let mut path_profile = PathSearchProfile::new();
     let mut opportunity_seq = 0u64;
     let adapters = AdapterBook::new(config, builder.clone());
@@ -182,6 +200,7 @@ fn run(
                               bundle_pool: &SlabPool<BundleCandidate>,
                               producer: &RingProducer<Lease<BundleCandidate>>,
                               overflow_queue: &mut VecDeque<BundleCandidate>,
+                              pending_readiness: &mut VecDeque<PendingReadinessTrade>,
                               opportunity_seq: &mut u64| {
         adapters.ingest(&update);
         let mut snapshot = update.into_snapshot();
@@ -226,6 +245,10 @@ fn run(
                         enqueue_pending_trade(pending_trades, trade);
                         break;
                     }
+                    TradeProcessResult::PendingReadiness(trade) => {
+                        schedule_readiness_retry(pending_readiness, trade, 0);
+                        break;
+                    }
                 }
             }
             if !queue.is_empty() {
@@ -240,6 +263,23 @@ fn run(
         let mut made_progress = false;
 
         if flush_overflow_queue(&mut overflow_queue, &bundle_pool, &producer) {
+            made_progress = true;
+        }
+        if flush_pending_readiness_queue(
+            &mut pending_readiness,
+            &mut path_profile,
+            &mut graph_manager,
+            &pool_snapshots,
+            &mut pending_trades,
+            &adapters,
+            &builder,
+            strategy.as_ref(),
+            notifier.as_ref(),
+            &bundle_pool,
+            &producer,
+            &mut overflow_queue,
+            &mut opportunity_seq,
+        ) {
             made_progress = true;
         }
 
@@ -259,6 +299,7 @@ fn run(
                     &bundle_pool,
                     &producer,
                     &mut overflow_queue,
+                    &mut pending_readiness,
                     &mut opportunity_seq,
                 );
                 made_progress = true;
@@ -280,6 +321,7 @@ fn run(
                     &bundle_pool,
                     &producer,
                     &mut overflow_queue,
+                    &mut pending_readiness,
                     &mut opportunity_seq,
                 );
                 drained_count += 1;
@@ -319,6 +361,9 @@ fn run(
                         telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::MissingSnapshot);
                         enqueue_pending_trade(&mut pending_trades, trade);
                     }
+                    TradeProcessResult::PendingReadiness(trade) => {
+                        schedule_readiness_retry(&mut pending_readiness, trade, 0);
+                    }
                 }
 
                 made_progress = true;
@@ -334,6 +379,11 @@ fn run(
     }
 
     info!("stage1 eval shutting down");
+    if let Some(handle) = reserve_hydrator {
+        if let Err(err) = handle.join() {
+            warn!(error = ?err, "flash-reserve hydrator thread panicked");
+        }
+    }
     Ok(())
 }
 
@@ -413,6 +463,233 @@ fn enqueue_pending_trade(pending: &mut HashMap<String, VecDeque<TradeUpdate>>, t
 enum TradeProcessResult {
     Processed,
     MissingSnapshot(TradeUpdate),
+    PendingReadiness(TradeUpdate),
+}
+
+fn hydrate_flash_loan_reserves(builder: &BuilderHandle, config: &AppConfig) -> bool {
+    if config.quicknode_rpcs.is_empty() {
+        warn!("no RPC endpoint configured for flash-loan reserve hydration");
+        return false;
+    }
+
+    for endpoint in &config.quicknode_rpcs {
+        let client = RpcClient::new_with_timeout(
+            endpoint.clone(),
+            Duration::from_secs(RESERVE_HYDRATE_TIMEOUT_SECS),
+        );
+        match builder
+            .flash_loan_planner()
+            .refresh_reserve_liquidity(|supply| {
+                let balance = client
+                    .get_token_account_balance(supply)
+                    .with_context(|| format!("failed to fetch reserve liquidity for {supply}"))?;
+                let raw = balance
+                    .amount
+                    .parse::<u128>()
+                    .with_context(|| format!("invalid token amount for {supply}"))?;
+                Ok(raw.min(u64::MAX as u128) as u64)
+            }) {
+            Ok(()) => {
+                return true;
+            }
+            Err(err) => {
+                warn!(
+                    endpoint = endpoint.as_str(),
+                    error = ?err,
+                    "failed to hydrate flash-loan reserve liquidity"
+                );
+            }
+        }
+    }
+
+    warn!("exhausted all RPC endpoints while hydrating flash-loan reserves");
+    false
+}
+
+fn desired_route_input_amount(
+    trade: &TradeUpdate,
+    builder: &BuilderHandle,
+    strategy: &StrategyEngine,
+) -> Option<u64> {
+    let mut desired = trade.sell_amount;
+    if let Some(budget) = strategy.flash_trade_budget(&trade.sell_mint) {
+        desired = desired.max(budget.trade_input_lamports);
+    }
+    if desired == 0 {
+        return None;
+    }
+
+    let mint = match Pubkey::from_str(&trade.sell_mint) {
+        Ok(pk) => pk,
+        Err(err) => {
+            debug!(
+                sell_mint = %trade.sell_mint,
+                error = %err,
+                "unable to parse sell mint for flash-loan sizing; using trade amount"
+            );
+            return Some(desired);
+        }
+    };
+
+    let planner = builder.flash_loan_planner();
+    if !planner.supports_mint(&mint) {
+        return Some(desired);
+    }
+
+    if let Some(headroom) = planner.reserve_headroom_for_mint(&mint) {
+        if headroom == 0 {
+            return None;
+        }
+        let tip_buffer = strategy.tip_buffer_hint(&trade.sell_mint);
+        if headroom <= tip_buffer {
+            debug!(
+                sell_mint = %trade.sell_mint,
+                headroom,
+                tip_buffer,
+                "reserve headroom exhausted after accounting for max tip buffer"
+            );
+            return None;
+        }
+        let capped = headroom.saturating_sub(tip_buffer);
+        if desired > capped {
+            debug!(
+                sell_mint = %trade.sell_mint,
+                desired,
+                capped,
+                tip_buffer,
+                headroom,
+                "clamping trade input to reserve headroom",
+            );
+            desired = capped;
+        }
+    }
+
+    if desired == 0 {
+        None
+    } else {
+        Some(desired)
+    }
+}
+
+fn readiness_retry_delay(attempt: u32) -> Duration {
+    let base = READINESS_RETRY_DELAY_MS.max(1);
+    let shift = attempt.saturating_sub(1).min(4);
+    Duration::from_millis(base * (1u64 << shift))
+}
+
+fn schedule_readiness_retry(
+    queue: &mut VecDeque<PendingReadinessTrade>,
+    trade: TradeUpdate,
+    attempt: u32,
+) {
+    if attempt >= MAX_READINESS_RETRIES {
+        warn!(
+            pool = %trade.pool_id,
+            sell_mint = %trade.sell_mint,
+            attempt,
+            "dropping trade after exhausting template readiness retries"
+        );
+        return;
+    }
+    if queue.len() >= MAX_PENDING_READINESS_TRADES {
+        warn!(
+            pool = %trade.pool_id,
+            sell_mint = %trade.sell_mint,
+            "pending readiness queue full; dropping trade"
+        );
+        telemetry::record_stage1_backpressure(Stage1BackpressureEvent::RingFull);
+        return;
+    }
+
+    let next_attempt = attempt.saturating_add(1);
+    let ready_at = Instant::now() + readiness_retry_delay(next_attempt);
+    queue.push_back(PendingReadinessTrade {
+        trade,
+        attempt: next_attempt,
+        ready_at,
+    });
+}
+
+fn flush_pending_readiness_queue(
+    queue: &mut VecDeque<PendingReadinessTrade>,
+    path_profile: &mut PathSearchProfile,
+    graph_manager: &mut GraphManager,
+    pool_snapshots: &HashMap<String, PoolSnapshot>,
+    pending_trades: &mut HashMap<String, VecDeque<TradeUpdate>>,
+    adapters: &AdapterBook,
+    builder: &BuilderHandle,
+    strategy: &StrategyEngine,
+    notifier: &Notifier,
+    bundle_pool: &SlabPool<BundleCandidate>,
+    producer: &RingProducer<Lease<BundleCandidate>>,
+    overflow_queue: &mut VecDeque<BundleCandidate>,
+    opportunity_seq: &mut u64,
+) -> bool {
+    let mut made_progress = false;
+    while let Some(pending) = queue.front() {
+        if pending.ready_at > Instant::now() {
+            break;
+        }
+        let pending = queue.pop_front().expect("pending readiness entry");
+        let snapshot = pool_snapshots.get(&pending.trade.pool_id).cloned();
+        match process_trade_update(
+            pending.trade,
+            snapshot,
+            path_profile,
+            graph_manager,
+            pool_snapshots,
+            adapters,
+            builder,
+            strategy,
+            notifier,
+            bundle_pool,
+            producer,
+            overflow_queue,
+            opportunity_seq,
+        ) {
+            TradeProcessResult::Processed => made_progress = true,
+            TradeProcessResult::MissingSnapshot(trade) => {
+                telemetry::record_stage1_feed_gap(Stage1FeedGapEvent::MissingSnapshot);
+                enqueue_pending_trade(pending_trades, trade);
+            }
+            TradeProcessResult::PendingReadiness(trade) => {
+                schedule_readiness_retry(queue, trade, pending.attempt);
+            }
+        }
+    }
+    made_progress
+}
+
+fn spawn_reserve_hydrator(
+    stop: Arc<AtomicBool>,
+    builder: BuilderHandle,
+    config: Arc<AppConfig>,
+) -> Option<thread::JoinHandle<()>> {
+    if config.flash_loans.is_empty() || config.quicknode_rpcs.is_empty() {
+        return None;
+    }
+    let interval = Duration::from_secs(RESERVE_HYDRATE_INTERVAL_SECS.max(1));
+    thread::Builder::new()
+        .name("flash_reserve_hydrator".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let loop_start = Instant::now();
+                let success = hydrate_flash_loan_reserves(&builder, config.as_ref());
+                if !success {
+                    thread::sleep(Duration::from_secs(RESERVE_HYDRATE_TIMEOUT_SECS));
+                    continue;
+                }
+                let elapsed = loop_start.elapsed();
+                if elapsed < interval {
+                    thread::sleep(interval - elapsed);
+                }
+            }
+        })
+        .map_err(|err| {
+            warn!(error = %err, "failed to spawn flash-reserve hydrator thread");
+            err
+        })
+        .ok()
 }
 
 fn process_trade_update(
@@ -451,6 +728,20 @@ fn process_trade_update(
     path_profile.maybe_log(candidate_paths.len());
     telemetry::record_path_search(path_search_elapsed, candidate_paths.len());
 
+    let planned_input_amount =
+        desired_route_input_amount(&trade, builder, strategy).unwrap_or(trade.sell_amount);
+    if planned_input_amount == 0 {
+        return TradeProcessResult::Processed;
+    }
+    if planned_input_amount != trade.sell_amount {
+        debug!(
+            sell_mint = %trade.sell_mint,
+            observed_amount = trade.sell_amount,
+            planned_amount = planned_input_amount,
+            "overriding trade input amount for flash-loan sizing",
+        );
+    }
+
     if let Some(best_path) = candidate_paths.first() {
         let direct_pools = graph_manager.pools_for_pair(&trade.sell_mint, &trade.buy_mint);
         let best_ratio = graph_manager.path_price_ratio(best_path);
@@ -468,13 +759,17 @@ fn process_trade_update(
     let mut selected_route: Option<RoutePlan> = None;
     let mut fallback_route: Option<(RoutePlan, usize, usize)> = None;
 
-    if trade.sell_amount > 0 {
+    if planned_input_amount > 0 {
         for path in &candidate_paths {
-            let mut plan = match build_route_plan(path, pool_snapshots, trade.sell_amount) {
+            let mut plan = match build_route_plan(path, pool_snapshots, planned_input_amount) {
                 Some(plan) => plan,
                 None => continue,
             };
             annotate_route_leg_readiness(builder, &mut plan);
+            plan.flash_loan_permitted = route_allows_flash_loans(&plan, builder);
+            if !plan.flash_loan_permitted {
+                continue;
+            }
             if route_plan_serializable(&plan) {
                 selected_route = Some(plan);
                 break;
@@ -493,13 +788,27 @@ fn process_trade_update(
         }
     }
 
-    if selected_route.is_none() {
-        selected_route = fallback_route.map(|(plan, _, _)| plan);
-    }
+    let selected_route = match selected_route {
+        Some(plan) => plan,
+        None => {
+            if let Some((_, ready_legs, total_legs)) = fallback_route {
+                debug!(
+                    sell_mint = %trade.sell_mint,
+                    buy_mint = %trade.buy_mint,
+                    ready_legs,
+                    total_legs,
+                    "deferring trade until templates/ALTs are ready"
+                );
+                return TradeProcessResult::PendingReadiness(trade);
+            } else {
+                return TradeProcessResult::Processed;
+            }
+        }
+    };
 
     let mut opportunity =
         Opportunity::from_trade(*opportunity_seq, trade, Some(snapshot), quote_edge);
-    opportunity.route_plan = selected_route;
+    opportunity.route_plan = Some(selected_route);
     *opportunity_seq = opportunity_seq.wrapping_add(1);
 
     if let Some(candidate) = strategy.evaluate(&opportunity) {
@@ -548,13 +857,99 @@ fn annotate_route_leg_readiness(builder: &BuilderHandle, plan: &mut RoutePlan) {
             leg.alt_ready = status.alt_ready;
             leg.context.template_ready = status.template_ready;
             leg.context.alt_ready = status.alt_ready;
+            if !(status.template_ready && status.alt_ready) {
+                debug!(
+                    pool = %leg.pool_id,
+                    direction = ?leg.direction,
+                    template_ready = status.template_ready,
+                    alt_ready = status.alt_ready,
+                    "route leg blocked waiting on template hydration or ALT",
+                );
+            }
         } else {
             leg.template_ready = false;
             leg.alt_ready = false;
             leg.context.template_ready = false;
             leg.context.alt_ready = false;
+            debug!(
+                pool = %leg.pool_id,
+                direction = ?leg.direction,
+                "route leg missing template metadata"
+            );
         }
     }
+}
+
+fn route_allows_flash_loans(plan: &RoutePlan, builder: &BuilderHandle) -> bool {
+    if plan.legs.is_empty() {
+        return false;
+    }
+    if plan.start_mint != plan.end_mint {
+        debug!(
+            start_mint = %plan.start_mint,
+            end_mint = %plan.end_mint,
+            "route start/end mint mismatch; cannot run flash loan",
+        );
+        return false;
+    }
+    let first_leg = &plan.legs[0];
+    if first_leg.input_amount == 0 {
+        debug!(
+            pool = %first_leg.pool_id,
+            "first leg input amount is zero; cannot size flash borrow",
+        );
+        return false;
+    }
+    if first_leg.input_mint != plan.start_mint {
+        debug!(
+            start_mint = %plan.start_mint,
+            input_mint = %first_leg.input_mint,
+            "route first leg input mint does not match borrow mint",
+        );
+        return false;
+    }
+
+    let start_mint = match Pubkey::from_str(&plan.start_mint) {
+        Ok(pk) => pk,
+        Err(err) => {
+            debug!(
+                start_mint = %plan.start_mint,
+                error = %err,
+                "unable to parse route start mint for flash-loan check",
+            );
+            return false;
+        }
+    };
+    let receiver_program = match Pubkey::from_str(&first_leg.program_id) {
+        Ok(pk) => pk,
+        Err(err) => {
+            debug!(
+                program_id = %first_leg.program_id,
+                error = %err,
+                "unable to parse receiver program for flash-loan check",
+            );
+            return false;
+        }
+    };
+
+    let planner = builder.flash_loan_planner();
+    if !planner.supports_mint(&start_mint) {
+        debug!(
+            start_mint = %plan.start_mint,
+            "flash-loan planner does not support route mint",
+        );
+        return false;
+    }
+    if !planner.receiver_program_allowed(&start_mint, &receiver_program) {
+        debug!(
+            start_mint = %plan.start_mint,
+            program_id = %first_leg.program_id,
+            "flash-loan mint does not permit receiver program",
+        );
+        return false;
+    }
+
+    true
 }
 
 fn readiness_for_leg(builder: &BuilderHandle, leg: &RouteLegPlan) -> Option<TemplateReadiness> {
@@ -563,8 +958,7 @@ fn readiness_for_leg(builder: &BuilderHandle, leg: &RouteLegPlan) -> Option<Temp
         PoolQuoteDirection::BaseToQuote => SwapTemplateDirection::BaseIn,
         PoolQuoteDirection::QuoteToBase => SwapTemplateDirection::BaseOut,
     };
-    let fee_bps = leg.fee_bps.min(u16::MAX as u64) as u16;
-    Some(builder.template_readiness(&pool, direction, fee_bps))
+    Some(builder.template_readiness(&pool, direction))
 }
 
 fn route_plan_serializable(plan: &RoutePlan) -> bool {
@@ -630,6 +1024,7 @@ fn build_route_plan(
             effective_price: quote.price(),
             fee_bps: quote.fee_bps,
             estimated_slippage_bps: quote.slippage_bps(),
+            template_fee_bps: quote.template_fee_bps,
             direction,
             sqrt_price_limit: quote.sqrt_price_limit,
             min_output_amount,
@@ -646,6 +1041,7 @@ fn build_route_plan(
         end_mint: path.end_mint.clone(),
         legs,
         estimated_final_output_amount: Some(running_amount),
+        flash_loan_permitted: false,
     })
 }
 
@@ -762,6 +1158,7 @@ mod tests {
             notional: 100,
             expected_output: (100.0 * price) as u64,
             fee_bps: 30,
+            template_fee_bps: 30,
             effective_price: price,
             estimated_slippage_bps: 5.0,
             sqrt_price_limit: None,

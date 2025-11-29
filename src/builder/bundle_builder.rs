@@ -10,17 +10,22 @@ use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::message::{v0::Message, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::pubkey::Pubkey;
 
-use crate::builder::templates::SwapTemplateDirection;
+use crate::builder::templates::{AccountSpec, SwapMintRole, SwapTemplateDirection};
 use crate::template::TemplateContext;
 
 use super::{
-    AmmV3Field, CpAmmField, InstructionTemplate, LbClmmField, LifinityField, TemplateCache,
-    TemplateCacheKey, TemplateFieldKind, TemplatePatch, WhirlpoolField,
+    AmmV3Field, AmmV3PoolAccounts, CpAmmField, CpAmmPoolAccounts, InstructionTemplate, LbClmmField,
+    LifinityField, LifinityPoolAccounts, TemplateCache, TemplateCacheKey, TemplateFieldKind,
+    TemplateMetadata, TemplatePatch, WhirlpoolField, WhirlpoolPoolAccounts,
 };
 
 static CP_AMM_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG")
         .expect("static cp_amm program id")
+});
+static COMPUTE_BUDGET_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str("ComputeBudget111111111111111111111111111111")
+        .expect("static compute budget program id")
 });
 static LB_CLMM_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo")
@@ -32,6 +37,14 @@ static MEMO_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
 static JITO_DONT_FRONT_ACCOUNT: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str("jitodontfront111111111111111111111111111111")
         .expect("static jitodontfront pubkey")
+});
+static ASSOCIATED_TOKEN_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str("ATokenGPvR93dthLvYbAphit9L8ZsfsZp7r4HQJDebg")
+        .expect("static associated token program id")
+});
+static SPL_TOKEN_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        .expect("static spl token program id")
 });
 
 const CP_AMM_HOST_FEE_INDEX: usize = 11;
@@ -47,6 +60,7 @@ pub struct BundleInstructionPlan {
     pub amount_in: u64,
     pub expected_output_amount: u64,
     pub fee_bps: u16,
+    pub template_fee_bps: u16,
     pub direction: SwapTemplateDirection,
     pub sqrt_price_limit: Option<u128>,
     pub min_output_amount: Option<u64>,
@@ -91,8 +105,14 @@ pub fn build_bundle(
     let mut instructions = Vec::with_capacity(
         prefix_instructions.len() + suffix_instructions.len() + plans.len().saturating_mul(2) + 1,
     );
-    if let Some(limit) = required_compute_unit_limit(plans) {
-        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(limit));
+    let prefix_includes_compute_budget = prefix_instructions
+        .first()
+        .map(|ix| ix.program_id == *COMPUTE_BUDGET_PROGRAM_ID)
+        .unwrap_or(false);
+    if !prefix_includes_compute_budget {
+        if let Some(limit) = required_compute_unit_limit(plans) {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(limit));
+        }
     }
     instructions.extend_from_slice(prefix_instructions);
     for plan in plans {
@@ -121,7 +141,7 @@ fn resolve_template(
 ) -> Result<Arc<InstructionTemplate>> {
     let pool = Pubkey::from_str(&plan.pool_id)
         .with_context(|| format!("invalid pool id {}", plan.pool_id))?;
-    let key = TemplateCacheKey::new(pool, plan.direction, plan.fee_bps);
+    let key = TemplateCacheKey::new(pool, plan.direction);
     cache.get(&key).with_context(|| {
         format!(
             "missing template for pool {} direction {:?}",
@@ -141,6 +161,7 @@ fn hydrate_instruction(
     }
 
     let mut accounts = template.accounts.as_ref().to_vec();
+    hydrate_template_accounts(plan, template, payer, &mut accounts)?;
     apply_template_context(plan, template, &mut accounts)?;
     rewrite_placeholder_signers(plan, &mut accounts, payer);
 
@@ -149,6 +170,472 @@ fn hydrate_instruction(
         accounts,
         data,
     })
+}
+
+fn hydrate_template_accounts(
+    plan: &BundleInstructionPlan,
+    template: &InstructionTemplate,
+    payer: Pubkey,
+    accounts: &mut [AccountMeta],
+) -> Result<()> {
+    match &template.metadata {
+        TemplateMetadata::None => Ok(()),
+        TemplateMetadata::AmmV3 {
+            account_specs,
+            pool_accounts,
+        } => {
+            let pool_accounts = pool_accounts.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "template for pool {} missing Raydium account metadata",
+                    plan.pool_id
+                )
+            })?;
+            hydrate_amm_v3_accounts(
+                plan,
+                template,
+                payer,
+                account_specs,
+                pool_accounts,
+                accounts,
+            )
+        }
+        TemplateMetadata::CpAmm {
+            account_specs,
+            pool_accounts,
+        } => {
+            let pool_accounts = pool_accounts.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "template for pool {} missing cp_amm account metadata",
+                    plan.pool_id
+                )
+            })?;
+            hydrate_cp_amm_accounts(
+                plan,
+                template,
+                payer,
+                account_specs,
+                pool_accounts,
+                accounts,
+            )
+        }
+        TemplateMetadata::Lifinity {
+            account_specs,
+            pool_accounts,
+        } => {
+            let pool_accounts = pool_accounts.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "template for pool {} missing Lifinity account metadata",
+                    plan.pool_id
+                )
+            })?;
+            hydrate_lifinity_accounts(
+                plan,
+                template,
+                payer,
+                account_specs,
+                pool_accounts,
+                accounts,
+            )
+        }
+        TemplateMetadata::Whirlpool {
+            account_specs,
+            pool_accounts,
+        } => {
+            let pool_accounts = pool_accounts.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "template for pool {} missing Whirlpool account metadata",
+                    plan.pool_id
+                )
+            })?;
+            hydrate_whirlpool_accounts(
+                plan,
+                template,
+                payer,
+                account_specs,
+                pool_accounts,
+                accounts,
+            )
+        }
+    }
+}
+
+fn hydrate_amm_v3_accounts(
+    plan: &BundleInstructionPlan,
+    template: &InstructionTemplate,
+    default_payer: Pubkey,
+    specs: &[AccountSpec],
+    pool_accounts: &AmmV3PoolAccounts,
+    accounts: &mut [AccountMeta],
+) -> Result<()> {
+    if specs.len() != accounts.len() {
+        bail!(
+            "template account/spec length mismatch ({} != {})",
+            accounts.len(),
+            specs.len()
+        );
+    }
+
+    let authority = plan.context.payer.unwrap_or(default_payer);
+    let mint0_ata = derive_associated_token_address(&authority, &pool_accounts.mint0);
+    let mint1_ata = derive_associated_token_address(&authority, &pool_accounts.mint1);
+    let context_input_account = plan.context.input_token_account;
+    let context_output_account = plan.context.output_token_account;
+
+    for (index, (meta, spec)) in accounts.iter_mut().zip(specs.iter()).enumerate() {
+        if spec.address.is_some() {
+            continue;
+        }
+
+        match spec.name {
+            "payer" => {
+                meta.pubkey = authority;
+            }
+            "amm_config" => {
+                meta.pubkey = pool_accounts.amm_config;
+            }
+            "pool_state" => {
+                meta.pubkey = template.key.pool_id;
+            }
+            "observation_state" => {
+                meta.pubkey = pool_accounts.observation_state;
+            }
+            "input_token_account" => {
+                let role = spec.mint_role.ok_or_else(|| {
+                    anyhow!(
+                        "amm_v3 account {} missing mint role metadata (index {})",
+                        spec.name,
+                        index
+                    )
+                })?;
+                meta.pubkey = context_input_account.unwrap_or(match role {
+                    SwapMintRole::Mint0 => mint0_ata,
+                    SwapMintRole::Mint1 => mint1_ata,
+                });
+            }
+            "output_token_account" => {
+                let role = spec.mint_role.ok_or_else(|| {
+                    anyhow!(
+                        "amm_v3 account {} missing mint role metadata (index {})",
+                        spec.name,
+                        index
+                    )
+                })?;
+                meta.pubkey = context_output_account.unwrap_or(match role {
+                    SwapMintRole::Mint0 => mint0_ata,
+                    SwapMintRole::Mint1 => mint1_ata,
+                });
+            }
+            "input_vault" | "output_vault" => {
+                let role = spec.mint_role.ok_or_else(|| {
+                    anyhow!(
+                        "amm_v3 account {} missing mint role metadata (index {})",
+                        spec.name,
+                        index
+                    )
+                })?;
+                meta.pubkey = pool_accounts.vault_for_role(role);
+            }
+            "input_vault_mint" | "output_vault_mint" => {
+                let role = spec.mint_role.ok_or_else(|| {
+                    anyhow!(
+                        "amm_v3 account {} missing mint role metadata (index {})",
+                        spec.name,
+                        index
+                    )
+                })?;
+                meta.pubkey = pool_accounts.mint_for_role(role);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn hydrate_cp_amm_accounts(
+    plan: &BundleInstructionPlan,
+    template: &InstructionTemplate,
+    default_payer: Pubkey,
+    specs: &[AccountSpec],
+    pool_accounts: &CpAmmPoolAccounts,
+    accounts: &mut [AccountMeta],
+) -> Result<()> {
+    if specs.len() != accounts.len() {
+        bail!(
+            "template account/spec length mismatch ({} != {})",
+            accounts.len(),
+            specs.len()
+        );
+    }
+
+    let authority = plan.context.payer.unwrap_or(default_payer);
+    let input_account = plan.context.input_token_account.unwrap_or_else(|| {
+        derive_associated_token_address(&authority, &pool_accounts.token_a_mint)
+    });
+    let output_account = plan.context.output_token_account.unwrap_or_else(|| {
+        derive_associated_token_address(&authority, &pool_accounts.token_b_mint)
+    });
+    let host_fee_account = plan
+        .context
+        .host_fee_account
+        .or(pool_accounts.referral_token_account);
+
+    for (meta, spec) in accounts.iter_mut().zip(specs.iter()) {
+        if spec.address.is_some() {
+            continue;
+        }
+
+        match spec.name {
+            "pool" => {
+                meta.pubkey = template.key.pool_id;
+            }
+            "payer" => {
+                meta.pubkey = authority;
+            }
+            "input_token_account" | "token_a_account" | "user_token_in" => {
+                meta.pubkey = input_account;
+            }
+            "output_token_account" | "token_b_account" | "user_token_out" => {
+                meta.pubkey = output_account;
+            }
+            "referral_token_account" | "host_fee_in" => {
+                if let Some(pk) = host_fee_account {
+                    meta.pubkey = pk;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn hydrate_lifinity_accounts(
+    plan: &BundleInstructionPlan,
+    template: &InstructionTemplate,
+    default_payer: Pubkey,
+    specs: &[AccountSpec],
+    pool_accounts: &LifinityPoolAccounts,
+    accounts: &mut [AccountMeta],
+) -> Result<()> {
+    if specs.len() != accounts.len() {
+        bail!(
+            "template account/spec length mismatch ({} != {})",
+            accounts.len(),
+            specs.len()
+        );
+    }
+
+    let user_authority = plan.context.payer.unwrap_or(default_payer);
+    let pool_authority = pool_accounts
+        .authority
+        .ok_or_else(|| anyhow!("template for pool {} missing authority", plan.pool_id))?;
+    let token_program = pool_accounts
+        .token_program
+        .ok_or_else(|| anyhow!("template for pool {} missing token program", plan.pool_id))?;
+    let pool_mint = pool_accounts
+        .pool_mint
+        .ok_or_else(|| anyhow!("template for pool {} missing pool mint", plan.pool_id))?;
+    let fee_account = pool_accounts
+        .fee_account
+        .ok_or_else(|| anyhow!("template for pool {} missing fee account", plan.pool_id))?;
+    let oracle_main = pool_accounts
+        .oracle_main
+        .ok_or_else(|| anyhow!("template for pool {} missing oracle_main", plan.pool_id))?;
+    let oracle_sub = pool_accounts
+        .oracle_sub
+        .ok_or_else(|| anyhow!("template for pool {} missing oracle_sub", plan.pool_id))?;
+    let oracle_pc = pool_accounts
+        .oracle_pc
+        .ok_or_else(|| anyhow!("template for pool {} missing oracle_pc", plan.pool_id))?;
+
+    let (input_mint, output_mint, swap_source, swap_destination) = match plan.direction {
+        SwapTemplateDirection::BaseIn => {
+            let source = pool_accounts.token_a_vault.ok_or_else(|| {
+                anyhow!("template for pool {} missing token_a_vault", plan.pool_id)
+            })?;
+            let dest = pool_accounts.token_b_vault.ok_or_else(|| {
+                anyhow!("template for pool {} missing token_b_vault", plan.pool_id)
+            })?;
+            (
+                pool_accounts.base_mint,
+                pool_accounts.quote_mint,
+                source,
+                dest,
+            )
+        }
+        SwapTemplateDirection::BaseOut => {
+            let source = pool_accounts.token_b_vault.ok_or_else(|| {
+                anyhow!("template for pool {} missing token_b_vault", plan.pool_id)
+            })?;
+            let dest = pool_accounts.token_a_vault.ok_or_else(|| {
+                anyhow!("template for pool {} missing token_a_vault", plan.pool_id)
+            })?;
+            (
+                pool_accounts.quote_mint,
+                pool_accounts.base_mint,
+                source,
+                dest,
+            )
+        }
+    };
+
+    let user_input_account = plan
+        .context
+        .input_token_account
+        .unwrap_or_else(|| derive_associated_token_address(&user_authority, &input_mint));
+    let user_output_account = plan
+        .context
+        .output_token_account
+        .unwrap_or_else(|| derive_associated_token_address(&user_authority, &output_mint));
+
+    for (meta, spec) in accounts.iter_mut().zip(specs.iter()) {
+        if spec.address.is_some() {
+            continue;
+        }
+
+        match spec.name {
+            "authority" => meta.pubkey = pool_authority,
+            "amm" => meta.pubkey = template.key.pool_id,
+            "userTransferAuthority" => meta.pubkey = user_authority,
+            "sourceInfo" => meta.pubkey = user_input_account,
+            "destinationInfo" => meta.pubkey = user_output_account,
+            "swapSource" => meta.pubkey = swap_source,
+            "swapDestination" => meta.pubkey = swap_destination,
+            "poolMint" => meta.pubkey = pool_mint,
+            "feeAccount" => meta.pubkey = fee_account,
+            "tokenProgram" => meta.pubkey = token_program,
+            "oracleMainAccount" => meta.pubkey = oracle_main,
+            "oracleSubAccount" => meta.pubkey = oracle_sub,
+            "oraclePcAccount" => meta.pubkey = oracle_pc,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn hydrate_whirlpool_accounts(
+    plan: &BundleInstructionPlan,
+    template: &InstructionTemplate,
+    default_payer: Pubkey,
+    specs: &[AccountSpec],
+    pool_accounts: &WhirlpoolPoolAccounts,
+    accounts: &mut [AccountMeta],
+) -> Result<()> {
+    if specs.len() != accounts.len() {
+        bail!(
+            "template account/spec length mismatch ({} != {})",
+            accounts.len(),
+            specs.len()
+        );
+    }
+
+    let authority = plan.context.payer.unwrap_or(default_payer);
+    let input_mint = Pubkey::from_str(&plan.input_mint)
+        .with_context(|| format!("invalid input mint {}", plan.input_mint))?;
+    let output_mint = Pubkey::from_str(&plan.output_mint)
+        .with_context(|| format!("invalid output mint {}", plan.output_mint))?;
+
+    let ata_for = |mint: &Pubkey| derive_associated_token_address(&authority, mint);
+    let owner_account_for_mint = |mint: &Pubkey| -> Pubkey {
+        if *mint == input_mint {
+            plan.context
+                .input_token_account
+                .unwrap_or_else(|| ata_for(mint))
+        } else if *mint == output_mint {
+            plan.context
+                .output_token_account
+                .unwrap_or_else(|| ata_for(mint))
+        } else {
+            ata_for(mint)
+        }
+    };
+
+    let owner_account_a = owner_account_for_mint(&pool_accounts.token_mint_a);
+    let owner_account_b = owner_account_for_mint(&pool_accounts.token_mint_b);
+    let vault_a = pool_accounts
+        .token_vault_a
+        .ok_or_else(|| anyhow!("template for pool {} missing token_vault_a", plan.pool_id))?;
+    let vault_b = pool_accounts
+        .token_vault_b
+        .ok_or_else(|| anyhow!("template for pool {} missing token_vault_b", plan.pool_id))?;
+    let oracle = pool_accounts
+        .oracle
+        .ok_or_else(|| anyhow!("template for pool {} missing oracle", plan.pool_id))?;
+    let whirlpool_account = if pool_accounts.whirlpool == Pubkey::default() {
+        template.key.pool_id
+    } else {
+        pool_accounts.whirlpool
+    };
+    let tick_array0 = plan
+        .context
+        .whirlpool_tick_arrays
+        .get(0)
+        .copied()
+        .ok_or_else(|| anyhow!("plan for pool {} missing tickArray0", plan.pool_id))?;
+    let tick_array1 = plan
+        .context
+        .whirlpool_tick_arrays
+        .get(1)
+        .copied()
+        .ok_or_else(|| anyhow!("plan for pool {} missing tickArray1", plan.pool_id))?;
+    let tick_array2 = plan
+        .context
+        .whirlpool_tick_arrays
+        .get(2)
+        .copied()
+        .ok_or_else(|| anyhow!("plan for pool {} missing tickArray2", plan.pool_id))?;
+
+    for (meta, spec) in accounts.iter_mut().zip(specs.iter()) {
+        if spec.address.is_some() {
+            continue;
+        }
+
+        match spec.name {
+            "tokenAuthority" => {
+                meta.pubkey = authority;
+            }
+            "whirlpool" => {
+                meta.pubkey = whirlpool_account;
+            }
+            "tokenOwnerAccountA" => {
+                meta.pubkey = owner_account_a;
+            }
+            "tokenOwnerAccountB" => {
+                meta.pubkey = owner_account_b;
+            }
+            "tokenVaultA" => {
+                meta.pubkey = vault_a;
+            }
+            "tokenVaultB" => {
+                meta.pubkey = vault_b;
+            }
+            "oracle" => {
+                meta.pubkey = oracle;
+            }
+            "tickArray0" => {
+                meta.pubkey = tick_array0;
+            }
+            "tickArray1" => {
+                meta.pubkey = tick_array1;
+            }
+            "tickArray2" => {
+                meta.pubkey = tick_array2;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[owner.as_ref(), SPL_TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0
 }
 
 fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [u8]) -> Result<()> {
@@ -305,6 +792,7 @@ pub(crate) fn hydrate_accounts_for_plan(
 ) -> Result<Vec<AccountMeta>> {
     let template = resolve_template(cache, plan)?;
     let mut accounts = template.accounts.as_ref().to_vec();
+    hydrate_template_accounts(plan, template.as_ref(), payer, &mut accounts)?;
     apply_template_context(plan, template.as_ref(), &mut accounts)?;
     rewrite_placeholder_signers(plan, &mut accounts, payer);
     Ok(accounts)
@@ -402,6 +890,7 @@ fn materialize_lookup_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder::templates::{AccountSpec, SwapMintRole};
     use crate::config::AppConfig;
     use serde_json::json;
     use solana_sdk::instruction::AccountMeta;
@@ -422,6 +911,7 @@ mod tests {
             amount_in: 42,
             expected_output_amount: 84,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -474,6 +964,7 @@ mod tests {
             amount_in: 1,
             expected_output_amount: 2,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -514,6 +1005,7 @@ mod tests {
             amount_in: 1,
             expected_output_amount: 2,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -546,6 +1038,7 @@ mod tests {
             amount_in: 1,
             expected_output_amount: 1,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -588,6 +1081,7 @@ mod tests {
             amount_in: 1,
             expected_output_amount: 2,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -641,6 +1135,7 @@ mod tests {
             amount_in: 1,
             expected_output_amount: 2,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -696,6 +1191,7 @@ mod tests {
             amount_in: 1,
             expected_output_amount: 2,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -748,6 +1244,7 @@ mod tests {
             amount_in: 10,
             expected_output_amount,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -797,6 +1294,7 @@ mod tests {
             amount_in: 10,
             expected_output_amount: 1_000_000,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: Some(explicit_min),
@@ -836,6 +1334,7 @@ mod tests {
             amount_in: 1,
             expected_output_amount: 1,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -875,6 +1374,7 @@ mod tests {
             amount_in: 1,
             expected_output_amount: 1,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -920,6 +1420,7 @@ mod tests {
             amount_in: 1,
             expected_output_amount: 2,
             fee_bps: 5,
+            template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -949,6 +1450,229 @@ mod tests {
         assert!(memo_pos < extra_pos, "memo should precede extra accounts");
         assert_eq!(hydrated[hydrated.len() - 2].pubkey, extra);
         assert_eq!(hydrated.last().unwrap().pubkey, *JITO_DONT_FRONT_ACCOUNT);
+    }
+
+    #[test]
+    fn hydrates_amm_v3_accounts_with_metadata() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let specs = amm_v3_account_specs();
+        let pool_accounts = AmmV3PoolAccounts {
+            amm_config: Pubkey::new_unique(),
+            observation_state: Pubkey::new_unique(),
+            mint0: Pubkey::new_unique(),
+            mint1: Pubkey::new_unique(),
+            mint0_program: Pubkey::new_unique(),
+            mint1_program: Pubkey::new_unique(),
+            vault0: Pubkey::new_unique(),
+            vault1: Pubkey::new_unique(),
+        };
+        insert_amm_v3_template(
+            &cache,
+            pool,
+            program_id,
+            SwapTemplateDirection::BaseIn,
+            specs,
+            pool_accounts.clone(),
+        );
+
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: pool_accounts.mint0.to_string(),
+            output_mint: pool_accounts.mint1.to_string(),
+            amount_in: 10,
+            expected_output_amount: 20,
+            fee_bps: 5,
+            template_fee_bps: 5,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context: TemplateContext::default(),
+            lookup_table: None,
+        };
+
+        let payer = Pubkey::new_unique();
+        let hydrated = hydrate_accounts_for_plan(&cache, &plan, payer).expect("accounts");
+        let payer_idx = find_account_index(specs, "payer");
+        assert_eq!(hydrated[payer_idx].pubkey, payer);
+
+        let amm_config_idx = find_account_index(specs, "amm_config");
+        assert_eq!(hydrated[amm_config_idx].pubkey, pool_accounts.amm_config);
+
+        let input_vault_idx = find_account_index(specs, "input_vault");
+        assert_eq!(hydrated[input_vault_idx].pubkey, pool_accounts.vault0);
+
+        let output_vault_idx = find_account_index(specs, "output_vault");
+        assert_eq!(hydrated[output_vault_idx].pubkey, pool_accounts.vault1);
+
+        let observation_idx = find_account_index(specs, "observation_state");
+        assert_eq!(
+            hydrated[observation_idx].pubkey,
+            pool_accounts.observation_state
+        );
+
+        let owner_ata0 = super::derive_associated_token_address(&payer, &pool_accounts.mint0);
+        let owner_ata1 = super::derive_associated_token_address(&payer, &pool_accounts.mint1);
+        let input_user_idx = find_account_index(specs, "input_token_account");
+        let output_user_idx = find_account_index(specs, "output_token_account");
+        assert_eq!(hydrated[input_user_idx].pubkey, owner_ata0);
+        assert_eq!(hydrated[output_user_idx].pubkey, owner_ata1);
+
+        let input_mint_idx = find_account_index(specs, "input_vault_mint");
+        let output_mint_idx = find_account_index(specs, "output_vault_mint");
+        assert_eq!(hydrated[input_mint_idx].pubkey, pool_accounts.mint0);
+        assert_eq!(hydrated[output_mint_idx].pubkey, pool_accounts.mint1);
+    }
+
+    #[test]
+    fn hydrates_amm_v3_accounts_with_context_payer() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let specs = amm_v3_account_specs();
+        let pool_accounts = AmmV3PoolAccounts {
+            amm_config: Pubkey::new_unique(),
+            observation_state: Pubkey::new_unique(),
+            mint0: Pubkey::new_unique(),
+            mint1: Pubkey::new_unique(),
+            mint0_program: Pubkey::new_unique(),
+            mint1_program: Pubkey::new_unique(),
+            vault0: Pubkey::new_unique(),
+            vault1: Pubkey::new_unique(),
+        };
+        insert_amm_v3_template(
+            &cache,
+            pool,
+            program_id,
+            SwapTemplateDirection::BaseIn,
+            specs,
+            pool_accounts.clone(),
+        );
+
+        let override_payer = Pubkey::new_unique();
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: pool_accounts.mint0.to_string(),
+            output_mint: pool_accounts.mint1.to_string(),
+            amount_in: 10,
+            expected_output_amount: 20,
+            fee_bps: 5,
+            template_fee_bps: 5,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context: TemplateContext {
+                payer: Some(override_payer),
+                ..TemplateContext::default()
+            },
+            lookup_table: None,
+        };
+
+        let fallback_payer = Pubkey::new_unique();
+        let hydrated = hydrate_accounts_for_plan(&cache, &plan, fallback_payer).expect("accounts");
+        let payer_idx = find_account_index(specs, "payer");
+        assert_eq!(hydrated[payer_idx].pubkey, override_payer);
+
+        let owner_ata0 =
+            super::derive_associated_token_address(&override_payer, &pool_accounts.mint0);
+        let owner_ata1 =
+            super::derive_associated_token_address(&override_payer, &pool_accounts.mint1);
+        let input_user_idx = find_account_index(specs, "input_token_account");
+        let output_user_idx = find_account_index(specs, "output_token_account");
+        assert_eq!(hydrated[input_user_idx].pubkey, owner_ata0);
+        assert_eq!(hydrated[output_user_idx].pubkey, owner_ata1);
+    }
+
+    #[test]
+    fn hydrates_whirlpool_accounts_with_tick_arrays() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let specs = whirlpool_account_specs();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+        let oracle = Pubkey::new_unique();
+        let pool_accounts = WhirlpoolPoolAccounts {
+            whirlpool: pool,
+            token_mint_a: Pubkey::new_unique(),
+            token_mint_b: Pubkey::new_unique(),
+            token_vault_a: Some(vault_a),
+            token_vault_b: Some(vault_b),
+            oracle: Some(oracle),
+        };
+
+        insert_whirlpool_template(
+            &cache,
+            pool,
+            program_id,
+            SwapTemplateDirection::BaseIn,
+            specs,
+            pool_accounts.clone(),
+        );
+
+        let payer = Pubkey::new_unique();
+        let tick_arrays = vec![
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: pool_accounts.token_mint_a.to_string(),
+            output_mint: pool_accounts.token_mint_b.to_string(),
+            amount_in: 1,
+            expected_output_amount: 1,
+            fee_bps: 5,
+            template_fee_bps: 5,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context: TemplateContext {
+                whirlpool_tick_arrays: tick_arrays.clone(),
+                ..TemplateContext::default()
+            },
+            lookup_table: None,
+        };
+
+        let hydrated = hydrate_accounts_for_plan(&cache, &plan, payer).expect("whirlpool accounts");
+
+        let authority_idx = find_account_index(specs, "tokenAuthority");
+        assert_eq!(hydrated[authority_idx].pubkey, payer);
+
+        let owner_a_idx = find_account_index(specs, "tokenOwnerAccountA");
+        let owner_b_idx = find_account_index(specs, "tokenOwnerAccountB");
+        let owner_a = super::derive_associated_token_address(&payer, &pool_accounts.token_mint_a);
+        let owner_b = super::derive_associated_token_address(&payer, &pool_accounts.token_mint_b);
+        assert_eq!(hydrated[owner_a_idx].pubkey, owner_a);
+        assert_eq!(hydrated[owner_b_idx].pubkey, owner_b);
+
+        let vault_a_idx = find_account_index(specs, "tokenVaultA");
+        let vault_b_idx = find_account_index(specs, "tokenVaultB");
+        assert_eq!(hydrated[vault_a_idx].pubkey, vault_a);
+        assert_eq!(hydrated[vault_b_idx].pubkey, vault_b);
+
+        let oracle_idx = find_account_index(specs, "oracle");
+        assert_eq!(hydrated[oracle_idx].pubkey, oracle);
+
+        let tick0_idx = find_account_index(specs, "tickArray0");
+        let tick1_idx = find_account_index(specs, "tickArray1");
+        let tick2_idx = find_account_index(specs, "tickArray2");
+        assert_eq!(hydrated[tick0_idx].pubkey, tick_arrays[0]);
+        assert_eq!(hydrated[tick1_idx].pubkey, tick_arrays[1]);
+        assert_eq!(hydrated[tick2_idx].pubkey, tick_arrays[2]);
     }
 
     fn insert_template(
@@ -984,7 +1708,7 @@ mod tests {
         accounts: Vec<AccountMeta>,
         patches: Vec<TemplatePatch>,
     ) -> Pubkey {
-        let key = TemplateCacheKey::new(pool, direction, 5);
+        let key = TemplateCacheKey::new(pool, direction);
         let template = InstructionTemplate {
             key,
             program_id,
@@ -996,9 +1720,300 @@ mod tests {
             tlv_bytes: 0,
             template_hash: [0u8; 32],
             alt_handle: None,
+            metadata: TemplateMetadata::None,
         };
         cache.insert(template);
         program_id
+    }
+
+    fn insert_amm_v3_template(
+        cache: &TemplateCache,
+        pool: Pubkey,
+        program_id: Pubkey,
+        direction: SwapTemplateDirection,
+        specs: &'static [AccountSpec],
+        pool_accounts: AmmV3PoolAccounts,
+    ) {
+        let accounts = specs
+            .iter()
+            .map(|spec| {
+                if spec.is_writable {
+                    AccountMeta::new(Pubkey::default(), spec.is_signer)
+                } else {
+                    AccountMeta::new_readonly(Pubkey::default(), spec.is_signer)
+                }
+            })
+            .collect::<Vec<_>>();
+        let template = InstructionTemplate {
+            key: TemplateCacheKey::new(pool, direction),
+            program_id,
+            discriminator: [0u8; 8],
+            accounts: StdArc::from(accounts),
+            data: StdArc::new(vec![0u8; 8]),
+            patches: StdArc::from(Vec::new()),
+            cu_budget: 0,
+            tlv_bytes: 0,
+            template_hash: [0u8; 32],
+            alt_handle: None,
+            metadata: TemplateMetadata::AmmV3 {
+                account_specs: specs,
+                pool_accounts: Some(pool_accounts),
+            },
+        };
+        cache.insert(template);
+    }
+
+    fn insert_whirlpool_template(
+        cache: &TemplateCache,
+        pool: Pubkey,
+        program_id: Pubkey,
+        direction: SwapTemplateDirection,
+        specs: &'static [AccountSpec],
+        pool_accounts: WhirlpoolPoolAccounts,
+    ) {
+        let accounts = specs
+            .iter()
+            .map(|spec| {
+                if spec.is_writable {
+                    AccountMeta::new(Pubkey::default(), spec.is_signer)
+                } else {
+                    AccountMeta::new_readonly(Pubkey::default(), spec.is_signer)
+                }
+            })
+            .collect::<Vec<_>>();
+        let template = InstructionTemplate {
+            key: TemplateCacheKey::new(pool, direction),
+            program_id,
+            discriminator: [0u8; 8],
+            accounts: StdArc::from(accounts),
+            data: StdArc::new(vec![0u8; 8]),
+            patches: StdArc::from(Vec::new()),
+            cu_budget: 0,
+            tlv_bytes: 0,
+            template_hash: [0u8; 32],
+            alt_handle: None,
+            metadata: TemplateMetadata::Whirlpool {
+                account_specs: specs,
+                pool_accounts: Some(pool_accounts),
+            },
+        };
+        cache.insert(template);
+    }
+
+    fn amm_v3_account_specs() -> &'static [AccountSpec] {
+        static SPECS: once_cell::sync::Lazy<&'static [AccountSpec]> =
+            once_cell::sync::Lazy::new(|| {
+                let specs = vec![
+                    AccountSpec {
+                        name: "payer",
+                        is_signer: true,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "amm_config",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "pool_state",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "input_token_account",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint0),
+                    },
+                    AccountSpec {
+                        name: "output_token_account",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint1),
+                    },
+                    AccountSpec {
+                        name: "input_vault",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint0),
+                    },
+                    AccountSpec {
+                        name: "output_vault",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint1),
+                    },
+                    AccountSpec {
+                        name: "observation_state",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "input_vault_mint",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint0),
+                    },
+                    AccountSpec {
+                        name: "output_vault_mint",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint1),
+                    },
+                ];
+                Box::leak(specs.into_boxed_slice())
+            });
+        *SPECS
+    }
+
+    fn whirlpool_account_specs() -> &'static [AccountSpec] {
+        static SPECS: once_cell::sync::Lazy<&'static [AccountSpec]> =
+            once_cell::sync::Lazy::new(|| {
+                let specs = vec![
+                    AccountSpec {
+                        name: "tokenProgram",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "tokenAuthority",
+                        is_signer: true,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "whirlpool",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "tokenOwnerAccountA",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint0),
+                    },
+                    AccountSpec {
+                        name: "tokenVaultA",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint0),
+                    },
+                    AccountSpec {
+                        name: "tokenOwnerAccountB",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint1),
+                    },
+                    AccountSpec {
+                        name: "tokenVaultB",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint1),
+                    },
+                    AccountSpec {
+                        name: "tickArray0",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "tickArray1",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "tickArray2",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "oracle",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                ];
+                Box::leak(specs.into_boxed_slice())
+            });
+        *SPECS
+    }
+
+    fn find_account_index(specs: &[AccountSpec], name: &str) -> usize {
+        specs
+            .iter()
+            .position(|spec| spec.name == name)
+            .expect("account name present in specs")
     }
 
     fn test_config() -> StdArc<AppConfig> {

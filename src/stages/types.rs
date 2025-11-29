@@ -4,7 +4,7 @@ use std::time::Instant;
 use once_cell::sync::Lazy;
 use solana_sdk::pubkey::Pubkey;
 
-use crate::builder::BundleBuildContext;
+use crate::builder::{BundleBuildContext, FlashLoanRoutePlan};
 use crate::proto::solana_corecast::{DexTradeStreamMessage, PoolLiquidityChangeStreamMessage};
 use crate::proto::solana_messages::{
     Account as ProtoAccount, Currency, ParsedIdlInstruction, PoolLiquidityChangeEvent, Program,
@@ -198,6 +198,8 @@ fn extras_if_any(extras: RaydiumV3PoolExtras) -> Option<RaydiumV3PoolExtras> {
         && extras.vault_bumps.is_none()
         && extras.trade_fee_rate.is_none()
         && extras.protocol_fee_rate.is_none()
+        && extras.base_token_program.is_none()
+        && extras.quote_token_program.is_none()
     {
         None
     } else {
@@ -812,6 +814,8 @@ pub struct RaydiumV3PoolExtras {
     pub vault_bumps: Option<[u8; 2]>,
     pub trade_fee_rate: Option<u32>,
     pub protocol_fee_rate: Option<u32>,
+    pub base_token_program: Option<Pubkey>,
+    pub quote_token_program: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -828,6 +832,11 @@ pub struct CpAmmPoolExtras {
     pub protocol_fee_bps: Option<u16>,
     pub referral_bps: Option<u16>,
     pub referral_token_account: Option<String>,
+    pub sqrt_price_x64: Option<u128>,
+    pub liquidity: Option<u128>,
+    pub sqrt_min_price_x64: Option<u128>,
+    pub sqrt_max_price_x64: Option<u128>,
+    pub hydrated_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -933,6 +942,7 @@ pub struct PoolQuoteSide {
     pub notional: u64,
     pub expected_output: u64,
     pub fee_bps: u64,
+    pub template_fee_bps: u16,
     pub effective_price: f64,
     pub estimated_slippage_bps: f64,
     pub sqrt_price_limit: Option<u128>,
@@ -1124,6 +1134,7 @@ pub struct BundleCandidate {
     pub tip_lamports: Option<u64>,
     pub tip_account: Option<Pubkey>,
     pub flash_loan: Option<FlashLoanSummary>,
+    pub flash_loan_reservation: Option<FlashLoanRoutePlan>,
     pub stage2_attempts: u8,
     pub stage3_attempts: u8,
     pub stage3_ready_at: Option<Instant>,
@@ -1144,6 +1155,7 @@ impl BundleCandidate {
             tip_lamports: None,
             tip_account: None,
             flash_loan: None,
+            flash_loan_reservation: None,
             stage2_attempts: 0,
             stage3_attempts: 0,
             stage3_ready_at: None,
@@ -1157,6 +1169,7 @@ pub struct RoutePlan {
     pub end_mint: String,
     pub legs: Vec<RouteLegPlan>,
     pub estimated_final_output_amount: Option<u64>,
+    pub flash_loan_permitted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1170,6 +1183,7 @@ pub struct RouteLegPlan {
     pub effective_price: f64,
     pub fee_bps: u64,
     pub estimated_slippage_bps: f64,
+    pub template_fee_bps: u16,
     pub direction: PoolQuoteDirection,
     pub sqrt_price_limit: Option<u128>,
     pub min_output_amount: Option<u64>,
@@ -1189,6 +1203,7 @@ pub struct PlannedInstruction {
     pub amount: u64,
     pub estimated_output_amount: u64,
     pub fee_bps: u64,
+    pub template_fee_bps: u16,
     pub direction: PoolQuoteDirection,
     pub lookup_table: Option<PlannedLookupTable>,
     pub sqrt_price_limit: Option<u128>,

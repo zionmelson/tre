@@ -1,3 +1,5 @@
+.github/
+certs/
 target/
-tests
+tests/
 config.json

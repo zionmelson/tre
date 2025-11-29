@@ -24,6 +24,7 @@ use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, 
 
 const RAYDIUM_V3_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 const TICK_ARRAY_SEED: &[u8] = b"tick_array";
+const POOL_VAULT_SEED: &[u8] = b"pool_vault";
 const TICK_ARRAY_STATE_DISCRIMINATOR: [u8; 8] = [192, 155, 85, 205, 49, 249, 129, 42];
 const POOL_STATE_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
 const AMM_CONFIG_STATE_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 43, 111];
@@ -41,6 +42,13 @@ const MIN_RAYDIUM_TICK_ARRAY_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN
     + 8
     + 107;
 const MIN_RAYDIUM_AMM_CONFIG_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN + 109;
+const SPL_TOKEN_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const SPL_TOKEN_2022_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBq2FXk7XJ68");
+const MEMO_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("ATokenGPvR93dthLvYbAphit9L8ZsfsZp7r4HQJDebg");
 
 #[allow(clippy::assign_op_pattern, clippy::manual_div_ceil)]
 mod u256 {
@@ -194,7 +202,7 @@ impl RaydiumV3Adapter {
             return;
         };
 
-        let extras = self.enrich_extras(pool_pubkey, extras);
+        let extras = self.enrich_extras(pool_pubkey, base_mint, quote_mint, extras);
         let RaydiumV3PoolExtras {
             tick_spacing,
             sqrt_price_x64,
@@ -207,6 +215,8 @@ impl RaydiumV3Adapter {
             vault_bumps,
             trade_fee_rate,
             protocol_fee_rate: _,
+            base_token_program,
+            quote_token_program,
         } = extras;
 
         let trade_fee_bps = trade_fee_rate.map(fee_bps_from_hundredth_bip);
@@ -215,6 +225,8 @@ impl RaydiumV3Adapter {
             pool_id: pool_pubkey,
             base_mint,
             quote_mint,
+            base_token_program: base_token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID),
+            quote_token_program: quote_token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID),
             amm_config,
             observation_state,
             tick_spacing,
@@ -245,7 +257,13 @@ impl RaydiumV3Adapter {
         self.evict_stale(update.slot);
     }
 
-    fn enrich_extras(&self, pool: Pubkey, mut extras: RaydiumV3PoolExtras) -> RaydiumV3PoolExtras {
+    fn enrich_extras(
+        &self,
+        pool: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        mut extras: RaydiumV3PoolExtras,
+    ) -> RaydiumV3PoolExtras {
         let Some(hydrator) = self.hydrator.as_ref() else {
             return extras;
         };
@@ -264,6 +282,13 @@ impl RaydiumV3Adapter {
             extras.protocol_fee_rate = extras.protocol_fee_rate.or(meta.protocol_fee_rate);
         }
 
+        extras.base_token_program = extras
+            .base_token_program
+            .or_else(|| hydrator.lookup_mint_program(base_mint));
+        extras.quote_token_program = extras
+            .quote_token_program
+            .or_else(|| hydrator.lookup_mint_program(quote_mint));
+
         if let (Some(spacing), Some(tick)) = (extras.tick_spacing, extras.current_tick) {
             if let Some(start_index) = active_tick_array_start(spacing, tick) {
                 let _ = hydrator.hydrate_tick_array(pool, start_index);
@@ -278,31 +303,100 @@ impl RaydiumV3Adapter {
         let Some(builder) = self.template_builder.as_ref() else {
             return;
         };
+        if self.registered_templates.contains(&state.pool_id) {
+            return;
+        }
         let Some(fee_bps) = state.trade_fee_bps else {
             return;
         };
-        if !self.registered_templates.insert(state.pool_id) {
+        let (Some(amm_config), Some(observation_state)) =
+            (state.amm_config, state.observation_state)
+        else {
+            warn!(
+                target = "adapter::raydium_v3",
+                pool = %state.pool_id,
+                "skipping template registration due to missing pool metadata"
+            );
             return;
-        }
+        };
 
         let fee_tier_bps = u16::try_from(fee_bps).unwrap_or(u16::MAX);
-        let mut alt_accounts = Vec::with_capacity(8);
-        alt_accounts.push(state.pool_id);
-        alt_accounts.push(state.base_mint);
-        alt_accounts.push(state.quote_mint);
-        if let Some(key) = state.amm_config {
-            alt_accounts.push(key);
-        }
-        if let Some(key) = state.observation_state {
-            alt_accounts.push(key);
-        }
+        let payer = builder.payer_pubkey();
+        let alt_accounts = build_raydium_alt_accounts(
+            state.pool_id,
+            state.base_mint,
+            state.quote_mint,
+            state.base_token_program,
+            state.quote_token_program,
+            amm_config,
+            observation_state,
+            &self.program_id,
+            &payer,
+        );
 
         builder.register_amm_v3_pool(AmmV3PoolMeta {
             pool_id: state.pool_id,
             fee_tier_bps,
+            base_mint: state.base_mint,
+            quote_mint: state.quote_mint,
+            base_token_program: Some(state.base_token_program),
+            quote_token_program: Some(state.quote_token_program),
+            amm_config,
+            observation_state,
             alt_accounts,
             alt_handle: None,
         });
+
+        self.registered_templates.insert(state.pool_id);
+    }
+
+    fn decorate_quote_context(
+        &self,
+        context: &mut TemplateContext,
+        state: &RaydiumV3State,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+    ) {
+        context.requires_memo = true;
+        if context.input_token_program.is_none() {
+            context.input_token_program = self.mint_program_for(state, input_mint);
+        }
+        if context.output_token_program.is_none() {
+            context.output_token_program = self.mint_program_for(state, output_mint);
+        }
+
+        let payer = context
+            .payer
+            .or_else(|| self.template_builder.as_ref().map(|b| b.payer_pubkey()));
+        if let Some(payer_pk) = payer {
+            context.payer = Some(payer_pk);
+            let input_program = context.input_token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID);
+            if context.input_token_account.is_none() {
+                context.input_token_account = Some(derive_associated_token_address_with_program(
+                    &payer_pk,
+                    &input_mint,
+                    &input_program,
+                ));
+            }
+            let output_program = context.output_token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID);
+            if context.output_token_account.is_none() {
+                context.output_token_account = Some(derive_associated_token_address_with_program(
+                    &payer_pk,
+                    &output_mint,
+                    &output_program,
+                ));
+            }
+        }
+    }
+
+    fn mint_program_for(&self, state: &RaydiumV3State, mint: Pubkey) -> Option<Pubkey> {
+        if mint == state.base_mint {
+            Some(state.base_token_program)
+        } else if mint == state.quote_mint {
+            Some(state.quote_token_program)
+        } else {
+            None
+        }
     }
 
     fn simulate_clmm_exact_in(
@@ -464,6 +558,7 @@ impl RaydiumV3Adapter {
         }
 
         let fee_bps = state.trade_fee_bps.unwrap_or(DEFAULT_FEE_BPS);
+        let template_fee_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
         let (input_mint, output_mint) = if base_to_quote {
             (state.base_mint, state.quote_mint)
         } else {
@@ -507,15 +602,20 @@ impl RaydiumV3Adapter {
             notional: probe_amount,
             expected_output: quote.amount_out,
             fee_bps,
+            template_fee_bps,
             effective_price: execution_price,
             estimated_slippage_bps: slippage,
             sqrt_price_limit: quote.sqrt_price_limit,
             min_output_amount: None,
             limit_price: None,
             price_impact_limit_bps: None,
-            context: TemplateContext {
-                compute_unit_limit: Some(RAYDIUM_DEFAULT_CU_LIMIT),
-                ..Default::default()
+            context: {
+                let mut context = TemplateContext {
+                    compute_unit_limit: Some(RAYDIUM_DEFAULT_CU_LIMIT),
+                    ..Default::default()
+                };
+                self.decorate_quote_context(&mut context, state, input_mint, output_mint);
+                context
             },
         })
     }
@@ -557,6 +657,12 @@ impl ProtocolAdapter for RaydiumV3Adapter {
         response.sqrt_price_limit = quote.sqrt_price_limit;
         response.min_output_amount = Some(quote.amount_out);
         response.context.compute_unit_limit = Some(RAYDIUM_DEFAULT_CU_LIMIT);
+        self.decorate_quote_context(
+            &mut response.context,
+            &state,
+            response.request.input_mint,
+            response.request.output_mint,
+        );
         Some(response)
     }
 
@@ -590,6 +696,8 @@ pub struct RaydiumV3State {
     pub pool_id: Pubkey,
     pub base_mint: Pubkey,
     pub quote_mint: Pubkey,
+    pub base_token_program: Pubkey,
+    pub quote_token_program: Pubkey,
     pub amm_config: Option<Pubkey>,
     pub observation_state: Option<Pubkey>,
     pub tick_spacing: Option<i32>,
@@ -613,6 +721,93 @@ impl RaydiumV3State {
         }
         Some(self.vault_quote as f64 / self.vault_base as f64)
     }
+}
+
+fn build_raydium_alt_accounts(
+    pool_id: Pubkey,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    base_token_program: Pubkey,
+    quote_token_program: Pubkey,
+    amm_config: Pubkey,
+    observation_state: Pubkey,
+    program_id: &Pubkey,
+    owner: &Pubkey,
+) -> Vec<Pubkey> {
+    let (mint0, mint1, program0, program1) = order_mints_with_programs(
+        base_mint,
+        quote_mint,
+        base_token_program,
+        quote_token_program,
+    );
+    let vault0 = derive_pool_vault_address(program_id, &pool_id, &mint0);
+    let vault1 = derive_pool_vault_address(program_id, &pool_id, &mint1);
+    let owner_ata0 = derive_associated_token_address_with_program(owner, &mint0, &program0);
+    let owner_ata1 = derive_associated_token_address_with_program(owner, &mint1, &program1);
+
+    let mut accounts = Vec::with_capacity(12);
+    accounts.push(pool_id);
+    accounts.push(base_mint);
+    accounts.push(quote_mint);
+    accounts.push(amm_config);
+    accounts.push(observation_state);
+    accounts.push(vault0);
+    accounts.push(vault1);
+    accounts.push(owner_ata0);
+    accounts.push(owner_ata1);
+    accounts.push(MEMO_PROGRAM_ID);
+    accounts.push(SPL_TOKEN_PROGRAM_ID);
+    accounts.push(SPL_TOKEN_2022_PROGRAM_ID);
+    accounts
+}
+
+fn order_mints(base: Pubkey, quote: Pubkey) -> (Pubkey, Pubkey) {
+    if base.to_bytes() <= quote.to_bytes() {
+        (base, quote)
+    } else {
+        (quote, base)
+    }
+}
+
+fn order_mints_with_programs(
+    base: Pubkey,
+    quote: Pubkey,
+    base_program: Pubkey,
+    quote_program: Pubkey,
+) -> (Pubkey, Pubkey, Pubkey, Pubkey) {
+    if base.to_bytes() <= quote.to_bytes() {
+        (base, quote, base_program, quote_program)
+    } else {
+        (quote, base, quote_program, base_program)
+    }
+}
+
+fn derive_pool_vault_address(program_id: &Pubkey, pool_state: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[POOL_VAULT_SEED, pool_state.as_ref(), mint.as_ref()],
+        program_id,
+    )
+    .0
+}
+
+fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[owner.as_ref(), SPL_TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0
+}
+
+fn derive_associated_token_address_with_program(
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0
 }
 
 fn parse_pubkey(value: &str) -> Option<Pubkey> {
@@ -842,6 +1037,8 @@ struct RaydiumPoolHydrator {
     amm_config_cache: Arc<DashMap<Pubkey, HydratedAmmConfig>>,
     missing_amm_configs: Arc<DashMap<Pubkey, Instant>>,
     missing_tick_arrays: DashMap<Pubkey, Instant>,
+    mint_program_cache: DashMap<Pubkey, Pubkey>,
+    missing_mints: DashMap<Pubkey, Instant>,
     retry_backoff: Duration,
 }
 
@@ -887,6 +1084,8 @@ impl RaydiumPoolHydrator {
             amm_config_cache,
             missing_amm_configs,
             missing_tick_arrays: DashMap::new(),
+            mint_program_cache: DashMap::new(),
+            missing_mints: DashMap::new(),
             retry_backoff,
         })
     }
@@ -897,6 +1096,47 @@ impl RaydiumPoolHydrator {
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
         self.pool_cache.get_or_schedule(pool)
+    }
+
+    fn lookup_mint_program(&self, mint: Pubkey) -> Option<Pubkey> {
+        if let Some(entry) = self.mint_program_cache.get(&mint) {
+            return Some(*entry.value());
+        }
+        if self.should_skip_missing_mint(&mint) {
+            return None;
+        }
+
+        for client in self.clients.as_ref() {
+            match client.get_account(&mint) {
+                Ok(account) => {
+                    let program = account.owner;
+                    self.mint_program_cache.insert(mint, program);
+                    self.missing_mints.remove(&mint);
+                    return Some(program);
+                }
+                Err(error) => {
+                    if is_account_not_found(&error) {
+                        if self.mark_missing_mint(mint) {
+                            warn!(
+                                target = "adapter::raydium_v3",
+                                mint = %mint,
+                                "raydium mint missing on-chain"
+                            );
+                        }
+                        return None;
+                    } else {
+                        warn!(
+                            target = "adapter::raydium_v3",
+                            mint = %mint,
+                            %error,
+                            "failed to fetch raydium mint account"
+                        );
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     pub fn hydrate_tick_array(
@@ -1096,12 +1336,20 @@ impl RaydiumPoolHydrator {
         Self::should_skip_missing(&self.missing_tick_arrays, key, self.retry_backoff)
     }
 
+    fn should_skip_missing_mint(&self, key: &Pubkey) -> bool {
+        Self::should_skip_missing(&self.missing_mints, key, self.retry_backoff)
+    }
+
     fn mark_missing_config(&self, key: Pubkey) -> bool {
         Self::record_missing(&self.missing_amm_configs, key)
     }
 
     fn mark_missing_tick_array(&self, key: Pubkey) -> bool {
         Self::record_missing(&self.missing_tick_arrays, key)
+    }
+
+    fn mark_missing_mint(&self, key: Pubkey) -> bool {
+        Self::record_missing(&self.missing_mints, key)
     }
 
     fn should_skip_missing(
@@ -1854,5 +2102,51 @@ mod tests {
         let end = cursor + PUBKEY_BYTES;
         buffer[cursor..end].copy_from_slice(key.as_ref());
         end
+    }
+
+    #[test]
+    fn alt_account_builder_includes_pool_derivatives() {
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let base_program = Pubkey::new_unique();
+        let quote_program = Pubkey::new_unique();
+        let amm_config = Pubkey::new_unique();
+        let observation = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+
+        let accounts = build_raydium_alt_accounts(
+            pool,
+            base,
+            quote,
+            base_program,
+            quote_program,
+            amm_config,
+            observation,
+            &program_id,
+            &owner,
+        );
+
+        assert!(accounts.contains(&pool));
+        assert!(accounts.contains(&base));
+        assert!(accounts.contains(&quote));
+        assert!(accounts.contains(&amm_config));
+        assert!(accounts.contains(&observation));
+        assert!(accounts.contains(&MEMO_PROGRAM_ID));
+        assert!(accounts.contains(&SPL_TOKEN_PROGRAM_ID));
+        assert!(accounts.contains(&SPL_TOKEN_2022_PROGRAM_ID));
+
+        let (mint0, mint1, program0, program1) =
+            order_mints_with_programs(base, quote, base_program, quote_program);
+        let vault0 = derive_pool_vault_address(&program_id, &pool, &mint0);
+        let vault1 = derive_pool_vault_address(&program_id, &pool, &mint1);
+        assert!(accounts.contains(&vault0));
+        assert!(accounts.contains(&vault1));
+
+        let owner_ata0 = derive_associated_token_address_with_program(&owner, &mint0, &program0);
+        let owner_ata1 = derive_associated_token_address_with_program(&owner, &mint1, &program1);
+        assert!(accounts.contains(&owner_ata0));
+        assert!(accounts.contains(&owner_ata1));
     }
 }

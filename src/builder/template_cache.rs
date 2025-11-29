@@ -7,7 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
-use super::templates::SwapTemplateDirection;
+use super::templates::{AccountSpec, SwapMintRole, SwapTemplateDirection};
+use super::{CpAmmPoolAccounts, LifinityPoolAccounts, WhirlpoolPoolAccounts};
 use crate::config::AppConfig;
 
 #[derive(Clone)]
@@ -91,16 +92,11 @@ pub struct TemplateCacheStats {
 pub struct TemplateCacheKey {
     pub pool_id: Pubkey,
     pub direction: SwapTemplateDirection,
-    pub fee_tier_bps: u16,
 }
 
 impl TemplateCacheKey {
-    pub fn new(pool_id: Pubkey, direction: SwapTemplateDirection, fee_tier_bps: u16) -> Self {
-        Self {
-            pool_id,
-            direction,
-            fee_tier_bps,
-        }
+    pub fn new(pool_id: Pubkey, direction: SwapTemplateDirection) -> Self {
+        Self { pool_id, direction }
     }
 }
 
@@ -116,6 +112,7 @@ pub struct InstructionTemplate {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub metadata: TemplateMetadata,
 }
 
 impl InstructionTemplate {
@@ -124,7 +121,7 @@ impl InstructionTemplate {
             pool_id,
             program_id,
             direction,
-            fee_tier_bps,
+            fee_tier_bps: _fee_tier_bps,
             discriminator,
             accounts,
             data,
@@ -133,12 +130,14 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            account_specs,
+            pool_accounts,
         } = params;
 
         let patches = field_layout.into_patches();
 
         Self {
-            key: TemplateCacheKey::new(pool_id, direction, fee_tier_bps),
+            key: TemplateCacheKey::new(pool_id, direction),
             program_id,
             discriminator,
             accounts: accounts.into(),
@@ -148,6 +147,10 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            metadata: TemplateMetadata::AmmV3 {
+                account_specs,
+                pool_accounts,
+            },
         }
     }
 
@@ -156,7 +159,7 @@ impl InstructionTemplate {
             pool_id,
             program_id,
             direction,
-            fee_tier_bps,
+            fee_tier_bps: _fee_tier_bps,
             discriminator,
             accounts,
             data,
@@ -165,12 +168,14 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            account_specs,
+            pool_accounts,
         } = params;
 
         let patches = field_layout.into_patches();
 
         Self {
-            key: TemplateCacheKey::new(pool_id, direction, fee_tier_bps),
+            key: TemplateCacheKey::new(pool_id, direction),
             program_id,
             discriminator,
             accounts: accounts.into(),
@@ -180,6 +185,10 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            metadata: TemplateMetadata::CpAmm {
+                account_specs,
+                pool_accounts,
+            },
         }
     }
 
@@ -188,7 +197,7 @@ impl InstructionTemplate {
             pool_id,
             program_id,
             direction,
-            fee_tier_bps,
+            fee_tier_bps: _fee_tier_bps,
             discriminator,
             accounts,
             data,
@@ -202,7 +211,7 @@ impl InstructionTemplate {
         let patches = field_layout.into_patches();
 
         Self {
-            key: TemplateCacheKey::new(pool_id, direction, fee_tier_bps),
+            key: TemplateCacheKey::new(pool_id, direction),
             program_id,
             discriminator,
             accounts: accounts.into(),
@@ -212,6 +221,7 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            metadata: TemplateMetadata::None,
         }
     }
 
@@ -220,7 +230,7 @@ impl InstructionTemplate {
             pool_id,
             program_id,
             direction,
-            fee_tier_bps,
+            fee_tier_bps: _fee_tier_bps,
             discriminator,
             accounts,
             data,
@@ -229,12 +239,14 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            account_specs,
+            pool_accounts,
         } = params;
 
         let patches = field_layout.into_patches();
 
         Self {
-            key: TemplateCacheKey::new(pool_id, direction, fee_tier_bps),
+            key: TemplateCacheKey::new(pool_id, direction),
             program_id,
             discriminator,
             accounts: accounts.into(),
@@ -244,6 +256,10 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            metadata: TemplateMetadata::Lifinity {
+                account_specs,
+                pool_accounts,
+            },
         }
     }
 
@@ -252,7 +268,7 @@ impl InstructionTemplate {
             pool_id,
             program_id,
             direction,
-            fee_tier_bps,
+            fee_tier_bps: _fee_tier_bps,
             discriminator,
             accounts,
             data,
@@ -261,12 +277,14 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            account_specs,
+            pool_accounts,
         } = params;
 
         let patches = field_layout.into_patches();
 
         Self {
-            key: TemplateCacheKey::new(pool_id, direction, fee_tier_bps),
+            key: TemplateCacheKey::new(pool_id, direction),
             program_id,
             discriminator,
             accounts: accounts.into(),
@@ -276,7 +294,147 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            metadata: TemplateMetadata::Whirlpool {
+                account_specs,
+                pool_accounts,
+            },
         }
+    }
+
+    pub fn is_hydrated(&self) -> bool {
+        match &self.metadata {
+            TemplateMetadata::None => true,
+            TemplateMetadata::AmmV3 { pool_accounts, .. } => pool_accounts
+                .as_ref()
+                .map(|accounts| accounts.is_populated())
+                .unwrap_or(false),
+            TemplateMetadata::CpAmm { pool_accounts, .. } => pool_accounts
+                .as_ref()
+                .map(|accounts| accounts.is_populated())
+                .unwrap_or(false),
+            TemplateMetadata::Lifinity { pool_accounts, .. } => pool_accounts
+                .as_ref()
+                .map(|accounts| accounts.is_populated())
+                .unwrap_or(false),
+            TemplateMetadata::Whirlpool { pool_accounts, .. } => pool_accounts
+                .as_ref()
+                .map(|accounts| accounts.is_populated())
+                .unwrap_or(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TemplateMetadata {
+    None,
+    AmmV3 {
+        account_specs: &'static [AccountSpec],
+        pool_accounts: Option<AmmV3PoolAccounts>,
+    },
+    CpAmm {
+        account_specs: &'static [AccountSpec],
+        pool_accounts: Option<CpAmmPoolAccounts>,
+    },
+    Lifinity {
+        account_specs: &'static [AccountSpec],
+        pool_accounts: Option<LifinityPoolAccounts>,
+    },
+    Whirlpool {
+        account_specs: &'static [AccountSpec],
+        pool_accounts: Option<WhirlpoolPoolAccounts>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AmmV3PoolAccounts {
+    pub amm_config: Pubkey,
+    pub observation_state: Pubkey,
+    pub mint0: Pubkey,
+    pub mint1: Pubkey,
+    pub mint0_program: Pubkey,
+    pub mint1_program: Pubkey,
+    pub vault0: Pubkey,
+    pub vault1: Pubkey,
+}
+
+impl AmmV3PoolAccounts {
+    pub fn mint_for_role(&self, role: SwapMintRole) -> Pubkey {
+        match role {
+            SwapMintRole::Mint0 => self.mint0,
+            SwapMintRole::Mint1 => self.mint1,
+        }
+    }
+
+    pub fn token_program_for_role(&self, role: SwapMintRole) -> Pubkey {
+        match role {
+            SwapMintRole::Mint0 => self.mint0_program,
+            SwapMintRole::Mint1 => self.mint1_program,
+        }
+    }
+
+    pub fn vault_for_role(&self, role: SwapMintRole) -> Pubkey {
+        match role {
+            SwapMintRole::Mint0 => self.vault0,
+            SwapMintRole::Mint1 => self.vault1,
+        }
+    }
+
+    pub fn is_populated(&self) -> bool {
+        const ZERO: Pubkey = Pubkey::new_from_array([0u8; 32]);
+        self.amm_config != ZERO
+            && self.observation_state != ZERO
+            && self.mint0 != ZERO
+            && self.mint1 != ZERO
+            && self.mint0_program != ZERO
+            && self.mint1_program != ZERO
+            && self.vault0 != ZERO
+            && self.vault1 != ZERO
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_amm_v3_template(pool_accounts: Option<AmmV3PoolAccounts>) -> InstructionTemplate {
+        InstructionTemplate {
+            key: TemplateCacheKey::new(Pubkey::new_unique(), SwapTemplateDirection::BaseIn),
+            program_id: Pubkey::new_unique(),
+            discriminator: [0; 8],
+            accounts: Arc::from(Vec::<AccountMeta>::new()),
+            data: Arc::new(Vec::new()),
+            patches: Arc::from(Vec::<TemplatePatch>::new()),
+            cu_budget: 0,
+            tlv_bytes: 0,
+            template_hash: [0; 32],
+            alt_handle: None,
+            metadata: TemplateMetadata::AmmV3 {
+                account_specs: &[],
+                pool_accounts,
+            },
+        }
+    }
+
+    #[test]
+    fn amm_v3_template_not_hydrated_without_pool_accounts() {
+        let template = empty_amm_v3_template(None);
+        assert!(!template.is_hydrated());
+    }
+
+    #[test]
+    fn amm_v3_template_ready_when_pool_accounts_present() {
+        let pool_accounts = AmmV3PoolAccounts {
+            amm_config: Pubkey::new_unique(),
+            observation_state: Pubkey::new_unique(),
+            mint0: Pubkey::new_unique(),
+            mint1: Pubkey::new_unique(),
+            mint0_program: Pubkey::new_unique(),
+            mint1_program: Pubkey::new_unique(),
+            vault0: Pubkey::new_unique(),
+            vault1: Pubkey::new_unique(),
+        };
+        let template = empty_amm_v3_template(Some(pool_accounts));
+        assert!(template.is_hydrated());
     }
 }
 
@@ -515,6 +673,8 @@ pub struct AmmV3TemplateParams {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub account_specs: &'static [AccountSpec],
+    pub pool_accounts: Option<AmmV3PoolAccounts>,
 }
 
 #[derive(Debug, Clone)]
@@ -531,6 +691,8 @@ pub struct CpAmmTemplateParams {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub account_specs: &'static [AccountSpec],
+    pub pool_accounts: Option<CpAmmPoolAccounts>,
 }
 
 #[derive(Debug, Clone)]
@@ -563,6 +725,8 @@ pub struct LifinityTemplateParams {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub account_specs: &'static [AccountSpec],
+    pub pool_accounts: Option<LifinityPoolAccounts>,
 }
 
 #[derive(Debug, Clone)]
@@ -579,6 +743,8 @@ pub struct WhirlpoolTemplateParams {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub account_specs: &'static [AccountSpec],
+    pub pool_accounts: Option<WhirlpoolPoolAccounts>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

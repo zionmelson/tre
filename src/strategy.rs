@@ -76,6 +76,12 @@ pub struct StrategyConfig {
     pub tip_congestion_expired_weight_bps: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FlashLoanTradeBudget {
+    pub trade_input_lamports: u64,
+    pub baseline_tip_lamports: u64,
+}
+
 impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
@@ -320,13 +326,23 @@ impl StrategyEngine {
         }
 
         let profit_native = estimated_final - first_leg.input_amount;
-        let profit_lamports = lamports_if_wsol(&route.start_mint, profit_native);
-        if let Some(lamports) = profit_lamports {
+        let mut profit_lamports = lamports_if_wsol(&route.start_mint, profit_native);
+        let flash_loan_fee_lamports = if route.start_mint == WSOL_MINT {
+            compute_flash_loan_fee(first_leg.input_amount)
+        } else {
+            0
+        };
+        if let Some(mut lamports) = profit_lamports {
+            if flash_loan_fee_lamports > 0 {
+                lamports = lamports.saturating_sub(flash_loan_fee_lamports);
+                profit_lamports = Some(lamports);
+            }
             if lamports < self.config.min_profit_lamports {
                 self.rejected_count.fetch_add(1, Ordering::Relaxed);
                 debug!(
                     seq = opportunity.seq,
                     profit_lamports = lamports,
+                    flash_loan_fee_lamports,
                     min_profit_lamports = self.config.min_profit_lamports,
                     "opportunity rejected: profit below threshold"
                 );
@@ -341,13 +357,16 @@ impl StrategyEngine {
         {
             if let Some(lamports) = profit_lamports {
                 let carry_fee = tip_carry_fee(&route.start_mint, tip_lamports);
-                let net_profit = lamports.saturating_sub(tip_lamports.saturating_add(carry_fee));
+                let net_profit = lamports
+                    .saturating_sub(tip_lamports)
+                    .saturating_sub(carry_fee);
                 if net_profit < self.config.min_profit_lamports {
                     self.rejected_count.fetch_add(1, Ordering::Relaxed);
                     debug!(
                         seq = opportunity.seq,
                         profit_lamports = lamports,
                         net_profit_lamports = net_profit,
+                        flash_loan_fee_lamports,
                         tip_lamports,
                         carry_fee,
                         min_profit_lamports = self.config.min_profit_lamports,
@@ -362,6 +381,26 @@ impl StrategyEngine {
 
         self.accepted_count.fetch_add(1, Ordering::Relaxed);
         Some(candidate)
+    }
+
+    pub fn flash_trade_budget(&self, mint: &str) -> Option<FlashLoanTradeBudget> {
+        if mint != WSOL_MINT {
+            return None;
+        }
+        let tip = self.tip_oracle.baseline_tip(&self.config)?;
+        let profit = self.config.min_profit_lamports;
+        Some(FlashLoanTradeBudget {
+            trade_input_lamports: tip.saturating_add(profit),
+            baseline_tip_lamports: tip,
+        })
+    }
+
+    pub fn tip_buffer_hint(&self, mint: &str) -> u64 {
+        if mint == WSOL_MINT {
+            self.config.max_tip_lamports
+        } else {
+            0
+        }
     }
 
     pub fn on_arbitrage_signal(&self, opportunity: &ArbitrageOpportunity) {
@@ -419,6 +458,7 @@ mod tests {
                 estimated_output_amount: TEST_INPUT_LAMPORTS + TEST_PROFIT_LAMPORTS,
                 effective_price: 1.0,
                 fee_bps: 30,
+                template_fee_bps: 30,
                 estimated_slippage_bps: 1.0,
                 direction: PoolQuoteDirection::BaseToQuote,
                 sqrt_price_limit: None,
@@ -430,6 +470,7 @@ mod tests {
                 alt_ready: false,
             }],
             estimated_final_output_amount: Some(TEST_INPUT_LAMPORTS + TEST_PROFIT_LAMPORTS),
+            flash_loan_permitted: true,
         }
     }
 
@@ -547,11 +588,30 @@ impl TipOracle {
         }
     }
 
+    fn baseline_tip(&self, config: &StrategyConfig) -> Option<u64> {
+        self.compute_tip_lamports(config, None, false)
+    }
+
     fn recommended_tip(
         &self,
         config: &StrategyConfig,
         profit_lamports: Option<u64>,
     ) -> Option<(u64, Pubkey)> {
+        let tip = self.compute_tip_lamports(config, profit_lamports, true)?;
+        if self.recipients.is_empty() {
+            return None;
+        }
+        let idx = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let recipient = self.recipients[idx % self.recipients.len()];
+        Some((tip, recipient))
+    }
+
+    fn compute_tip_lamports(
+        &self,
+        config: &StrategyConfig,
+        profit_lamports: Option<u64>,
+        record_metrics: bool,
+    ) -> Option<u64> {
         if self.recipients.is_empty() {
             return None;
         }
@@ -561,11 +621,18 @@ impl TipOracle {
             floor = config.tip_floor_min_lamports;
         }
         let mut tip = floor.max(config.min_tip_lamports);
-        let markup = floor + floor.saturating_mul(config.tip_floor_markup_bps) / 10_000;
-        tip = tip.max(markup);
+        let markup = floor
+            .saturating_mul(config.tip_floor_markup_bps)
+            .checked_div(10_000)
+            .unwrap_or(u64::MAX);
+        let marked_floor = floor.saturating_add(markup);
+        tip = tip.max(marked_floor);
 
         if let Some(profit) = profit_lamports {
-            let share = profit.saturating_mul(config.tip_profit_share_bps) / 10_000;
+            let share = profit
+                .saturating_mul(config.tip_profit_share_bps)
+                .checked_div(10_000)
+                .unwrap_or(u64::MAX);
             tip = tip.max(share);
         }
 
@@ -574,7 +641,9 @@ impl TipOracle {
             config.tip_congestion_max_multiplier,
             config.tip_congestion_expired_weight_bps,
         );
-        telemetry::record_tip_multiplier(pressure_multiplier);
+        if record_metrics {
+            telemetry::record_tip_multiplier(pressure_multiplier);
+        }
         if pressure_multiplier.is_finite() && pressure_multiplier > 1.0 {
             let scaled = (tip as f64) * pressure_multiplier;
             if scaled.is_finite() && scaled > 0.0 {
@@ -582,7 +651,9 @@ impl TipOracle {
             }
         }
 
-        tip = tip.clamp(config.min_tip_lamports, config.max_tip_lamports);
+        let min_tip = config.min_tip_lamports.min(config.max_tip_lamports);
+        let max_tip = config.max_tip_lamports.max(config.min_tip_lamports);
+        tip = tip.clamp(min_tip, max_tip);
         if tip == 0 {
             return None;
         }
@@ -594,9 +665,11 @@ impl TipOracle {
             }
         }
 
-        let idx = self.cursor.fetch_add(1, Ordering::Relaxed);
-        let recipient = self.recipients[idx % self.recipients.len()];
-        Some((tip, recipient))
+        if tip == 0 {
+            None
+        } else {
+            Some(tip)
+        }
     }
 }
 

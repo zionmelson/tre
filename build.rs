@@ -263,14 +263,7 @@ fn emit_lb_clmm_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error:
         .as_deref()
         .ok_or("lb_clmm idl missing program id")?;
 
-    const LB_INSTRUCTIONS: &[&str] = &[
-        "swap",
-        "swap2",
-        "swap_exact_out",
-        "swap_exact_out2",
-        "swap_with_price_impact",
-        "swap_with_price_impact2",
-    ];
+    const LB_INSTRUCTIONS: &[&str] = &["swap", "swap_exact_out", "swap_with_price_impact"];
 
     let mut buffer = String::new();
     buffer.push_str("pub static LB_CLMM_SWAP_TEMPLATES: &[LbClmmSwapTemplate] = &[\n");
@@ -496,7 +489,14 @@ fn render_lb_clmm_template(
     )?;
     writeln!(snippet, "        accounts: &[")?;
     for account in &ix.accounts {
-        let rendered = render_account(account, direction)?;
+        let mut adjusted = account.clone();
+        if matches!(
+            adjusted.name.as_str(),
+            "token_x_program" | "token_y_program"
+        ) {
+            adjusted.address = None;
+        }
+        let rendered = render_account(&adjusted, direction)?;
         snippet.push_str(&rendered);
     }
     writeln!(snippet, "        ],")?;

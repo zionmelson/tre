@@ -21,7 +21,7 @@ use tonic::{Code, Status};
 use tracing::{debug, info, warn, Level};
 const SYSTEM_PROGRAM_ID: Pubkey = pubkey!("11111111111111111111111111111111");
 
-use crate::builder::{BuilderHandle, BuilderStage, BundleBuildContext};
+use crate::builder::{BuilderHandle, BuilderStage, BundleBuildContext, FlashLoanRoutePlan};
 use crate::bundle::{BundleClient, BundleSubmitResult, BundleTracker, PendingSubmission};
 use crate::cluster::{GateBlockReason, GateVerdict, LeaderScheduleGate};
 use crate::core::{pin_current_thread, Lease, RingConsumer};
@@ -179,6 +179,7 @@ pub trait Stage3Builder: Send + Sync {
     fn payer_pubkey(&self) -> Pubkey;
     fn sign_bundle(&self, ctx: &BundleBuildContext) -> Result<VersionedTransaction>;
     fn heartbeat(&self, stage: BuilderStage);
+    fn release_flash_loan_route(&self, plan: &FlashLoanRoutePlan);
 }
 
 pub trait Stage3BundleClient: Send + Sync {
@@ -406,16 +407,17 @@ fn process_bundle<B, C, N, T>(
     );
     match attempt_submit(&lease, builder, client, simulator) {
         Ok((result, tip_lamports)) => {
-            handle_success(lease, result, tip_lamports, notifier, tracker, source);
+            handle_success(
+                builder,
+                lease,
+                result,
+                tip_lamports,
+                notifier,
+                tracker,
+                source,
+            );
         }
-        Err(err) => handle_failure(
-            lease,
-            err,
-            builder.payer_pubkey(),
-            notifier,
-            tracker,
-            retry_queue,
-        ),
+        Err(err) => handle_failure(builder, lease, err, notifier, tracker, retry_queue),
     }
 }
 
@@ -637,17 +639,20 @@ fn classify_protocol(program_id: &str) -> &'static str {
     }
 }
 
-fn handle_success<N, T>(
-    lease: Lease<BundleCandidate>,
+fn handle_success<B, N, T>(
+    builder: &B,
+    mut lease: Lease<BundleCandidate>,
     submit_result: BundleSubmitResult,
     tip_lamports: Option<u64>,
     notifier: &N,
     tracker: &T,
     source: BundleSource,
 ) where
+    B: Stage3Builder,
     N: Stage3Notifier,
     T: Stage3Tracker,
 {
+    release_flash_loan_reservation(builder, &mut lease);
     let seq = lease.seq;
     let detection_latency = record_stage3_outcome(
         &lease,
@@ -688,14 +693,15 @@ fn handle_success<N, T>(
     );
 }
 
-fn handle_failure<N, T>(
+fn handle_failure<B, N, T>(
+    builder: &B,
     mut lease: Lease<BundleCandidate>,
     err: Stage3Error,
-    payer: Pubkey,
     notifier: &N,
     tracker: &T,
     retry_queue: &mut VecDeque<Lease<BundleCandidate>>,
 ) where
+    B: Stage3Builder,
     N: Stage3Notifier,
     T: Stage3Tracker,
 {
@@ -723,7 +729,8 @@ fn handle_failure<N, T>(
     let tip_lamports = lease
         .bundle_context
         .as_ref()
-        .and_then(|ctx| extract_tip_lamports(ctx, payer));
+        .and_then(|ctx| extract_tip_lamports(ctx, builder.payer_pubkey()));
+    release_flash_loan_reservation(builder, &mut lease);
     let latency =
         record_stage3_outcome(&lease, Stage3SubmissionStatus::Failure, None, tip_lamports);
     emit_submission_alert(
@@ -741,6 +748,15 @@ fn handle_failure<N, T>(
         },
     );
     tracker.record_stage3_failure(seq, lease.created_at, tip_lamports, detail);
+}
+
+fn release_flash_loan_reservation<B: Stage3Builder>(
+    builder: &B,
+    lease: &mut Lease<BundleCandidate>,
+) {
+    if let Some(plan) = lease.flash_loan_reservation.take() {
+        builder.release_flash_loan_route(&plan);
+    }
 }
 
 fn schedule_retry(
@@ -883,6 +899,10 @@ impl Stage3Builder for BuilderHandle {
 
     fn heartbeat(&self, stage: BuilderStage) {
         BuilderHandle::heartbeat(self, stage)
+    }
+
+    fn release_flash_loan_route(&self, plan: &FlashLoanRoutePlan) {
+        BuilderHandle::flash_loan_planner(self).release_route(plan);
     }
 }
 

@@ -2,7 +2,7 @@ use std::{convert::TryFrom, str::FromStr};
 
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
-use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
+use solana_sdk::{instruction::AccountMeta, pubkey, pubkey::Pubkey};
 use tracing::{info, warn};
 
 use crate::builder::templates::{
@@ -12,8 +12,8 @@ use crate::builder::templates::{
     WHIRLPOOL_SWAP_TEMPLATES,
 };
 use crate::builder::{
-    AmmV3FieldLayout, AmmV3PoolMeta, AmmV3TemplateParams, CpAmmFieldLayout, CpAmmPoolMeta,
-    CpAmmTemplateParams, InstructionTemplate, LbClmmFieldLayout, LbClmmPoolMeta,
+    AmmV3FieldLayout, AmmV3PoolAccounts, AmmV3PoolMeta, AmmV3TemplateParams, CpAmmFieldLayout,
+    CpAmmPoolMeta, CpAmmTemplateParams, InstructionTemplate, LbClmmFieldLayout, LbClmmPoolMeta,
     LbClmmTemplateParams, LifinityFieldLayout, LifinityPoolMeta, LifinityTemplateParams,
     TemplateCache, TemplateSlice, WhirlpoolFieldLayout, WhirlpoolPoolMeta, WhirlpoolTemplateParams,
 };
@@ -24,6 +24,8 @@ const DEFAULT_CP_AMM_CU_BUDGET: u32 = 400_000;
 const DEFAULT_LB_CLMM_CU_BUDGET: u32 = 420_000;
 const DEFAULT_LIFINITY_CU_BUDGET: u32 = 320_000;
 const DEFAULT_WHIRLPOOL_CU_BUDGET: u32 = 380_000;
+const AMM_V3_POOL_VAULT_SEED: &[u8] = b"pool_vault";
+const SPL_TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
 pub fn populate_static_templates(cache: &TemplateCache, config: &AppConfig) {
     if let Err(err) = load_amm_v3_templates(cache, config) {
@@ -256,6 +258,10 @@ fn build_amm_v3_params(
         .map(|meta| (meta.pool_id, meta.fee_tier_bps, meta.alt_handle))
         .unwrap_or_else(|| (synth_pool_id(&program_id, template.direction), 0, None));
 
+    let pool_accounts = pool_meta
+        .map(|meta| derive_amm_v3_pool_accounts(meta, &program_id))
+        .transpose()?;
+
     Ok(AmmV3TemplateParams {
         pool_id,
         program_id,
@@ -269,6 +275,53 @@ fn build_amm_v3_params(
         tlv_bytes: 0,
         template_hash,
         alt_handle,
+        account_specs: template.accounts,
+        pool_accounts,
+    })
+}
+
+fn derive_amm_v3_pool_accounts(
+    meta: &AmmV3PoolMeta,
+    program_id: &Pubkey,
+) -> Result<AmmV3PoolAccounts> {
+    let base_bytes = meta.base_mint.to_bytes();
+    let quote_bytes = meta.quote_mint.to_bytes();
+    let base_program = meta.base_token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID);
+    let quote_program = meta.quote_token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID);
+    let (mint0, mint1, mint0_program, mint1_program) = if base_bytes <= quote_bytes {
+        (meta.base_mint, meta.quote_mint, base_program, quote_program)
+    } else {
+        (meta.quote_mint, meta.base_mint, quote_program, base_program)
+    };
+
+    let vault0 = Pubkey::find_program_address(
+        &[
+            AMM_V3_POOL_VAULT_SEED,
+            meta.pool_id.as_ref(),
+            mint0.as_ref(),
+        ],
+        program_id,
+    )
+    .0;
+    let vault1 = Pubkey::find_program_address(
+        &[
+            AMM_V3_POOL_VAULT_SEED,
+            meta.pool_id.as_ref(),
+            mint1.as_ref(),
+        ],
+        program_id,
+    )
+    .0;
+
+    Ok(AmmV3PoolAccounts {
+        amm_config: meta.amm_config,
+        observation_state: meta.observation_state,
+        mint0,
+        mint1,
+        mint0_program,
+        mint1_program,
+        vault0,
+        vault1,
     })
 }
 
@@ -278,16 +331,24 @@ fn build_cp_amm_params(
 ) -> Result<CpAmmTemplateParams> {
     let program_id = Pubkey::from_str(template.program_id)
         .with_context(|| format!("invalid program id {}", template.program_id))?;
-    let accounts = convert_accounts(template.accounts)?;
+    let mut accounts = convert_accounts(template.accounts)?;
 
     let mut data = Vec::with_capacity(64);
     data.extend_from_slice(&template.discriminator);
     let field_layout = encode_cp_amm_args(template, &mut data)?;
-    let template_hash = compute_template_hash(&program_id, &accounts, &data);
 
     let (pool_id, fee_tier_bps, alt_handle) = pool_meta
         .map(|meta| (meta.pool_id, meta.fee_tier_bps, meta.alt_handle))
         .unwrap_or_else(|| (synth_pool_id(&program_id, template.direction), 0, None));
+
+    let pool_accounts = if let Some(meta) = pool_meta {
+        apply_cp_amm_pool_accounts(template.accounts, &mut accounts, meta, template.direction)?;
+        Some(meta.accounts.for_direction(template.direction))
+    } else {
+        None
+    };
+
+    let template_hash = compute_template_hash(&program_id, &accounts, &data);
 
     Ok(CpAmmTemplateParams {
         pool_id,
@@ -302,7 +363,123 @@ fn build_cp_amm_params(
         tlv_bytes: 0,
         template_hash,
         alt_handle,
+        account_specs: template.accounts,
+        pool_accounts,
     })
+}
+
+fn apply_cp_amm_pool_accounts(
+    specs: &[AccountSpec],
+    accounts: &mut [AccountMeta],
+    pool_meta: &CpAmmPoolMeta,
+    direction: SwapTemplateDirection,
+) -> Result<()> {
+    if specs.len() != accounts.len() {
+        anyhow::bail!(
+            "template account/spec length mismatch ({} != {})",
+            accounts.len(),
+            specs.len()
+        );
+    }
+
+    let directional = pool_meta.accounts.for_direction(direction);
+
+    for (spec, meta) in specs.iter().zip(accounts.iter_mut()) {
+        match spec.name {
+            "pool" => {
+                meta.pubkey = pool_meta.pool_id;
+            }
+            "token_a_vault" => {
+                meta.pubkey = resolve_cp_amm_account(
+                    pool_meta.pool_id,
+                    "token_a_vault",
+                    directional.token_a_vault,
+                )?;
+            }
+            "token_b_vault" => {
+                meta.pubkey = resolve_cp_amm_account(
+                    pool_meta.pool_id,
+                    "token_b_vault",
+                    directional.token_b_vault,
+                )?;
+            }
+            "token_a_mint" => {
+                meta.pubkey = directional.token_a_mint;
+            }
+            "token_b_mint" => {
+                meta.pubkey = directional.token_b_mint;
+            }
+            "token_a_program" => {
+                meta.pubkey = resolve_cp_amm_account(
+                    pool_meta.pool_id,
+                    "token_a_program",
+                    directional.token_a_program,
+                )?;
+            }
+            "token_b_program" => {
+                meta.pubkey = resolve_cp_amm_account(
+                    pool_meta.pool_id,
+                    "token_b_program",
+                    directional.token_b_program,
+                )?;
+            }
+            "referral_token_account" => {
+                if let Some(pk) = directional.referral_token_account {
+                    meta.pubkey = pk;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_whirlpool_pool_accounts(
+    specs: &[AccountSpec],
+    accounts: &mut [AccountMeta],
+    pool_meta: &WhirlpoolPoolMeta,
+) -> Result<()> {
+    if specs.len() != accounts.len() {
+        anyhow::bail!(
+            "template account/spec length mismatch ({} != {})",
+            accounts.len(),
+            specs.len()
+        );
+    }
+
+    let vault_a = pool_meta
+        .accounts
+        .token_vault_a
+        .ok_or_else(|| anyhow!("whirlpool pool {} missing token_vault_a", pool_meta.pool_id))?;
+    let vault_b = pool_meta
+        .accounts
+        .token_vault_b
+        .ok_or_else(|| anyhow!("whirlpool pool {} missing token_vault_b", pool_meta.pool_id))?;
+    let oracle = pool_meta
+        .accounts
+        .oracle
+        .ok_or_else(|| anyhow!("whirlpool pool {} missing oracle", pool_meta.pool_id))?;
+
+    for (spec, meta) in specs.iter().zip(accounts.iter_mut()) {
+        match spec.name {
+            "whirlpool" => {
+                meta.pubkey = pool_meta.pool_id;
+            }
+            "tokenVaultA" => {
+                meta.pubkey = vault_a;
+            }
+            "tokenVaultB" => {
+                meta.pubkey = vault_b;
+            }
+            "oracle" => {
+                meta.pubkey = oracle;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn build_lb_clmm_params(
@@ -311,7 +488,10 @@ fn build_lb_clmm_params(
 ) -> Result<LbClmmTemplateParams> {
     let program_id = Pubkey::from_str(template.program_id)
         .with_context(|| format!("invalid program id {}", template.program_id))?;
-    let accounts = convert_accounts(template.accounts)?;
+    let mut accounts = convert_accounts(template.accounts)?;
+    if let Some(meta) = pool_meta {
+        apply_lb_clmm_pool_accounts(template.accounts, &mut accounts, meta)?;
+    }
 
     let mut data = Vec::with_capacity(128);
     data.extend_from_slice(&template.discriminator);
@@ -338,17 +518,153 @@ fn build_lb_clmm_params(
     })
 }
 
+fn apply_lb_clmm_pool_accounts(
+    specs: &[AccountSpec],
+    accounts: &mut [AccountMeta],
+    pool_meta: &LbClmmPoolMeta,
+) -> Result<()> {
+    for (spec, meta) in specs.iter().zip(accounts.iter_mut()) {
+        match spec.name {
+            "lb_pair" => {
+                meta.pubkey = pool_meta.pool_id;
+            }
+            "bin_array_bitmap_extension" => {
+                if let Some(pk) = pool_meta.accounts.bin_array_bitmap_extension {
+                    meta.pubkey = pk;
+                }
+            }
+            "reserve_x" => {
+                meta.pubkey = resolve_required_account(
+                    pool_meta.pool_id,
+                    "reserve_x",
+                    pool_meta.accounts.reserve_x,
+                )?;
+            }
+            "reserve_y" => {
+                meta.pubkey = resolve_required_account(
+                    pool_meta.pool_id,
+                    "reserve_y",
+                    pool_meta.accounts.reserve_y,
+                )?;
+            }
+            "token_x_mint" => {
+                meta.pubkey = pool_meta.accounts.token_x_mint;
+            }
+            "token_y_mint" => {
+                meta.pubkey = pool_meta.accounts.token_y_mint;
+            }
+            "oracle" => {
+                meta.pubkey = resolve_required_account(
+                    pool_meta.pool_id,
+                    "oracle",
+                    pool_meta.accounts.oracle,
+                )?;
+            }
+            "host_fee_in" => {
+                if let Some(pk) = pool_meta.accounts.host_fee_in {
+                    meta.pubkey = pk;
+                }
+            }
+            "token_x_program" => {
+                meta.pubkey = pool_meta.accounts.token_x_program;
+            }
+            "token_y_program" => {
+                meta.pubkey = pool_meta.accounts.token_y_program;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_required_account(pool_id: Pubkey, name: &str, value: Option<Pubkey>) -> Result<Pubkey> {
+    value.ok_or_else(|| anyhow!("pool {} missing {name} account", pool_id))
+}
+
+fn resolve_cp_amm_account(pool_id: Pubkey, name: &str, value: Option<Pubkey>) -> Result<Pubkey> {
+    value.ok_or_else(|| anyhow!("cp_amm pool {} missing {name} account", pool_id))
+}
+
+fn apply_lifinity_pool_accounts(
+    template: &LifinitySwapTemplate,
+    accounts: &mut [AccountMeta],
+    pool_meta: &LifinityPoolMeta,
+) -> Result<()> {
+    let specs = template.accounts;
+    if specs.len() != accounts.len() {
+        anyhow::bail!(
+            "template account/spec length mismatch ({} != {})",
+            accounts.len(),
+            specs.len()
+        );
+    }
+
+    let pool_id = pool_meta.pool_id;
+    let pool_accounts = &pool_meta.accounts;
+    let authority = resolve_required_account(pool_id, "authority", pool_accounts.authority)?;
+    let token_program =
+        resolve_required_account(pool_id, "token_program", pool_accounts.token_program)?;
+    let token_a_vault =
+        resolve_required_account(pool_id, "token_a_vault", pool_accounts.token_a_vault)?;
+    let token_b_vault =
+        resolve_required_account(pool_id, "token_b_vault", pool_accounts.token_b_vault)?;
+    let pool_mint = resolve_required_account(pool_id, "pool_mint", pool_accounts.pool_mint)?;
+    let fee_account = resolve_required_account(pool_id, "fee_account", pool_accounts.fee_account)?;
+    let oracle_main = resolve_required_account(pool_id, "oracle_main", pool_accounts.oracle_main)?;
+    let oracle_sub = resolve_required_account(pool_id, "oracle_sub", pool_accounts.oracle_sub)?;
+    let oracle_pc = resolve_required_account(pool_id, "oracle_pc", pool_accounts.oracle_pc)?;
+
+    let (swap_source, swap_destination) = match template.direction {
+        SwapTemplateDirection::BaseIn => (token_a_vault, token_b_vault),
+        SwapTemplateDirection::BaseOut => (token_b_vault, token_a_vault),
+    };
+
+    for (spec, meta) in specs.iter().zip(accounts.iter_mut()) {
+        if spec.address.is_some() {
+            continue;
+        }
+
+        match spec.name {
+            "authority" => meta.pubkey = authority,
+            "amm" => meta.pubkey = pool_id,
+            "swapSource" => meta.pubkey = swap_source,
+            "swapDestination" => meta.pubkey = swap_destination,
+            "poolMint" => meta.pubkey = pool_mint,
+            "feeAccount" => meta.pubkey = fee_account,
+            "tokenProgram" => meta.pubkey = token_program,
+            "oracleMainAccount" => meta.pubkey = oracle_main,
+            "oracleSubAccount" => meta.pubkey = oracle_sub,
+            "oraclePcAccount" => meta.pubkey = oracle_pc,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn default_spl_token_program_id() -> Pubkey {
+    Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        .expect("static spl token program id")
+}
+
 fn build_lifinity_params(
     template: &LifinitySwapTemplate,
     pool_meta: Option<&LifinityPoolMeta>,
 ) -> Result<LifinityTemplateParams> {
     let program_id = Pubkey::from_str(template.program_id)
         .with_context(|| format!("invalid program id {}", template.program_id))?;
-    let accounts = convert_accounts(template.accounts)?;
+    let mut accounts = convert_accounts(template.accounts)?;
 
     let mut data = Vec::with_capacity(64);
     data.extend_from_slice(&template.discriminator);
     let field_layout = encode_lifinity_args(template, &mut data)?;
+    let pool_accounts = if let Some(meta) = pool_meta {
+        apply_lifinity_pool_accounts(template, &mut accounts, meta)?;
+        Some(meta.accounts.clone())
+    } else {
+        None
+    };
     let template_hash = compute_template_hash(&program_id, &accounts, &data);
 
     let (pool_id, fee_tier_bps, alt_handle) = pool_meta
@@ -368,6 +684,8 @@ fn build_lifinity_params(
         tlv_bytes: 0,
         template_hash,
         alt_handle,
+        account_specs: template.accounts,
+        pool_accounts,
     })
 }
 
@@ -377,7 +695,7 @@ fn build_whirlpool_params(
 ) -> Result<WhirlpoolTemplateParams> {
     let program_id = Pubkey::from_str(template.program_id)
         .with_context(|| format!("invalid program id {}", template.program_id))?;
-    let accounts = convert_accounts(template.accounts)?;
+    let mut accounts = convert_accounts(template.accounts)?;
 
     let mut data = Vec::with_capacity(64);
     data.extend_from_slice(&template.discriminator);
@@ -387,6 +705,13 @@ fn build_whirlpool_params(
     let (pool_id, fee_tier_bps, alt_handle) = pool_meta
         .map(|meta| (meta.pool_id, meta.fee_tier_bps, meta.alt_handle))
         .unwrap_or_else(|| (synth_pool_id(&program_id, template.direction), 0, None));
+
+    let pool_accounts = if let Some(meta) = pool_meta {
+        apply_whirlpool_pool_accounts(template.accounts, &mut accounts, meta)?;
+        Some(meta.accounts.clone())
+    } else {
+        None
+    };
 
     Ok(WhirlpoolTemplateParams {
         pool_id,
@@ -401,6 +726,8 @@ fn build_whirlpool_params(
         tlv_bytes: 0,
         template_hash,
         alt_handle,
+        account_specs: template.accounts,
+        pool_accounts,
     })
 }
 
@@ -438,9 +765,11 @@ fn encode_cp_amm_args(
         ));
     };
 
+    let execution = cp_amm_execution_semantics(template);
+
     match arg.ty {
         "SwapParameters" => encode_swap_parameters(buffer),
-        "SwapParameters2" => encode_swap_parameters2(buffer, template.direction),
+        "SwapParameters2" => encode_swap_parameters2(buffer, execution),
         other => Err(anyhow!("unsupported cp_amm arg type {}", other)),
     }
 }
@@ -457,17 +786,34 @@ fn encode_swap_parameters(buffer: &mut Vec<u8>) -> Result<CpAmmFieldLayout> {
 const CP_AMM_SWAP_MODE_EXACT_IN: u8 = 0;
 const CP_AMM_SWAP_MODE_EXACT_OUT: u8 = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpAmmSwapExecution {
+    ExactIn,
+    ExactOut,
+}
+
+impl CpAmmSwapExecution {
+    fn swap_mode(self) -> u8 {
+        match self {
+            Self::ExactIn => CP_AMM_SWAP_MODE_EXACT_IN,
+            Self::ExactOut => CP_AMM_SWAP_MODE_EXACT_OUT,
+        }
+    }
+}
+
+fn cp_amm_execution_semantics(_template: &CpAmmSwapTemplate) -> CpAmmSwapExecution {
+    // Stage1 and the cp_amm adapter exclusively emit exact-in semantics today,
+    // regardless of mint direction. Generate templates that match that behavior.
+    CpAmmSwapExecution::ExactIn
+}
+
 fn encode_swap_parameters2(
     buffer: &mut Vec<u8>,
-    direction: SwapTemplateDirection,
+    execution: CpAmmSwapExecution,
 ) -> Result<CpAmmFieldLayout> {
     let amount_in = write_u64(buffer, 0)?;
     let min_out = write_u64(buffer, 0)?;
-    let swap_mode = match direction {
-        SwapTemplateDirection::BaseIn => CP_AMM_SWAP_MODE_EXACT_IN,
-        SwapTemplateDirection::BaseOut => CP_AMM_SWAP_MODE_EXACT_OUT,
-    };
-    buffer.push(swap_mode);
+    buffer.push(execution.swap_mode());
     Ok(CpAmmFieldLayout {
         amount_in,
         minimum_output: min_out,

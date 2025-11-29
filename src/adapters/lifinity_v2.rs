@@ -1,15 +1,20 @@
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
 
-use crate::builder::{BuilderHandle, LifinityPoolMeta};
+use crate::builder::{
+    templates::SwapTemplateDirection, BuilderHandle, LifinityPoolAccounts, LifinityPoolMeta,
+};
 use crate::stages::types::{
     LifinityPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
 };
@@ -21,6 +26,8 @@ use super::{
 };
 
 const LIFINITY_PROGRAM_ID: &str = "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c";
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvR93dthLvYbAphit9L8ZsfsZp7r4HQJDebg";
 const BPS_DENOMINATOR: u64 = 10_000;
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
@@ -28,6 +35,14 @@ const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const LIFINITY_DEFAULT_CU_LIMIT: u32 = 320_000;
 
 const DEFAULT_LIFINITY_HYDRATION_RETRY_MS: u64 = 60_000;
+
+static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program should be valid")
+});
+static ASSOCIATED_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID)
+        .expect("static associated token program should be valid")
+});
 
 #[derive(Debug, Clone)]
 pub struct LifinityAdapterConfig {
@@ -52,6 +67,11 @@ impl Default for LifinityAdapterConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LifinityRegistrationState {
+    fingerprint: u64,
+}
+
 pub struct LifinityAdapter {
     program_id: Pubkey,
     state: DashMap<Pubkey, LifinityPoolState>,
@@ -59,7 +79,7 @@ pub struct LifinityAdapter {
     hydrator: Option<LifinityPoolHydrator>,
     oracle_cache: Option<LifinityOracleCache>,
     template_builder: Option<BuilderHandle>,
-    registered_templates: DashSet<Pubkey>,
+    registered_templates: DashMap<Pubkey, LifinityRegistrationState>,
 }
 
 impl LifinityAdapter {
@@ -95,7 +115,7 @@ impl LifinityAdapter {
             hydrator,
             oracle_cache,
             template_builder,
-            registered_templates: DashSet::new(),
+            registered_templates: DashMap::new(),
         }
     }
 
@@ -291,50 +311,152 @@ impl LifinityAdapter {
         let Some(builder) = self.template_builder.as_ref() else {
             return;
         };
+        let (meta, fingerprint) = match self.build_lifinity_meta(state) {
+            Some(value) => value,
+            None => return,
+        };
 
-        if !self.registered_templates.insert(state.amm) {
-            return;
+        let template_ready = self.templates_ready(builder, state.amm);
+        if let Some(entry) = self.registered_templates.get(&state.amm) {
+            if entry.fingerprint == fingerprint && template_ready {
+                return;
+            }
         }
+
+        builder.register_lifinity_pool(meta);
+        self.registered_templates
+            .insert(state.amm, LifinityRegistrationState { fingerprint });
+    }
+
+    fn build_lifinity_meta(&self, state: &LifinityPoolState) -> Option<(LifinityPoolMeta, u64)> {
+        macro_rules! require {
+            ($value:expr, $label:literal) => {
+                match $value {
+                    Some(entry) => entry,
+                    None => {
+                        warn!(
+                            target = "adapter::lifinity",
+                            pool = %state.amm,
+                            concat!(
+                                "lifinity pool missing ",
+                                $label,
+                                " metadata; skipping registration"
+                            )
+                        );
+                        return None;
+                    }
+                }
+            };
+        }
+
+        let authority = require!(state.authority, "authority");
+        let token_program = require!(state.token_program, "token_program");
+        let token_a_vault = require!(state.token_a_vault, "token_a_vault");
+        let token_b_vault = require!(state.token_b_vault, "token_b_vault");
+        let pool_mint = require!(state.pool_mint, "pool_mint");
+        let fee_account = require!(state.fee_account, "fee_account");
+        let oracle_main = require!(state.oracle_main, "oracle_main");
+        let oracle_sub = require!(state.oracle_sub, "oracle_sub");
+        let oracle_pc = require!(state.oracle_pc, "oracle_pc");
 
         let mut alt_accounts = Vec::with_capacity(12);
         alt_accounts.push(state.amm);
         alt_accounts.push(state.base_mint);
         alt_accounts.push(state.quote_mint);
-        if let Some(pk) = state.authority {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.token_a_vault {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.token_b_vault {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.pool_mint {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.fee_account {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.token_program {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.oracle_main {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.oracle_sub {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.oracle_pc {
-            alt_accounts.push(pk);
-        }
+        alt_accounts.push(authority);
+        alt_accounts.push(token_a_vault);
+        alt_accounts.push(token_b_vault);
+        alt_accounts.push(pool_mint);
+        alt_accounts.push(fee_account);
+        alt_accounts.push(token_program);
+        alt_accounts.push(oracle_main);
+        alt_accounts.push(oracle_sub);
+        alt_accounts.push(oracle_pc);
 
         let fee_tier_bps = base_fee_bps(state).min(u64::from(u16::MAX)) as u16;
-        builder.register_lifinity_pool(LifinityPoolMeta {
-            pool_id: state.amm,
-            fee_tier_bps,
-            alt_accounts,
-            alt_handle: None,
-        });
+        let accounts = LifinityPoolAccounts {
+            base_mint: state.base_mint,
+            quote_mint: state.quote_mint,
+            authority: Some(authority),
+            token_program: Some(token_program),
+            token_a_vault: Some(token_a_vault),
+            token_b_vault: Some(token_b_vault),
+            pool_mint: Some(pool_mint),
+            fee_account: Some(fee_account),
+            oracle_main: Some(oracle_main),
+            oracle_sub: Some(oracle_sub),
+            oracle_pc: Some(oracle_pc),
+        };
+        let fingerprint =
+            Self::lifinity_registration_fingerprint(state.amm, &accounts, fee_tier_bps);
+
+        Some((
+            LifinityPoolMeta {
+                pool_id: state.amm,
+                fee_tier_bps,
+                alt_accounts,
+                alt_handle: None,
+                accounts,
+            },
+            fingerprint,
+        ))
+    }
+
+    fn templates_ready(&self, builder: &BuilderHandle, pool: Pubkey) -> bool {
+        let forward = builder.template_readiness(&pool, SwapTemplateDirection::BaseIn);
+        let reverse = builder.template_readiness(&pool, SwapTemplateDirection::BaseOut);
+        forward.template_ready && forward.alt_ready && reverse.template_ready && reverse.alt_ready
+    }
+
+    fn lifinity_registration_fingerprint(
+        pool: Pubkey,
+        accounts: &LifinityPoolAccounts,
+        fee_tier_bps: u16,
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        pool.hash(&mut hasher);
+        fee_tier_bps.hash(&mut hasher);
+        accounts.base_mint.hash(&mut hasher);
+        accounts.quote_mint.hash(&mut hasher);
+        accounts.authority.hash(&mut hasher);
+        accounts.token_program.hash(&mut hasher);
+        accounts.token_a_vault.hash(&mut hasher);
+        accounts.token_b_vault.hash(&mut hasher);
+        accounts.pool_mint.hash(&mut hasher);
+        accounts.fee_account.hash(&mut hasher);
+        accounts.oracle_main.hash(&mut hasher);
+        accounts.oracle_sub.hash(&mut hasher);
+        accounts.oracle_pc.hash(&mut hasher);
+        hasher.finish()
+    }
+    fn decorate_template_context(
+        &self,
+        state: &LifinityPoolState,
+        context: &mut TemplateContext,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+    ) {
+        let Some(builder) = self.template_builder.as_ref() else {
+            return;
+        };
+        let payer = context.payer.unwrap_or_else(|| builder.payer_pubkey());
+        context.payer = Some(payer);
+
+        let token_program = token_program_for_lifinity(state);
+        if context.input_token_account.is_none() {
+            context.input_token_account = Some(derive_associated_token_address(
+                &payer,
+                &token_program,
+                &input_mint,
+            ));
+        }
+        if context.output_token_account.is_none() {
+            context.output_token_account = Some(derive_associated_token_address(
+                &payer,
+                &token_program,
+                &output_mint,
+            ));
+        }
     }
 
     fn ensure_oracles_healthy(&self, state: &LifinityPoolState, current_slot: u64) -> bool {
@@ -472,6 +594,7 @@ impl LifinityAdapter {
         let ctx = select_reserves(state, &req)?;
         let expected_output = lifinity_amount_out(probe_amount, ctx, state)?;
         let fee_bps = total_effective_fee_bps(probe_amount, &ctx, state);
+        let template_fee_bps = base_fee_bps(state).min(u64::from(u16::MAX)) as u16;
 
         let execution_price = if probe_amount == 0 {
             0.0
@@ -500,15 +623,20 @@ impl LifinityAdapter {
             notional: probe_amount,
             expected_output,
             fee_bps,
+            template_fee_bps,
             effective_price: execution_price,
             estimated_slippage_bps: slippage_bps,
             sqrt_price_limit: None,
             min_output_amount: Some(expected_output),
             limit_price: None,
             price_impact_limit_bps: None,
-            context: TemplateContext {
-                compute_unit_limit: Some(LIFINITY_DEFAULT_CU_LIMIT),
-                ..Default::default()
+            context: {
+                let mut ctx = TemplateContext {
+                    compute_unit_limit: Some(LIFINITY_DEFAULT_CU_LIMIT),
+                    ..Default::default()
+                };
+                self.decorate_template_context(state, &mut ctx, input_mint, output_mint);
+                ctx
             },
         })
     }
@@ -554,10 +682,13 @@ impl ProtocolAdapter for LifinityAdapter {
         }
 
         let ctx = select_reserves(&state, &req)?;
+        let input_mint = req.input_mint;
+        let output_mint = req.output_mint;
         let amount_out = lifinity_amount_out(req.amount, ctx, &state)?;
         let mut response = build_quote_response(req, amount_out);
         response.min_output_amount = Some(amount_out);
         response.context.compute_unit_limit = Some(LIFINITY_DEFAULT_CU_LIMIT);
+        self.decorate_template_context(&state, &mut response.context, input_mint, output_mint);
         Some(response)
     }
 
@@ -785,6 +916,22 @@ fn apply_bps_cut(amount: u128, fee_bps: u64) -> u128 {
     }
 
     amount.saturating_mul(retained_bps) / (BPS_DENOMINATOR as u128)
+}
+
+fn token_program_for_lifinity(state: &LifinityPoolState) -> Pubkey {
+    state.token_program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY)
+}
+
+fn derive_associated_token_address(
+    owner: &Pubkey,
+    token_program: &Pubkey,
+    mint: &Pubkey,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_PUBKEY,
+    )
+    .0
 }
 
 fn slot_within_limit(current_slot: u64, snapshot_slot: u64, limit: Option<u64>) -> bool {

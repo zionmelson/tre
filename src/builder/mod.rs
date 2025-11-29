@@ -24,14 +24,17 @@ use tracing::warn;
 
 pub use alt_manager::{AltManager, AltManagerStats};
 pub use bundle_builder::{BundleBuildContext, BundleInstructionPlan, BundleLookupTablePlan};
-pub use flash_loan::{compute_flash_loan_fee, FlashLoanPlanner, FlashLoanRoutePlan};
+pub use flash_loan::{
+    compute_flash_loan_fee, FlashLoanPlanner, FlashLoanRoutePlan, FLASH_LOAN_BPS_DENOMINATOR,
+    SOLEND_FLASH_LOAN_FEE_BPS,
+};
 pub use mev_guard::MevGuard;
 pub use template_cache::{
-    AltHandleId, AmmV3Field, AmmV3FieldLayout, AmmV3TemplateParams, CpAmmField, CpAmmFieldLayout,
-    CpAmmTemplateParams, InstructionTemplate, LbClmmField, LbClmmFieldLayout, LbClmmTemplateParams,
-    LifinityField, LifinityFieldLayout, LifinityTemplateParams, TemplateCache, TemplateCacheKey,
-    TemplateCacheStats, TemplateFieldKind, TemplatePatch, TemplateSlice, WhirlpoolField,
-    WhirlpoolFieldLayout, WhirlpoolTemplateParams,
+    AltHandleId, AmmV3Field, AmmV3FieldLayout, AmmV3PoolAccounts, AmmV3TemplateParams, CpAmmField,
+    CpAmmFieldLayout, CpAmmTemplateParams, InstructionTemplate, LbClmmField, LbClmmFieldLayout,
+    LbClmmTemplateParams, LifinityField, LifinityFieldLayout, LifinityTemplateParams,
+    TemplateCache, TemplateCacheKey, TemplateCacheStats, TemplateFieldKind, TemplateMetadata,
+    TemplatePatch, TemplateSlice, WhirlpoolField, WhirlpoolFieldLayout, WhirlpoolTemplateParams,
 };
 pub use tx_graph::TxGraph;
 
@@ -143,16 +146,16 @@ impl BuilderHandle {
         &self,
         pool: &Pubkey,
         direction: templates::SwapTemplateDirection,
-        fee_tier_bps: u16,
     ) -> TemplateReadiness {
-        let key = TemplateCacheKey::new(*pool, direction, fee_tier_bps);
+        let key = TemplateCacheKey::new(*pool, direction);
         if let Some(template) = self.0.template_cache.get(&key) {
             let alt_ready = template
                 .alt_handle
                 .map(|handle| self.0.alt_manager.table_info(handle).is_some())
                 .unwrap_or(true);
+            let template_ready = template.is_hydrated();
             TemplateReadiness {
-                template_ready: true,
+                template_ready,
                 alt_ready,
             }
         } else {
@@ -297,6 +300,12 @@ pub enum BuilderStage {
 pub struct AmmV3PoolMeta {
     pub pool_id: Pubkey,
     pub fee_tier_bps: u16,
+    pub base_mint: Pubkey,
+    pub quote_mint: Pubkey,
+    pub base_token_program: Option<Pubkey>,
+    pub quote_token_program: Option<Pubkey>,
+    pub amm_config: Pubkey,
+    pub observation_state: Pubkey,
     pub alt_accounts: Vec<Pubkey>,
     pub alt_handle: Option<AltHandleId>,
 }
@@ -307,6 +316,58 @@ pub struct CpAmmPoolMeta {
     pub fee_tier_bps: u16,
     pub alt_accounts: Vec<Pubkey>,
     pub alt_handle: Option<AltHandleId>,
+    pub accounts: CpAmmPoolAccounts,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpAmmPoolAccounts {
+    pub token_a_mint: Pubkey,
+    pub token_b_mint: Pubkey,
+    pub token_a_vault: Option<Pubkey>,
+    pub token_b_vault: Option<Pubkey>,
+    pub token_a_program: Option<Pubkey>,
+    pub token_b_program: Option<Pubkey>,
+    pub referral_token_account: Option<Pubkey>,
+}
+
+impl CpAmmPoolAccounts {
+    pub fn for_direction(&self, direction: templates::SwapTemplateDirection) -> Self {
+        match direction {
+            templates::SwapTemplateDirection::BaseIn => self.clone(),
+            templates::SwapTemplateDirection::BaseOut => Self {
+                token_a_mint: self.token_b_mint,
+                token_b_mint: self.token_a_mint,
+                token_a_vault: self.token_b_vault,
+                token_b_vault: self.token_a_vault,
+                token_a_program: self.token_b_program,
+                token_b_program: self.token_a_program,
+                referral_token_account: self.referral_token_account,
+            },
+        }
+    }
+
+    pub fn is_populated(&self) -> bool {
+        const ZERO: Pubkey = Pubkey::new_from_array([0u8; 32]);
+        self.token_a_mint != ZERO
+            && self.token_b_mint != ZERO
+            && self.token_a_vault.is_some()
+            && self.token_b_vault.is_some()
+            && self.token_a_program.is_some()
+            && self.token_b_program.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LbClmmPoolAccounts {
+    pub reserve_x: Option<Pubkey>,
+    pub reserve_y: Option<Pubkey>,
+    pub token_x_mint: Pubkey,
+    pub token_y_mint: Pubkey,
+    pub oracle: Option<Pubkey>,
+    pub bin_array_bitmap_extension: Option<Pubkey>,
+    pub token_x_program: Pubkey,
+    pub token_y_program: Pubkey,
+    pub host_fee_in: Option<Pubkey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,6 +376,39 @@ pub struct LbClmmPoolMeta {
     pub fee_tier_bps: u16,
     pub alt_accounts: Vec<Pubkey>,
     pub alt_handle: Option<AltHandleId>,
+    pub accounts: LbClmmPoolAccounts,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LifinityPoolAccounts {
+    pub base_mint: Pubkey,
+    pub quote_mint: Pubkey,
+    pub authority: Option<Pubkey>,
+    pub token_program: Option<Pubkey>,
+    pub token_a_vault: Option<Pubkey>,
+    pub token_b_vault: Option<Pubkey>,
+    pub pool_mint: Option<Pubkey>,
+    pub fee_account: Option<Pubkey>,
+    pub oracle_main: Option<Pubkey>,
+    pub oracle_sub: Option<Pubkey>,
+    pub oracle_pc: Option<Pubkey>,
+}
+
+impl LifinityPoolAccounts {
+    pub fn is_populated(&self) -> bool {
+        const ZERO: Pubkey = Pubkey::new_from_array([0u8; 32]);
+        self.base_mint != ZERO
+            && self.quote_mint != ZERO
+            && self.authority.is_some()
+            && self.token_program.is_some()
+            && self.token_a_vault.is_some()
+            && self.token_b_vault.is_some()
+            && self.pool_mint.is_some()
+            && self.fee_account.is_some()
+            && self.oracle_main.is_some()
+            && self.oracle_sub.is_some()
+            && self.oracle_pc.is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,6 +417,28 @@ pub struct LifinityPoolMeta {
     pub fee_tier_bps: u16,
     pub alt_accounts: Vec<Pubkey>,
     pub alt_handle: Option<AltHandleId>,
+    pub accounts: LifinityPoolAccounts,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WhirlpoolPoolAccounts {
+    pub whirlpool: Pubkey,
+    pub token_mint_a: Pubkey,
+    pub token_mint_b: Pubkey,
+    pub token_vault_a: Option<Pubkey>,
+    pub token_vault_b: Option<Pubkey>,
+    pub oracle: Option<Pubkey>,
+}
+
+impl WhirlpoolPoolAccounts {
+    pub fn is_populated(&self) -> bool {
+        const ZERO: Pubkey = Pubkey::new_from_array([0u8; 32]);
+        self.whirlpool != ZERO
+            && self.token_mint_a != ZERO
+            && self.token_mint_b != ZERO
+            && self.token_vault_a.is_some()
+            && self.token_vault_b.is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,4 +447,5 @@ pub struct WhirlpoolPoolMeta {
     pub fee_tier_bps: u16,
     pub alt_accounts: Vec<Pubkey>,
     pub alt_handle: Option<AltHandleId>,
+    pub accounts: WhirlpoolPoolAccounts,
 }

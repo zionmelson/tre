@@ -35,6 +35,7 @@ struct TelemetryState {
     stage1_backpressure_events: Family<Stage1BackpressureLabels, Counter>,
     stage1_pool_drain_events: Family<Stage1PoolDrainLabels, Counter>,
     stage2_plan_events: Family<Stage2PlanLabels, Counter>,
+    stage2_pool_blocks: Family<Stage2PoolLabels, Counter>,
     stage3_retry_events: Family<Stage3RetryLabels, Counter>,
     stage1_feed_gap_events: Family<Stage1FeedGapLabels, Counter>,
 }
@@ -134,6 +135,13 @@ impl TelemetryState {
             stage2_plan_events.clone(),
         );
 
+        let stage2_pool_blocks = Family::default();
+        registry.register(
+            "stage2_pool_blockers_total",
+            "Stage2 readiness blocks grouped by pool id",
+            stage2_pool_blocks.clone(),
+        );
+
         let stage3_retry_events = Family::default();
         registry.register(
             "stage3_retry_events_total",
@@ -163,6 +171,7 @@ impl TelemetryState {
             stage1_backpressure_events,
             stage1_pool_drain_events,
             stage2_plan_events,
+            stage2_pool_blocks,
             stage3_retry_events,
             stage1_feed_gap_events,
         }
@@ -388,10 +397,24 @@ pub fn record_stage1_feed_gap(event: Stage1FeedGapEvent) {
         state.stage1_feed_gap_events.get_or_create(&labels).inc();
     }
 }
+
+pub fn record_stage2_pool_block(pool_id: &str) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = Stage2PoolLabels {
+            pool_id: pool_id.to_string(),
+        };
+        state.stage2_pool_blocks.get_or_create(&labels).inc();
+    }
+}
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 struct Stage2PlanLabels {
     event: &'static str,
     reason: &'static str,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct Stage2PoolLabels {
+    pool_id: String,
 }
 
 pub fn record_stage3_outcome(

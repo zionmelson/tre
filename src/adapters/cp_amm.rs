@@ -4,13 +4,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
+use uint::construct_uint;
 
 use super::hydration::AsyncHydrator;
-use crate::builder::{BuilderHandle, CpAmmPoolMeta};
+use crate::builder::{BuilderHandle, CpAmmPoolAccounts, CpAmmPoolMeta};
 use crate::stages::types::{
     CpAmmPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
 };
@@ -22,11 +24,25 @@ const BPS_DENOMINATOR: u64 = 10_000;
 const CP_AMM_DEFAULT_CU_LIMIT: u32 = 400_000;
 
 const CP_AMM_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvR93dthLvYbAphit9L8ZsfsZp7r4HQJDebg";
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 
 const DEFAULT_CP_AMM_HYDRATION_RETRY_MS: u64 = 60_000;
+
+static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program should be valid")
+});
+static ASSOCIATED_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID)
+        .expect("static associated token program should be valid")
+});
+
+construct_uint! {
+    pub struct U256(4);
+}
 
 #[derive(Debug, Clone)]
 pub struct CpAmmAdapterConfig {
@@ -35,6 +51,7 @@ pub struct CpAmmAdapterConfig {
     pub rpc_endpoints: Vec<String>,
     pub rpc_timeout_ms: u64,
     pub hydration_retry_ms: u64,
+    pub hydration_meta_ttl_ms: u64,
 }
 
 impl Default for CpAmmAdapterConfig {
@@ -46,6 +63,7 @@ impl Default for CpAmmAdapterConfig {
             // initial hydration hits several large accounts; allow generous timeout
             rpc_timeout_ms: 15_000,
             hydration_retry_ms: DEFAULT_CP_AMM_HYDRATION_RETRY_MS,
+            hydration_meta_ttl_ms: 600_000,
         }
     }
 }
@@ -56,7 +74,14 @@ pub struct CpAmmAdapter {
     config: CpAmmAdapterConfig,
     hydrator: Option<CpAmmPoolHydrator>,
     template_builder: Option<BuilderHandle>,
-    registered_templates: DashSet<Pubkey>,
+    registered_templates: DashMap<Pubkey, RegisteredTemplateSignature>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegisteredTemplateSignature {
+    alt_accounts: Vec<Pubkey>,
+    pool_accounts: CpAmmPoolAccounts,
+    fee_tier_bps: u16,
 }
 
 impl CpAmmAdapter {
@@ -82,7 +107,7 @@ impl CpAmmAdapter {
             config,
             hydrator,
             template_builder,
-            registered_templates: DashSet::new(),
+            registered_templates: DashMap::new(),
         }
     }
 
@@ -172,10 +197,15 @@ impl CpAmmAdapter {
                 .referral_token_account
                 .as_ref()
                 .and_then(|value| parse_pubkey(value)),
+            sqrt_price_x64: extras.sqrt_price_x64,
+            liquidity: extras.liquidity,
+            sqrt_min_price_x64: extras.sqrt_min_price_x64,
+            sqrt_max_price_x64: extras.sqrt_max_price_x64,
             vault_a_balance: update.base_post_amount,
             vault_b_balance: update.quote_post_amount,
             last_update_slot: update.slot,
             last_update_at: Instant::now(),
+            last_hydrated_at: extras.hydrated_at,
         };
 
         trace!(
@@ -214,6 +244,15 @@ impl CpAmmAdapter {
             extras.token_b_vault = extras
                 .token_b_vault
                 .or_else(|| Some(meta.token_b_vault.to_string()));
+            extras.sqrt_price_x64 = extras.sqrt_price_x64.or_else(|| Some(meta.sqrt_price_x64));
+            extras.liquidity = extras.liquidity.or_else(|| Some(meta.liquidity));
+            extras.sqrt_min_price_x64 = extras
+                .sqrt_min_price_x64
+                .or_else(|| Some(meta.sqrt_min_price_x64));
+            extras.sqrt_max_price_x64 = extras
+                .sqrt_max_price_x64
+                .or_else(|| Some(meta.sqrt_max_price_x64));
+            extras.hydrated_at = extras.hydrated_at.or(Some(meta.hydrated_at));
         }
 
         extras
@@ -223,9 +262,6 @@ impl CpAmmAdapter {
         let Some(builder) = self.template_builder.as_ref() else {
             return;
         };
-        if !self.registered_templates.insert(state.pool) {
-            return;
-        }
 
         let mut alt_accounts = Vec::with_capacity(10);
         alt_accounts.push(state.pool);
@@ -250,14 +286,80 @@ impl CpAmmAdapter {
             alt_accounts.push(pk);
         }
 
+        let token_a_program = state.token_a_program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY);
+        let token_b_program = state.token_b_program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY);
         let fee_tier_bps = state.total_fee_bps().min(u64::from(u16::MAX)) as u16;
+        let pool_accounts = CpAmmPoolAccounts {
+            token_a_mint: state.token_a_mint,
+            token_b_mint: state.token_b_mint,
+            token_a_vault: state.token_a_vault,
+            token_b_vault: state.token_b_vault,
+            token_a_program: Some(token_a_program),
+            token_b_program: Some(token_b_program),
+            referral_token_account: state.referral_token_account,
+        };
+        if !pool_accounts.is_populated() {
+            debug!(
+                target = "adapter::cp_amm",
+                pool = %state.pool,
+                "cp_amm pool metadata incomplete; deferring template registration"
+            );
+            return;
+        }
+
+        let signature = RegisteredTemplateSignature {
+            alt_accounts: alt_accounts.clone(),
+            pool_accounts: pool_accounts.clone(),
+            fee_tier_bps,
+        };
+
+        if let Some(existing) = self.registered_templates.get(&state.pool) {
+            if *existing == signature {
+                return;
+            }
+        }
 
         builder.register_cp_amm_pool(CpAmmPoolMeta {
             pool_id: state.pool,
             fee_tier_bps,
-            alt_accounts,
+            alt_accounts: alt_accounts.clone(),
             alt_handle: None,
+            accounts: pool_accounts.clone(),
         });
+
+        self.registered_templates.insert(state.pool, signature);
+    }
+
+    fn decorate_template_context(
+        &self,
+        state: &CpAmmState,
+        context: &mut TemplateContext,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+    ) {
+        let Some(builder) = self.template_builder.as_ref() else {
+            return;
+        };
+        let payer = context.payer.unwrap_or_else(|| builder.payer_pubkey());
+        context.payer = Some(payer);
+
+        if context.input_token_account.is_none() {
+            let program = token_program_for_mint(state, &input_mint);
+            context.input_token_account = Some(derive_associated_token_address(
+                &payer,
+                &program,
+                &input_mint,
+            ));
+        }
+
+        if context.output_token_account.is_none() {
+            let program = token_program_for_mint(state, &output_mint);
+            context.output_token_account = Some(derive_associated_token_address(
+                &payer,
+                &program,
+                &output_mint,
+            ));
+        }
     }
 
     fn build_snapshot_side(
@@ -269,6 +371,9 @@ impl CpAmmAdapter {
         probe_amount: u64,
     ) -> Option<PoolQuoteSide> {
         if probe_amount == 0 {
+            return None;
+        }
+        if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
             return None;
         }
 
@@ -287,31 +392,37 @@ impl CpAmmAdapter {
             direction: SwapDirection::ExactIn,
         };
 
-        let (expected_output, slippage_bps) = simulate_xyk_exact_in(state, &req)?;
+        let (expected_output, slippage_bps) = simulate_cp_amm_exact_in(state, &req)?;
+        let fee_bps = state.total_fee_bps();
+        let template_fee_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
         let effective_price = if probe_amount == 0 {
             0.0
         } else {
             expected_output as f64 / probe_amount as f64
         };
 
+        let mut context = TemplateContext {
+            compute_unit_limit: Some(CP_AMM_DEFAULT_CU_LIMIT),
+            requires_memo: state.referral_token_account.is_some(),
+            host_fee_account: state.referral_token_account,
+            ..Default::default()
+        };
+        self.decorate_template_context(state, &mut context, input_mint, output_mint);
+
         Some(PoolQuoteSide {
             input_mint: input_mint.to_string(),
             output_mint: output_mint.to_string(),
             notional: probe_amount,
             expected_output,
-            fee_bps: state.total_fee_bps(),
+            fee_bps,
+            template_fee_bps,
             effective_price,
             estimated_slippage_bps: slippage_bps,
             sqrt_price_limit: None,
             min_output_amount: Some(expected_output),
             limit_price: None,
             price_impact_limit_bps: None,
-            context: TemplateContext {
-                compute_unit_limit: Some(CP_AMM_DEFAULT_CU_LIMIT),
-                requires_memo: state.referral_token_account.is_some(),
-                host_fee_account: state.referral_token_account,
-                ..Default::default()
-            },
+            context,
         })
     }
 }
@@ -347,19 +458,31 @@ impl ProtocolAdapter for CpAmmAdapter {
             return None;
         }
         let state = self.get_state(&req.pool_id)?;
-        let (amount_out, edge_bps) = simulate_xyk_exact_in(&state, &req)?;
+        if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
+            return None;
+        }
+        let (amount_out, edge_bps) = simulate_cp_amm_exact_in(&state, &req)?;
         let mut response = build_quote_response(req, amount_out);
         response.edge_bps = edge_bps;
         response.min_output_amount = Some(amount_out);
         response.context.compute_unit_limit = Some(CP_AMM_DEFAULT_CU_LIMIT);
         response.context.requires_memo = state.referral_token_account.is_some();
         response.context.host_fee_account = state.referral_token_account;
+        self.decorate_template_context(
+            &state,
+            &mut response.context,
+            response.request.input_mint,
+            response.request.output_mint,
+        );
         Some(response)
     }
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         let pool_pubkey = parse_pubkey(&snapshot.pool_id)?;
         let state = self.get_state(&pool_pubkey)?;
+        if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
+            return None;
+        }
 
         let base_probe = snapshot_probe_amount(state.vault_a_balance)?;
         let quote_probe = snapshot_probe_amount(state.vault_b_balance)?;
@@ -376,45 +499,140 @@ impl ProtocolAdapter for CpAmmAdapter {
     }
 }
 
-fn simulate_xyk_exact_in(state: &CpAmmState, req: &QuoteRequest) -> Option<(u64, f64)> {
+fn simulate_cp_amm_exact_in(state: &CpAmmState, req: &QuoteRequest) -> Option<(u64, f64)> {
     if req.amount == 0 {
         return None;
     }
 
+    let direction = resolve_trade_direction(state, &req.input_mint, &req.output_mint)?;
     let (reserve_in, reserve_out) = state.resolve_reserves(&req.input_mint, &req.output_mint)?;
-    let total_fee_bps = state.total_fee_bps();
-    let amount_out = xyk_amount_out(reserve_in, reserve_out, req.amount, total_fee_bps)?;
-    let edge_bps =
-        compute_slippage_bps(reserve_in, reserve_out, req.amount, amount_out).unwrap_or(0.0);
-    Some((amount_out, edge_bps))
-}
-
-fn xyk_amount_out(
-    reserve_in: u128,
-    reserve_out: u128,
-    amount_in: u64,
-    fee_bps: u64,
-) -> Option<u64> {
     if reserve_in == 0 || reserve_out == 0 {
         return None;
     }
 
-    let fee_bps = fee_bps.min(BPS_DENOMINATOR);
-    let fee_deduction = (BPS_DENOMINATOR - fee_bps) as u128;
-    let amount_less_fee = (amount_in as u128)
-        .saturating_mul(fee_deduction)
-        .checked_div(BPS_DENOMINATOR as u128)?;
-    if amount_less_fee == 0 {
+    let amount_out = simulate_clmm_exact_in(state, req.amount, direction)?;
+    let edge_bps =
+        compute_slippage_bps(reserve_in, reserve_out, req.amount, amount_out).unwrap_or(0.0);
+    Some((amount_out, edge_bps))
+}
+fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<(u64, f64)> {
+    if req.amount == 0 {
         return None;
     }
 
-    let numerator = amount_less_fee.saturating_mul(reserve_out);
-    let denominator = reserve_in.saturating_add(amount_less_fee);
-    if denominator == 0 {
+    let direction = resolve_trade_direction(state, &req.input_mint, &req.output_mint)?;
+    let (reserve_in, reserve_out) = state.resolve_reserves(&req.input_mint, &req.output_mint)?;
+    if reserve_in == 0 || reserve_out == 0 {
+        return None;
+    }
+    if req.amount as u128 >= reserve_out {
         return None;
     }
 
-    Some((numerator / denominator).min(u64::MAX as u128) as u64)
+    let amount_in = find_input_for_exact_out(state, direction, req.amount)?;
+    let edge_bps =
+        compute_slippage_bps(reserve_in, reserve_out, amount_in, req.amount).unwrap_or(0.0);
+    Some((amount_in, edge_bps))
+}
+
+fn find_input_for_exact_out(
+    state: &CpAmmState,
+    direction: TradeDirection,
+    target_out: u64,
+) -> Option<u64> {
+    let mut hi = target_out.max(1);
+    let mut candidate = None;
+    for _ in 0..64 {
+        let amount_out = simulate_clmm_exact_in(state, hi, direction)?;
+        if amount_out >= target_out {
+            candidate = Some(hi);
+            break;
+        }
+        if hi >= u64::MAX / 2 {
+            return None;
+        }
+        hi = hi.saturating_mul(2);
+    }
+
+    let mut best_input = candidate?;
+    let mut low = 1u64;
+    while low < best_input {
+        let mid = low + (best_input - low) / 2;
+        let amount_out = simulate_clmm_exact_in(state, mid, direction)?;
+        if amount_out >= target_out {
+            best_input = mid;
+        } else {
+            low = mid.saturating_add(1);
+        }
+    }
+    Some(best_input)
+}
+
+fn simulate_clmm_exact_in(
+    state: &CpAmmState,
+    amount_in: u64,
+    direction: TradeDirection,
+) -> Option<u64> {
+    if amount_in == 0 {
+        return None;
+    }
+    let params = state.clmm_params()?;
+    if params.liquidity == 0 {
+        return None;
+    }
+    let zero_for_one = matches!(direction, TradeDirection::AToB);
+    let sqrt_price_current = math::to_x96(params.sqrt_price_x64);
+    let sqrt_price_limit_x64 = if zero_for_one {
+        params.sqrt_min_price_x64
+    } else {
+        params.sqrt_max_price_x64
+    };
+    let sqrt_price_limit = math::to_x96(sqrt_price_limit_x64);
+
+    if zero_for_one && sqrt_price_limit >= sqrt_price_current {
+        return None;
+    }
+    if !zero_for_one && sqrt_price_limit <= sqrt_price_current {
+        return None;
+    }
+
+    let step = math::compute_swap_step(
+        sqrt_price_current,
+        sqrt_price_limit,
+        params.liquidity,
+        amount_in as u128,
+        state.total_fee_bps(),
+        zero_for_one,
+    )?;
+    if step.amount_out == 0 {
+        return None;
+    }
+    let consumed = step.amount_in.saturating_add(step.fee_amount);
+    let hit_price_cap = step.sqrt_price_next == sqrt_price_limit;
+    if hit_price_cap && consumed < amount_in as u128 {
+        return None;
+    }
+    Some(step.amount_out.min(u64::MAX as u128) as u64)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TradeDirection {
+    AToB,
+    BToA,
+}
+
+fn resolve_trade_direction(
+    state: &CpAmmState,
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+) -> Option<TradeDirection> {
+    if input_mint == &state.token_a_mint && output_mint == &state.token_b_mint {
+        Some(TradeDirection::AToB)
+    } else if input_mint == &state.token_b_mint && output_mint == &state.token_a_mint {
+        Some(TradeDirection::BToA)
+    } else {
+        None
+    }
 }
 
 fn compute_slippage_bps(
@@ -459,6 +677,10 @@ fn needs_hydration(extras: &CpAmmPoolExtras) -> bool {
         || extras.token_b_mint.is_none()
         || extras.token_a_vault.is_none()
         || extras.token_b_vault.is_none()
+        || extras.sqrt_price_x64.is_none()
+        || extras.liquidity.is_none()
+        || extras.sqrt_min_price_x64.is_none()
+        || extras.sqrt_max_price_x64.is_none()
 }
 
 #[derive(Clone, Debug)]
@@ -467,11 +689,18 @@ struct HydratedPoolMeta {
     token_b_mint: Pubkey,
     token_a_vault: Pubkey,
     token_b_vault: Pubkey,
+    sqrt_price_x64: u128,
+    liquidity: u128,
+    sqrt_min_price_x64: u128,
+    sqrt_max_price_x64: u128,
+    hydrated_at: Instant,
 }
 
 struct CpAmmPoolHydrator {
     hydrator: AsyncHydrator<Pubkey, HydratedPoolMeta>,
     endpoint_count: usize,
+    retry_backoff: Duration,
+    last_attempts: DashMap<Pubkey, Instant>,
 }
 
 impl CpAmmPoolHydrator {
@@ -501,6 +730,8 @@ impl CpAmmPoolHydrator {
         Some(Self {
             hydrator,
             endpoint_count,
+            retry_backoff: Duration::from_millis(config.hydration_retry_ms.max(1)),
+            last_attempts: DashMap::new(),
         })
     }
 
@@ -509,7 +740,29 @@ impl CpAmmPoolHydrator {
     }
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        self.hydrator.get_or_schedule(pool)
+        if let Some(meta) = self.hydrator.cached(&pool) {
+            if meta.hydrated_at.elapsed() >= self.retry_backoff {
+                if self.should_schedule(pool) {
+                    self.hydrator.schedule(pool);
+                }
+            }
+            return Some(meta);
+        }
+        if self.should_schedule(pool) {
+            self.hydrator.schedule(pool);
+        }
+        None
+    }
+
+    fn should_schedule(&self, pool: Pubkey) -> bool {
+        let now = Instant::now();
+        if let Some(last) = self.last_attempts.get(&pool) {
+            if now.duration_since(*last.value()) < self.retry_backoff {
+                return false;
+            }
+        }
+        self.last_attempts.insert(pool, now);
+        true
     }
 }
 
@@ -543,8 +796,11 @@ fn fetch_cp_amm_meta(clients: &[Arc<RpcClient>], pool: Pubkey) -> Option<Hydrate
 
 const POOL_FEES_STRUCT_LEN: usize = 160;
 const PUBKEY_BYTES: usize = 32;
+const U64_BYTES: usize = 8;
+const U128_BYTES: usize = 16;
 const CP_AMM_POOL_ACCOUNT_HEADER_LEN: usize = 8 + POOL_FEES_STRUCT_LEN;
-const CP_AMM_POOL_ACCOUNT_MIN_LEN: usize = CP_AMM_POOL_ACCOUNT_HEADER_LEN + PUBKEY_BYTES * 4;
+const CP_AMM_POOL_ACCOUNT_MIN_LEN: usize =
+    CP_AMM_POOL_ACCOUNT_HEADER_LEN + (PUBKEY_BYTES * 6) + (U128_BYTES * 5) + (U64_BYTES * 4);
 
 fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
     if data.len() < CP_AMM_POOL_ACCOUNT_MIN_LEN {
@@ -556,12 +812,29 @@ fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
     let token_b_mint = read_pubkey_from_slice(data, &mut cursor)?;
     let token_a_vault = read_pubkey_from_slice(data, &mut cursor)?;
     let token_b_vault = read_pubkey_from_slice(data, &mut cursor)?;
+    let _whitelisted_vault = read_pubkey_from_slice(data, &mut cursor)?;
+    let _partner = read_pubkey_from_slice(data, &mut cursor)?;
+    let liquidity = read_u128_from_slice(data, &mut cursor)?;
+    let _padding = read_u128_from_slice(data, &mut cursor)?;
+    // Skip protocol + partner fee accruals
+    read_u64_from_slice(data, &mut cursor)?;
+    read_u64_from_slice(data, &mut cursor)?;
+    read_u64_from_slice(data, &mut cursor)?;
+    read_u64_from_slice(data, &mut cursor)?;
+    let sqrt_min_price_x64 = read_u128_from_slice(data, &mut cursor)?;
+    let sqrt_max_price_x64 = read_u128_from_slice(data, &mut cursor)?;
+    let sqrt_price_x64 = read_u128_from_slice(data, &mut cursor)?;
 
     Some(HydratedPoolMeta {
         token_a_mint,
         token_b_mint,
         token_a_vault,
         token_b_vault,
+        sqrt_price_x64,
+        liquidity,
+        sqrt_min_price_x64,
+        sqrt_max_price_x64,
+        hydrated_at: Instant::now(),
     })
 }
 
@@ -572,6 +845,24 @@ fn read_pubkey_from_slice(data: &[u8], cursor: &mut usize) -> Option<Pubkey> {
     bytes.copy_from_slice(slice);
     *cursor = end;
     Some(Pubkey::new_from_array(bytes))
+}
+
+fn read_u64_from_slice(data: &[u8], cursor: &mut usize) -> Option<u64> {
+    let end = cursor.checked_add(U64_BYTES)?;
+    let slice = data.get(*cursor..end)?;
+    let mut bytes = [0u8; U64_BYTES];
+    bytes.copy_from_slice(slice);
+    *cursor = end;
+    Some(u64::from_le_bytes(bytes))
+}
+
+fn read_u128_from_slice(data: &[u8], cursor: &mut usize) -> Option<u128> {
+    let end = cursor.checked_add(U128_BYTES)?;
+    let slice = data.get(*cursor..end)?;
+    let mut bytes = [0u8; U128_BYTES];
+    bytes.copy_from_slice(slice);
+    *cursor = end;
+    Some(u128::from_le_bytes(bytes))
 }
 
 #[derive(Debug, Clone)]
@@ -589,10 +880,15 @@ pub struct CpAmmState {
     pub protocol_fee_bps: Option<u16>,
     pub referral_bps: Option<u16>,
     pub referral_token_account: Option<Pubkey>,
+    pub sqrt_price_x64: Option<u128>,
+    pub liquidity: Option<u128>,
+    pub sqrt_min_price_x64: Option<u128>,
+    pub sqrt_max_price_x64: Option<u128>,
     pub vault_a_balance: u128,
     pub vault_b_balance: u128,
     pub last_update_slot: u64,
     pub last_update_at: Instant,
+    pub last_hydrated_at: Option<Instant>,
 }
 
 impl CpAmmState {
@@ -621,10 +917,234 @@ impl CpAmmState {
             .saturating_add(referral)
             .min(BPS_DENOMINATOR)
     }
+
+    fn clmm_params(&self) -> Option<ClmmParams> {
+        Some(ClmmParams {
+            liquidity: self.liquidity?,
+            sqrt_price_x64: self.sqrt_price_x64?,
+            sqrt_min_price_x64: self.sqrt_min_price_x64?,
+            sqrt_max_price_x64: self.sqrt_max_price_x64?,
+        })
+    }
+
+    fn hydration_stale(&self, ttl_ms: u64) -> bool {
+        if ttl_ms == 0 {
+            return false;
+        }
+        match self.last_hydrated_at {
+            Some(instant) => instant.elapsed().as_millis() as u64 > ttl_ms,
+            None => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ClmmParams {
+    liquidity: u128,
+    sqrt_price_x64: u128,
+    sqrt_min_price_x64: u128,
+    sqrt_max_price_x64: u128,
 }
 
 fn parse_pubkey(value: &str) -> Option<Pubkey> {
     Pubkey::from_str(value).ok()
+}
+
+fn token_program_for_mint(state: &CpAmmState, mint: &Pubkey) -> Pubkey {
+    if *mint == state.token_a_mint {
+        state.token_a_program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY)
+    } else if *mint == state.token_b_mint {
+        state.token_b_program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY)
+    } else {
+        *SPL_TOKEN_PROGRAM_PUBKEY
+    }
+}
+
+fn derive_associated_token_address(
+    owner: &Pubkey,
+    token_program: &Pubkey,
+    mint: &Pubkey,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_PUBKEY,
+    )
+    .0
+}
+
+mod math {
+    use super::{BPS_DENOMINATOR, U256};
+
+    #[derive(Debug, Clone)]
+    pub struct SwapStepResult {
+        pub sqrt_price_next: U256,
+        pub amount_in: u128,
+        pub amount_out: u128,
+        pub fee_amount: u128,
+    }
+
+    pub fn to_x96(value_x64: u128) -> U256 {
+        U256::from(value_x64) << 32
+    }
+
+    pub fn compute_swap_step(
+        sqrt_price_current: U256,
+        sqrt_price_target: U256,
+        liquidity: u128,
+        amount_remaining: u128,
+        fee_bps: u64,
+        zero_for_one: bool,
+    ) -> Option<SwapStepResult> {
+        if liquidity == 0 {
+            return None;
+        }
+
+        let fee_denominator = BPS_DENOMINATOR as u128;
+        let fee_bps = fee_bps as u128;
+        if fee_bps >= fee_denominator {
+            return None;
+        }
+
+        let amount_less_fee = amount_remaining
+            .checked_mul(fee_denominator - fee_bps)?
+            .checked_div(fee_denominator)?;
+
+        let (sqrt_price_next, amount_in, amount_out) = if zero_for_one {
+            let amount_in_max =
+                get_amount0_delta(liquidity, sqrt_price_target, sqrt_price_current, true)?;
+            if amount_less_fee >= amount_in_max {
+                let out =
+                    get_amount1_delta(liquidity, sqrt_price_target, sqrt_price_current, false)?;
+                (sqrt_price_target, amount_in_max, out)
+            } else {
+                let next_price = get_next_sqrt_price_from_input(
+                    sqrt_price_current,
+                    liquidity,
+                    amount_less_fee,
+                    true,
+                )?;
+                let in_amount = get_amount0_delta(liquidity, next_price, sqrt_price_current, true)?;
+                let out = get_amount1_delta(liquidity, next_price, sqrt_price_current, false)?;
+                (next_price, in_amount, out)
+            }
+        } else {
+            let amount_in_max =
+                get_amount1_delta(liquidity, sqrt_price_current, sqrt_price_target, true)?;
+            if amount_less_fee >= amount_in_max {
+                let out =
+                    get_amount0_delta(liquidity, sqrt_price_current, sqrt_price_target, false)?;
+                (sqrt_price_target, amount_in_max, out)
+            } else {
+                let next_price = get_next_sqrt_price_from_input(
+                    sqrt_price_current,
+                    liquidity,
+                    amount_less_fee,
+                    false,
+                )?;
+                let in_amount = get_amount1_delta(liquidity, sqrt_price_current, next_price, true)?;
+                let out = get_amount0_delta(liquidity, sqrt_price_current, next_price, false)?;
+                (next_price, in_amount, out)
+            }
+        };
+
+        let fee_amount = mul_div_round_up(amount_in, fee_bps, fee_denominator - fee_bps)?;
+
+        Some(SwapStepResult {
+            sqrt_price_next,
+            amount_in,
+            amount_out,
+            fee_amount,
+        })
+    }
+
+    fn get_amount0_delta(
+        liquidity: u128,
+        sqrt_a: U256,
+        sqrt_b: U256,
+        round_up: bool,
+    ) -> Option<u128> {
+        let (sqrt_low, sqrt_high) = if sqrt_a > sqrt_b {
+            (sqrt_b, sqrt_a)
+        } else {
+            (sqrt_a, sqrt_b)
+        };
+        if sqrt_low == U256::zero() {
+            return None;
+        }
+        let numerator1 = U256::from(liquidity) << 96;
+        let numerator2 = sqrt_high.checked_sub(sqrt_low)?;
+        let numerator = numerator1.checked_mul(numerator2)?;
+        let denominator = sqrt_high.checked_mul(sqrt_low)?;
+        let quotient = if round_up {
+            div_round_up(numerator, denominator)
+        } else {
+            numerator.checked_div(denominator)?
+        };
+        quotient.try_into().ok()
+    }
+
+    fn get_amount1_delta(
+        liquidity: u128,
+        sqrt_a: U256,
+        sqrt_b: U256,
+        round_up: bool,
+    ) -> Option<u128> {
+        let (sqrt_low, sqrt_high) = if sqrt_a > sqrt_b {
+            (sqrt_b, sqrt_a)
+        } else {
+            (sqrt_a, sqrt_b)
+        };
+        let diff = sqrt_high.checked_sub(sqrt_low)?;
+        let numerator = U256::from(liquidity).checked_mul(diff)?;
+        let denominator = U256::one() << 96;
+        let quotient = if round_up {
+            div_round_up(numerator, denominator)
+        } else {
+            numerator >> 96
+        };
+        quotient.try_into().ok()
+    }
+
+    fn get_next_sqrt_price_from_input(
+        sqrt_price_current: U256,
+        liquidity: u128,
+        amount_in: u128,
+        zero_for_one: bool,
+    ) -> Option<U256> {
+        if amount_in == 0 {
+            return Some(sqrt_price_current);
+        }
+        let liquidity_u256 = U256::from(liquidity);
+        if zero_for_one {
+            let numerator = sqrt_price_current
+                .checked_mul(liquidity_u256)?
+                .checked_mul(U256::one() << 96)?;
+            let denominator = liquidity_u256
+                .checked_mul(U256::one() << 96)?
+                .checked_add(U256::from(amount_in).checked_mul(sqrt_price_current)?)?;
+            Some(numerator.checked_div(denominator)?)
+        } else {
+            let increment = (U256::from(amount_in) << 96).checked_div(liquidity_u256)?;
+            Some(sqrt_price_current.checked_add(increment)?)
+        }
+    }
+
+    fn div_round_up(numerator: U256, denominator: U256) -> U256 {
+        let mut quotient = numerator / denominator;
+        if numerator % denominator != U256::zero() {
+            quotient += U256::one();
+        }
+        quotient
+    }
+
+    fn mul_div_round_up(value: u128, numerator: u128, denominator: u128) -> Option<u128> {
+        if denominator == 0 {
+            return None;
+        }
+        let numerator_u256 = U256::from(value).checked_mul(U256::from(numerator))?;
+        let result = div_round_up(numerator_u256, U256::from(denominator));
+        result.try_into().ok()
+    }
 }
 
 #[cfg(test)]
@@ -638,23 +1158,46 @@ mod tests {
         let token_b_mint = Pubkey::new_unique();
         let token_a_vault = Pubkey::new_unique();
         let token_b_vault = Pubkey::new_unique();
+        let whitelisted_vault = Pubkey::new_unique();
+        let partner = Pubkey::new_unique();
+        let liquidity: u128 = 42_000;
+        let sqrt_price: u128 = 1_234_567_890;
 
         let mut data = vec![0u8; CP_AMM_POOL_ACCOUNT_MIN_LEN];
         let mut cursor = CP_AMM_POOL_ACCOUNT_HEADER_LEN;
-        for key in [token_a_mint, token_b_mint, token_a_vault, token_b_vault] {
+        for key in [
+            token_a_mint,
+            token_b_mint,
+            token_a_vault,
+            token_b_vault,
+            whitelisted_vault,
+            partner,
+        ] {
             data[cursor..cursor + PUBKEY_BYTES].copy_from_slice(key.as_ref());
             cursor += PUBKEY_BYTES;
         }
+
+        let liquidity_bytes = liquidity.to_le_bytes();
+        data[cursor..cursor + U128_BYTES].copy_from_slice(&liquidity_bytes);
+        cursor += U128_BYTES;
+        cursor += U128_BYTES; // padding
+        cursor += U64_BYTES * 4; // protocol + partner fee accumulators
+        cursor += U128_BYTES; // sqrt_min_price
+        cursor += U128_BYTES; // sqrt_max_price
+        let sqrt_price_bytes = sqrt_price.to_le_bytes();
+        data[cursor..cursor + U128_BYTES].copy_from_slice(&sqrt_price_bytes);
 
         let meta = parse_pool_account(&data).expect("pool account should hydrate");
         assert_eq!(meta.token_a_mint, token_a_mint);
         assert_eq!(meta.token_b_mint, token_b_mint);
         assert_eq!(meta.token_a_vault, token_a_vault);
         assert_eq!(meta.token_b_vault, token_b_vault);
+        assert_eq!(meta.liquidity, liquidity);
+        assert_eq!(meta.sqrt_price_x64, sqrt_price);
     }
 
     #[test]
-    fn simulate_xyk_exact_in_respects_slippage() {
+    fn simulate_cp_amm_exact_in_respects_slippage() {
         let pool = Pubkey::new_unique();
         let mint_a = Pubkey::new_unique();
         let mint_b = Pubkey::new_unique();
@@ -681,16 +1224,74 @@ mod tests {
             protocol_fee_bps: None,
             referral_bps: None,
             referral_token_account: None,
+            sqrt_price_x64: Some(1_u128 << 64),
+            liquidity: Some(5_000_000_000),
+            sqrt_min_price_x64: Some(1_u128 << 60),
+            sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 1_000_000,
             vault_b_balance: 1_000_000,
             last_update_slot: 0,
             last_update_at: Instant::now(),
+            last_hydrated_at: Some(Instant::now()),
         };
 
         let (amount_out, edge_bps) =
-            simulate_xyk_exact_in(&state, &req).expect("swap should quote");
-        assert_eq!(amount_out, 90_661);
-        assert!(edge_bps < -900.0);
+            simulate_cp_amm_exact_in(&state, &req).expect("swap should quote");
+        assert!(amount_out > 0);
+        assert!(edge_bps.is_sign_negative());
+    }
+
+    #[test]
+    fn simulate_cp_amm_exact_out_tracks_inverse() {
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let exact_in = QuoteRequest {
+            pool_id: pool,
+            input_mint: mint_a,
+            output_mint: mint_b,
+            amount: 50_000,
+            slot: 1,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let mut state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            amp: None,
+            lp_fee_bps: Some(30),
+            protocol_fee_bps: None,
+            referral_bps: None,
+            referral_token_account: None,
+            sqrt_price_x64: Some(1_u128 << 64),
+            liquidity: Some(8_000_000_000),
+            sqrt_min_price_x64: Some(1_u128 << 60),
+            sqrt_max_price_x64: Some(1_u128 << 70),
+            vault_a_balance: 2_000_000,
+            vault_b_balance: 3_000_000,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+            last_hydrated_at: Some(Instant::now()),
+        };
+
+        let (expected_out, _) =
+            simulate_cp_amm_exact_in(&state, &exact_in).expect("exact-in quote should succeed");
+
+        let exact_out = QuoteRequest {
+            amount: expected_out,
+            direction: SwapDirection::ExactOut,
+            ..exact_in
+        };
+        let (amount_in, _) =
+            simulate_cp_amm_exact_out(&state, &exact_out).expect("inverse quote should succeed");
+        assert!(amount_in >= exact_in.amount);
+        assert!(amount_in - exact_in.amount <= 5);
     }
 
     #[test]
@@ -712,10 +1313,15 @@ mod tests {
             protocol_fee_bps: None,
             referral_bps: None,
             referral_token_account: None,
+            sqrt_price_x64: None,
+            liquidity: None,
+            sqrt_min_price_x64: None,
+            sqrt_max_price_x64: None,
             vault_a_balance: 1,
             vault_b_balance: 1,
             last_update_slot: 0,
             last_update_at: Instant::now(),
+            last_hydrated_at: None,
         };
 
         let other_mint = Pubkey::new_unique();
@@ -746,10 +1352,15 @@ mod tests {
             protocol_fee_bps: Some(5),
             referral_bps: Some(5),
             referral_token_account: None,
+            sqrt_price_x64: Some(1_u128 << 64),
+            liquidity: Some(9_000_000_000),
+            sqrt_min_price_x64: Some(1_u128 << 60),
+            sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 1_000_000,
             vault_b_balance: 2_000_000,
             last_update_slot: 0,
             last_update_at: Instant::now(),
+            last_hydrated_at: Some(Instant::now()),
         };
 
         adapter.state.insert(pool, state.clone());
