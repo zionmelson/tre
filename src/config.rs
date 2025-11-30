@@ -21,7 +21,6 @@ const ENV_JITO_TIP_STREAM_URL: &str = "TRE_JITO_TIP_STREAM_URL";
 const ENV_JITO_AUCTION_STREAM_URL: &str = "TRE_JITO_AUCTION_STREAM_URL";
 const ENV_JITO_CA_PEM: &str = "TRE_JITO_CA_PEM";
 const ENV_QUICKNODE_RPCS: &str = "TRE_QUICKNODE_RPCS";
-const ENV_ENABLE_FAST_LANE: &str = "TRE_ENABLE_FAST_LANE";
 const ENV_HYDRATION_ONLY_MODE: &str = "TRE_HYDRATION_ONLY_MODE";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -343,9 +342,6 @@ impl AppConfig {
         if let Some(list) = env_list(ENV_QUICKNODE_RPCS) {
             self.quicknode_rpcs = list;
         }
-        if let Some(enabled) = env_bool(ENV_ENABLE_FAST_LANE) {
-            self.pipeline.enable_fast_lane = enabled;
-        }
         if let Some(enabled) = env_bool(ENV_HYDRATION_ONLY_MODE) {
             self.pipeline.hydration_only_mode = enabled;
         }
@@ -439,14 +435,12 @@ pub struct PerfTuning {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PipelineConfig {
-    pub enable_fast_lane: bool,
     pub hydration_only_mode: bool,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            enable_fast_lane: true,
             hydration_only_mode: false,
         }
     }

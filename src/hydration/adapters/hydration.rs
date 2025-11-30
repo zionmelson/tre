@@ -102,10 +102,6 @@ where
         }
     }
 
-    pub(crate) fn cache(&self) -> Arc<DashMap<K, V>> {
-        self.cache.clone()
-    }
-
     fn spawn_worker(
         name: &'static str,
         index: usize,

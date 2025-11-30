@@ -13,7 +13,7 @@ use uint::construct_uint;
 
 use super::hydration::AsyncHydrator;
 use crate::builder::{BuilderHandle, CpAmmPoolAccounts, CpAmmPoolMeta};
-use crate::stages::types::{
+use crate::hydration::types::{
     CpAmmPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
     CP_AMM_INPUT_UTILIZATION_BPS,
 };
@@ -553,6 +553,7 @@ fn simulate_cp_amm_exact_in(state: &CpAmmState, req: &QuoteRequest) -> Option<(u
         compute_slippage_bps(reserve_in, reserve_out, req.amount, amount_out).unwrap_or(0.0);
     Some((amount_out, edge_bps))
 }
+#[cfg(test)]
 fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<(u64, f64)> {
     if req.amount == 0 {
         return None;
@@ -573,6 +574,7 @@ fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<(
     Some((amount_in, edge_bps))
 }
 
+#[cfg(test)]
 fn find_input_for_exact_out(
     state: &CpAmmState,
     direction: TradeDirection,
@@ -1192,7 +1194,7 @@ mod math {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stages::types::{PoolSnapshot, PoolUpdateExtensions};
+    use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions};
 
     #[test]
     fn parses_pool_account_prefix() {

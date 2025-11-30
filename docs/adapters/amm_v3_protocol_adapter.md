@@ -4,7 +4,7 @@
 
 - Provide a protocol-specific implementation of the upcoming `ProtocolAdapter` trait for Raydium AMM v3 (CLMM) pools.
 - Surface precise pricing data (mid, bounds, liquidity-aware slippage) derived from CoreCast pool updates and protocol math documented in `docs/swaps/amm_v3_swaps.md`.
-- Generate deterministic swap instruction templates that Stage2 can serialize without re-deriving protocol knowledge.
+- Generate deterministic swap instruction templates inside the hydration lane so the fast execution planner can serialize them without re-deriving protocol knowledge.
 - Deliver confidence scores + validation hooks so downstream strategy code knows whether an arbitrage quote is executable.
 
 ## Responsibilities
@@ -62,7 +62,7 @@ pub struct RaydiumV3State {
 ## State Management
 
 - Extend `PoolUpdate` to carry adapter-specific extensions (from CoreCast metadata fields) and feed them into `RaydiumV3State::apply_update`.
-- `DashMap` (or lock-free slab) keyed by pool ensures thread-safe reads in Stage1.
+- `DashMap` (or lock-free slab) keyed by pool ensures thread-safe reads in the fast execution lane planner.
 - Implement TTL eviction to avoid quoting from stale pools (e.g., `slot` drift or `Instant` age > N ms).
 
 ## Pricing Logic
@@ -72,7 +72,7 @@ pub struct RaydiumV3State {
    - For each tick boundary, compute max available liquidity, fees, and new sqrt price using formulas from Raydium open-source or IDL.
    - Accumulate output until input exhausted or liquidity depleted.
 3. **Exact-out** – Reverse the solver to compute required input, respecting tick spacing and `sqrt_price_limit`.
-4. **Edge calculation** – Compare quoted price vs observed trade price (Stage1 existing logic) or vs other adapters to produce `edge_bps`.
+4. **Edge calculation** – Compare quoted price vs observed trade price (fast execution heuristics) or vs other adapters to produce `edge_bps`.
 5. **Slippage guard** – Emit recommended `sqrt_price_limit_x64` derived from price bounds encountered during the simulation.
 
 ## Swap Template Generation
@@ -86,17 +86,17 @@ pub struct SwapTemplate {
     pub discriminator: [u8; 8], // swap_v2
     pub accounts: Vec<AccountMeta>,
     pub data: Vec<u8>,
-    pub context: TemplateContext, // hints for Stage2 (payer, signer reqs)
+    pub context: TemplateContext, // hints for the fast execution lane (payer, signer reqs)
 }
 ```
 
 - Fill `amount`, `other_amount_threshold`, `sqrt_price_limit_x64`, `is_base_input` from the `QuoteResponse`.
-- Include derived bumps to let Stage2 re-derive addresses if needed.
+- Include derived bumps to let the fast execution lane re-derive addresses if needed.
 
 ## Validation Hooks
 
 - `QuoteResponse::status` with enums: `Ok`, `StaleState`, `InsufficientLiquidity`, `MissingAccounts`.
-- Attach audit info (ticks crossed, fee paid, estimated compute budget) to help Stage2 decide bundling priority.
+- Attach audit info (ticks crossed, fee paid, estimated compute budget) to help the fast execution lane decide bundling priority.
 
 ## Integration Plan
 
@@ -104,11 +104,11 @@ pub struct SwapTemplate {
 2. **Adapter Skeleton** – implement trait with stubbed quote/template methods returning `None` until math filled in.
 3. **Pricing Engine** – port the sqrt-price/tick math from Raydium reference or our existing tooling; unit-test with fixtures.
 4. **Template Builder** – encode swap instructions using `raydium_amm_v3` IDL or manual Borsh layout; validate against known-good swaps.
-5. **Stage1 Wiring** – instantiate adapter, feed pool updates, and replace generic `Opportunity::from_trade` with adapter-derived quotes when `program_id` matches.
+5. **Fast execution wiring** – instantiate the adapter, feed pool updates from the hydration lane, and replace generic `Opportunity::from_trade` with adapter-derived quotes when `program_id` matches.
 6. **Testing** – add regression tests with recorded CoreCast updates + expected quotes; optionally run against a forknet harness to ensure instruction templates execute.
 
 ## Open Questions
 
 - Do we house adapter configs (tick spacing overrides, memo requirements) in `config.json` or derive entirely from CoreCast metadata?
 - How do we prioritize between multiple adapters producing quotes for the same trade (e.g., fallback to reserve ratio when adapter unavailable)?
-- Should swap template generation live in Stage1 (attach to bundle candidate) or Stage2 (lazy evaluation when we decide to submit)?
+- Should swap template generation live in the hydration lane (attach to bundle candidate) or the fast execution lane (lazy evaluation when we decide to submit)?

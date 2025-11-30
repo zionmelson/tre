@@ -21,7 +21,7 @@ use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use tracing::{debug, info, trace, warn};
 
 use crate::builder::{BuilderHandle, LbClmmPoolAccounts, LbClmmPoolMeta};
-use crate::stages::types::{
+use crate::hydration::types::{
     compute_edge_bps, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras,
     LbClmmPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
     LB_CLMM_INPUT_UTILIZATION_BPS,

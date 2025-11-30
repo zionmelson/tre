@@ -12,11 +12,14 @@ use tracing::info;
 use crate::builder::BuilderHandle;
 use crate::bundle::{BundleClient, BundleTracker};
 use crate::config::AppConfig;
-use crate::core::{Lease, RingConsumer, SpscRing};
+use crate::core::{Lease, RingConsumer, SlabPool, SpscRing};
+use crate::hydration::types::PoolSnapshot;
 use crate::hydration::{HydrationService, HydrationSnapshot};
 use crate::notifier::Notifier;
-use crate::planner::{spawn_fast_lane_planner, PlannerConfig};
-use crate::stages::types::BundleCandidate;
+use crate::planner::types::BundleCandidate;
+use crate::planner::{
+    spawn_fast_lane_planner, spawn_fast_lane_trade_feed, spawn_graph_service, PlannerConfig,
+};
 use crate::strategy::StrategyEngine;
 use crate::submission::{self, SubmissionConfig};
 
@@ -30,24 +33,24 @@ impl ExecutorRuntime {
     pub fn spawn(config: Arc<AppConfig>) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let hydration_only = config.pipeline.hydration_only_mode;
-        let fast_lane_enabled = config.pipeline.enable_fast_lane && !hydration_only;
         if hydration_only {
             info!("hydration-only mode enabled; execution lanes disabled");
-        }
-        if !fast_lane_enabled && !hydration_only {
-            return Err(anyhow!(
-                "fast lane disabled but legacy execution path has been removed; set pipeline.enable_fast_lane=true or enable hydration_only_mode"
-            ));
         }
 
         let mut handles = Vec::new();
         let builder = BuilderHandle::new(config.clone())?;
-        let hydration_service = HydrationService::new(builder.clone());
+        let hydration_service = HydrationService::new(builder.clone(), config.clone());
         let strategy = Arc::new(StrategyEngine::new(config.clone())?);
         let notifier = Arc::new(Notifier::new(strategy.clone(), config.clone()));
         let (hydration_tx, hydration_rx) =
             SpscRing::<HydrationSnapshot>::with_capacity(config.perf.ring_capacity).into_split();
+        let (pool_tx, pool_rx) =
+            SpscRing::<PoolSnapshot>::with_capacity(config.perf.ring_capacity).into_split();
+        handles.push(hydration_service.spawn_adapter_ingest(stop.clone(), pool_tx)?);
         handles.push(hydration_service.spawn_snapshot_worker(stop.clone(), hydration_tx)?);
+
+        let (graph_handle, graph_thread) = spawn_graph_service(stop.clone(), None, pool_rx)?;
+        handles.push(graph_thread);
 
         if hydration_only {
             handles.push(spawn_snapshot_drain(stop.clone(), hydration_rx)?);
@@ -62,14 +65,23 @@ impl ExecutorRuntime {
         let (planner_tx, planner_rx) =
             SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
                 .into_split();
+        let bundle_pool = SlabPool::new(config.perf.bundle_slab);
+
+        let (trade_rx, trade_handle) =
+            spawn_fast_lane_trade_feed(stop.clone(), config.clone(), config.perf.ring_capacity)?;
+        handles.push(trade_handle);
 
         handles.push(spawn_fast_lane_planner(
             stop.clone(),
             Some(config.perf.eval_core),
             hydration_rx,
+            graph_handle.clone(),
+            notifier.clone(),
             planner_tx,
             builder.clone(),
             PlannerConfig::default(),
+            bundle_pool,
+            trade_rx,
         )?);
 
         let bundle_client = Arc::new(BundleClient::new(config.clone(), builder.auth_signer())?);

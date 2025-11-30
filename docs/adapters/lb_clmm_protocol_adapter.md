@@ -3,8 +3,8 @@
 ## Goals & Scope
 
 - Deliver a production-ready implementation of the shared `ProtocolAdapter` trait for the `lb_clmm` liquidity-bin CLMM program (`LBUZ…Pwxo`, IDL v0.10.1) documented in `docs/swaps/lb_clmm_swap.md`.
-- Normalize CoreCast-derived pool state (bin configs, vault balances, oracle state, dynamic fee params) so Stage1 quoting runs on protocol-agnostic math.
-- Emit deterministic `SwapTemplate` payloads for `swap`, `swap2`, `swap_exact_out*`, and `swap_with_price_impact*` so Stage2 bundling requires no lb_clmm-specific knowledge.
+- Normalize CoreCast-derived pool state (bin configs, vault balances, oracle state, dynamic fee params) so the fast execution lane quotes against protocol-agnostic math.
+- Emit deterministic `SwapTemplate` payloads for `swap`, `swap2`, `swap_exact_out*`, and `swap_with_price_impact*` inside the hydration lane so bundling requires no lb_clmm-specific knowledge.
 - Provide adapter-level validation, risk flags, and telemetry so strategies can filter quotes that violate bin-range, activation, or price-impact constraints.
 
 ## Responsibilities
@@ -21,7 +21,7 @@
 - **lb_clmm IDL** (`idls/pools/lb_clmm.json`) for authoritative layouts (`LbPair`, `BinArray`, `Oracle`, `SwapParameters`, `RemainingAccountsInfo`).
 - **Swap reference** (`docs/swaps/lb_clmm_swap.md`) for account ordering, optional accounts, memo + transfer-hook behavior, host-fee rules, and error catalog.
 - **Config overrides** (`config.json`) for adapter tuning (bin TTL, oracle horizon, compute-budget overrides, host-fee toggles).
-- **Runtime RPC client** (already available in Stage0/Stage1) for lazy hydration of bin arrays or verifying Token-2022 hook metadata.
+- **Runtime RPC client** (shared by hydration + fast execution lanes) for lazy hydration of bin arrays or verifying Token-2022 hook metadata.
 
 ## API Shape
 
@@ -64,11 +64,11 @@ pub struct LbClmmState {
 
 ## State Management Plan
 
-- **CoreCast ingestion**: Extend the Stage0 parser to emit lb_clmm-specific payloads (bin deltas, oracle sample, dynamic fee scalars, pool flags). Adapter subscribes via `ingest_pool_update` and merges deltas into `BinSnapshotRing` (ringbuffer keyed by bin id).
+- **CoreCast ingestion**: Extend the hydration-lane parser to emit lb_clmm-specific payloads (bin deltas, oracle sample, dynamic fee scalars, pool flags). The adapter subscribes via `ingest_pool_update` and merges deltas into `BinSnapshotRing` (ringbuffer keyed by bin id).
 - **Lazy hydration**: On first sight of a pool or whenever bin arrays fall out-of-sync, fetch `LbPair`, `BinArray` (active +- guard range), and `Oracle` accounts via RPC. Cache static PDAs + Token Program IDs so quoting remains lock-free.
 - **Bitmap extension handling**: Track when `bin_array_bitmap_extension` is required (pool spans >512 bins) and cache the PDA to avoid deriving during every template build.
 - **TTL & invalidation**: Evict or mark state as `StaleState` when `slot - last_update_slot > config.max_state_age_slots`, or when `oracle.exponent` drifts beyond `max_oracle_lag_slots`.
-- **Concurrency**: Use `DashMap` for pool-level shards and let pricing functions grab immutable snapshots (Arc clones) to keep Stage1 latency low.
+- **Concurrency**: Use `DashMap` for pool-level shards and let pricing functions grab immutable snapshots (Arc clones) to keep fast execution latency low.
 
 ## Pricing & Bin Walk Logic
 
@@ -78,14 +78,14 @@ pub struct LbClmmState {
 4. **Oracle guards** – Provide `max_price_impact_bps` enforcement by comparing price before first bin and after last bin. Emit `QuoteResponse::status = PriceImpactExceeded` when guard violated.
 5. **Slippage** – For `ExactIn`, compute `min_amount_out` suggestion; for `ExactOut`, compute `max_amount_in` along the traversal path. Respect user-provided ceilings in the request.
 6. **Partial-fill** – If liquidity exhausts before target satisfied, emit `QuoteResponse::status = InsufficientLiquidity` plus `filled_amount` so strategy can downsize or skip.
-7. **Edge metrics** – Derive execution price vs oracle mid-point and compute `edge_bps`. Use this for Stage1 ranking and to flag quotes that rely on stale volatility inputs.
+7. **Edge metrics** – Derive execution price vs oracle mid-point and compute `edge_bps`. Use this for fast execution ranking and to flag quotes that rely on stale volatility inputs.
 
 ## Swap Template Generation
 
 - **Instruction selection**:
   - Default to `swap_with_price_impact2` when a request supplies `max_price_impact_bps` or when either mint uses Token-2022 hooks.
   - Downgrade to `swap2` for vanilla exact-in trades without price guards but still requiring hook plumbing.
-  - Offer `swap_exact_out` / `swap_exact_out2` for Stage1 requests flagged as exact-out; adapter rejects unsupported modes early.
+- Offer `swap_exact_out` / `swap_exact_out2` for fast execution requests flagged as exact-out; adapter rejects unsupported modes early.
 - **Accounts**: Follow the canonical order from `docs/swaps/lb_clmm_swap.md`:
   1. `lb_pair`
   2. Optional `bin_array_bitmap_extension`
@@ -100,7 +100,7 @@ pub struct LbClmmState {
   11. `event_authority`, `program`
 - **Remaining accounts**: Build `RemainingAccountsInfo` slices when Token-2022 transfer hooks or reward hooks are required. The adapter inspects mint metadata (cached) to determine hook types.
 - **Arguments**: Serialize the appropriate struct (`Swap`, `Swap2`, `SwapExactOut`, etc.) and embed computed guardrails (amounts, `active_id`, `max_price_impact_bps`).
-- **Compute budget hints**: Annotate `SwapTemplate` with recommended CU target (e.g., 300k when wide bin walks expected) so Stage2 can prepend compute budget instructions.
+- **Compute budget hints**: Annotate `SwapTemplate` with recommended CU target (e.g., 300k when wide bin walks expected) so the fast execution lane can prepend compute budget instructions.
 
 ## Validation & Telemetry
 
@@ -117,15 +117,15 @@ pub struct LbClmmState {
 
 ## Integration Plan
 
-1. **Schema extensions (Stage0)**
+1. **Schema extensions (Hydration lane)**
 
    - Update CoreCast proto parsing to include lb_clmm-specific fields (bin deltas, oracle payload, fee params).
    - Add unit tests covering new prost conversions.
 
-2. **Adapter skeleton (Stage1)**
+2. **Adapter skeleton (Fast execution integration)**
 
    - Introduce `LbClmmAdapter` struct + trait impl stubs returning `None`.
-   - Wire adapter registration in Stage0 ingest map and Stage1 quote router keyed by program id `LBUZ…Pwxo`.
+   - Wire adapter registration in the hydration ingest map and fast execution quote router keyed by program id `LBUZ…Pwxo`.
 
 3. **State cache & hydration**
 
@@ -142,9 +142,9 @@ pub struct LbClmmState {
    - Encode all swap instruction variants via Anchor-generated account structs or manual Borsh serialization.
    - Unit-test account ordering + remaining-accounts slices; run `solana-test-validator` sims to ensure instructions pass.
 
-6. **Strategy wiring (Stage2)**
+6. **Lane wiring (fast execution)**
 
-   - Ensure Stage2 uses new templates to bundle transactions and respects adapter-provided guardrails (price impact, slippage, host fee address inclusion).
+   - Ensure the fast execution lane uses new templates to bundle transactions and respects adapter-provided guardrails (price impact, slippage, host fee address inclusion).
    - Update notifier paths for adapter telemetry.
 
 7. **Docs & rollout**
@@ -175,6 +175,6 @@ pub struct LbClmmState {
 - [ ] State cache hydrated via fixtures + RPC fallback.
 - [ ] Exact-in/out pricing validated against on-chain txs.
 - [ ] Swap template builder passes `solana-test-validator` sims for all four instruction variants.
-- [ ] Stage1/Stage2 wiring toggled on for canary pools.
+- [ ] Hydration + fast execution wiring toggled on for canary pools.
 - [ ] Observability dashboards + alerts updated.
 - [ ] Documentation (this file + architecture guide) published.

@@ -3,8 +3,8 @@
 ## Goals & Scope
 
 - Ship a purpose-built implementation of the shared `ProtocolAdapter` trait for the `cp_amm` constant-product pools documented in `docs/swaps/cp_amm_swap.md`.
-- Transform CoreCast stream updates + on-chain account fetches into normalized pool state so Stage1 quoting logic no longer performs protocol-specific math.
-- Generate deterministic `SwapTemplate` payloads targeting the `swap2` instruction (supports `ExactIn`, `PartialFill`, `ExactOut`) so Stage2 can bundle without re-deriving cp_amm knowledge.
+- Transform CoreCast stream updates + on-chain account fetches into normalized pool state so the fast execution lane’s quoting logic no longer performs protocol-specific math.
+- Generate deterministic `SwapTemplate` payloads targeting the `swap2` instruction (supports `ExactIn`, `PartialFill`, `ExactOut`) inside the hydration lane so the fast execution lane can bundle without re-deriving cp_amm knowledge.
 - Surface adapter-specific validation + telemetry so strategies understand when cp_amm quotes are actionable, stale, or liquidity constrained.
 
 ## Responsibilities
@@ -70,8 +70,8 @@ pub struct CpAmmState {
 ## State Management Plan
 
 - Extend `PoolUpdate` to expose cp_amm-specific extensions (amp curve params, fee schedule, referral account). These fields originate from CoreCast metadata; when absent we lazily fetch the on-chain `Pool` account using the runtime RPC client.
-- Maintain a `DashMap` cache keyed by pool `Pubkey` so Stage1 read paths are lock-free.
-- Add TTL eviction (`slot` drift and `Instant` age) plus per-pool dirty flags to avoid quoting from state that predates the latest Stage0 ingest cycle.
+- Maintain a `DashMap` cache keyed by pool `Pubkey` so fast execution read paths are lock-free.
+- Add TTL eviction (`slot` drift and `Instant` age) plus per-pool dirty flags to avoid quoting from state that predates the latest hydration ingest cycle.
 - Record an `Arc<PoolStaticMeta>` alongside mutable balances so serialization (account metas, token program IDs) is O(1).
 
 ## Pricing & Simulation
@@ -83,7 +83,7 @@ pub struct CpAmmState {
    - Apply cp_amm invariant `xy = const` (or `xy = const + amp` depending on pool config) to solve for output after fees.
    - Subtract protocol + referral fees, then enforce `minimum_amount_out` guard.
 4. **Exact-out solver** – Rearrange the invariant to solve required input for a target output; bail if exceeding request max or if vault lacks liquidity (`InsufficientLiquidity`).
-5. **Partial-fill heuristic** – For `SwapMode::PartialFill`, cap input by `amount_0`, recompute leftover, and emit `amount_left` inside the quote context so Stage1 can decide to retry.
+5. **Partial-fill heuristic** – For `SwapMode::PartialFill`, cap input by `amount_0`, recompute leftover, and emit `amount_left` inside the quote context so the fast execution lane can decide to retry.
 6. **Edge computation** – Compare quoted execution price vs mid-price derived from vault balances to produce `edge_bps` for prioritization.
 7. **Risk flags** – Track rate-limiter hints (errors 6048/6049) from recent logs and mark quotes as `RateLimited` when we expect rejections.
 
@@ -96,7 +96,7 @@ pub struct CpAmmState {
   3. `token_a_vault`, `token_b_vault`, `token_a_mint`, `token_b_mint` (matching direction).
   4. `payer`, respective token programs (Token-2022 aware), optional `referral_token_account`, Anchor `event_authority`, cp_amm program ID.
 - `SwapParameters2` serialization uses Borsh; we reuse the generated Anchor struct or encode manually via our codec helpers.
-- Embed instruction context (payer signer, compute budget suggestions, expected fee) in `SwapTemplate::context` so Stage2 knows how to bundle.
+- Embed instruction context (payer signer, compute budget suggestions, expected fee) in `SwapTemplate::context` so the fast execution planner knows how to bundle.
 
 ## Validation & Telemetry
 
@@ -116,7 +116,7 @@ pub struct CpAmmState {
 3. **State cache & hydration** – Implement `ingest_pool_update` + lazy RPC fetch for missing metadata; write tests using fixture `cp_amm_pool.json`.
 4. **Pricing engine** – Port invariant math into a dedicated `cp_amm_math.rs`; cover `ExactIn`, `ExactOut`, and `PartialFill` via proptests fed by IDL-based fixtures.
 5. **Template builder** – Encode `swap2` instruction using our `proto::accounts::Swap2` helper; integration-test against a local validator or RPC simulation harness.
-6. **Stage wiring** – Register adapter in Stage0 ingestion map, Stage1 quote aggregator, and Stage2 submission path so cp_amm pools flow end-to-end.
+6. **Lane wiring** – Register the adapter inside the hydration lane ingestion map, feed its normalized quotes to the fast execution aggregator, and ensure submission policies consume the emitted templates end-to-end.
 7. **Observability** – Add tracing spans + metrics counters; update `docs/architecture.md` with adapter references.
 
 ## Testing & Tooling
@@ -130,5 +130,5 @@ pub struct CpAmmState {
 
 - **Referral routing** – Not all pools expose referral ATAs via CoreCast; do we maintain a static map or skip referral payouts (risking rejection)?
 - **Token program mismatches** – Pools pairing Token-2022 with legacy SPL require dual program IDs; need deterministic selection logic per mint.
-- **Rate limiter feedback** – Lack of direct limiter state may cause repeated failures; consider parsing recent transaction logs (Stage2) to backoff.
-- **Compute budget** – cp_amm `swap2` occasionally exceeds default CU when amp is high; decide whether adapter emits compute-budget instructions inside templates or leaves to Stage2 policy.
+- **Rate limiter feedback** – Lack of direct limiter state may cause repeated failures; consider parsing recent transaction logs (fast execution lane) to back off.
+- **Compute budget** – cp_amm `swap2` occasionally exceeds default CU when amp is high; decide whether the adapter emits compute-budget instructions inside templates or leaves it to fast execution policy.

@@ -648,11 +648,6 @@ fn apply_lifinity_pool_accounts(
     Ok(())
 }
 
-fn default_spl_token_program_id() -> Pubkey {
-    Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-        .expect("static spl token program id")
-}
-
 fn build_lifinity_params(
     template: &LifinitySwapTemplate,
     pool_meta: Option<&LifinityPoolMeta>,
@@ -770,11 +765,9 @@ fn encode_cp_amm_args(
         ));
     };
 
-    let execution = cp_amm_execution_semantics(template);
-
     match arg.ty {
         "SwapParameters" => encode_swap_parameters(buffer),
-        "SwapParameters2" => encode_swap_parameters2(buffer, execution),
+        "SwapParameters2" => encode_swap_parameters2(buffer),
         other => Err(anyhow!("unsupported cp_amm arg type {}", other)),
     }
 }
@@ -789,36 +782,13 @@ fn encode_swap_parameters(buffer: &mut Vec<u8>) -> Result<CpAmmFieldLayout> {
 }
 
 const CP_AMM_SWAP_MODE_EXACT_IN: u8 = 0;
-const CP_AMM_SWAP_MODE_EXACT_OUT: u8 = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CpAmmSwapExecution {
-    ExactIn,
-    ExactOut,
-}
-
-impl CpAmmSwapExecution {
-    fn swap_mode(self) -> u8 {
-        match self {
-            Self::ExactIn => CP_AMM_SWAP_MODE_EXACT_IN,
-            Self::ExactOut => CP_AMM_SWAP_MODE_EXACT_OUT,
-        }
-    }
-}
-
-fn cp_amm_execution_semantics(_template: &CpAmmSwapTemplate) -> CpAmmSwapExecution {
-    // Stage1 and the cp_amm adapter exclusively emit exact-in semantics today,
-    // regardless of mint direction. Generate templates that match that behavior.
-    CpAmmSwapExecution::ExactIn
-}
-
-fn encode_swap_parameters2(
-    buffer: &mut Vec<u8>,
-    execution: CpAmmSwapExecution,
-) -> Result<CpAmmFieldLayout> {
+fn encode_swap_parameters2(buffer: &mut Vec<u8>) -> Result<CpAmmFieldLayout> {
     let amount_in = write_u64(buffer, 0)?;
     let min_out = write_u64(buffer, 0)?;
-    buffer.push(execution.swap_mode());
+    // Stage1 and the cp_amm adapter exclusively use exact-in semantics today,
+    // so always emit the matching swap mode.
+    buffer.push(CP_AMM_SWAP_MODE_EXACT_IN);
     Ok(CpAmmFieldLayout {
         amount_in,
         minimum_output: min_out,

@@ -7,7 +7,8 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::config::AppConfig;
-use crate::stages::{ArbitrageOpportunity, BundleCandidate, PoolPath};
+use crate::planner::graph_manager::{ArbitrageOpportunity, PoolPath};
+use crate::planner::types::BundleCandidate;
 use crate::strategy::StrategyEngine;
 
 pub struct Notifier {
@@ -303,7 +304,7 @@ fn describe_path(path: &PoolPath) -> String {
         .join(",")
 }
 
-fn describe_route_plan(plan: &crate::stages::types::RoutePlan) -> Vec<String> {
+fn describe_route_plan(plan: &crate::planner::types::RoutePlan) -> Vec<String> {
     plan.legs
         .iter()
         .map(|leg| format!("{}->{}", leg.input_mint, leg.output_mint))

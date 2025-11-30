@@ -17,7 +17,8 @@ use tracing::{debug, info, warn};
 
 use crate::builder::compute_flash_loan_fee;
 use crate::config::AppConfig;
-use crate::stages::{ArbitrageOpportunity, BundleCandidate, Opportunity};
+use crate::planner::graph_manager::ArbitrageOpportunity;
+use crate::planner::types::{BundleCandidate, Opportunity};
 use crate::telemetry;
 use crate::tip_pressure;
 
@@ -418,7 +419,8 @@ impl StrategyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stages::types::{PoolQuoteDirection, RouteLegPlan, RoutePlan, TradeUpdate};
+    use crate::hydration::types::{PoolQuoteDirection, TradeUpdate};
+    use crate::planner::types::{RouteLegPlan, RoutePlan};
     use crate::template::TemplateContext;
 
     const TEST_INPUT_LAMPORTS: u64 = 1_000_000_000;

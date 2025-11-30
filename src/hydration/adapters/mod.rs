@@ -1,6 +1,6 @@
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
-use crate::stages::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate};
+use crate::hydration::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate};
 
 mod cp_amm;
 mod hydration;

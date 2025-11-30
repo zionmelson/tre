@@ -7,7 +7,6 @@ use std::{
 };
 
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
@@ -15,7 +14,7 @@ use tracing::{debug, info, trace, warn};
 use crate::builder::{
     templates::SwapTemplateDirection, BuilderHandle, LifinityPoolAccounts, LifinityPoolMeta,
 };
-use crate::stages::types::{
+use crate::hydration::types::{
     LifinityPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
     LIFINITY_V2_INPUT_UTILIZATION_BPS,
 };
@@ -27,7 +26,6 @@ use super::{
 };
 
 const LIFINITY_PROGRAM_ID: &str = "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c";
-const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const BPS_DENOMINATOR: u64 = 10_000;
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
@@ -36,10 +34,6 @@ const LIFINITY_DEFAULT_CU_LIMIT: u32 = 320_000;
 const LIFINITY_DEFAULT_CU_PRICE: u64 = 5_000;
 
 const DEFAULT_LIFINITY_HYDRATION_RETRY_MS: u64 = 60_000;
-
-static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program should be valid")
-});
 
 #[derive(Debug, Clone)]
 pub struct LifinityAdapterConfig {
@@ -1051,7 +1045,6 @@ struct HydratedPoolMeta {
 }
 
 struct LifinityPoolHydrator {
-    program_id: Pubkey,
     hydrator: AsyncHydrator<Pubkey, HydratedPoolMeta>,
     endpoint_count: usize,
 }
@@ -1081,7 +1074,6 @@ impl LifinityPoolHydrator {
         });
 
         Some(Self {
-            program_id,
             hydrator,
             endpoint_count,
         })
@@ -1479,7 +1471,7 @@ fn ratio_to_signed_bps(num: i64, denom: u64) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stages::types::{PoolSnapshot, PoolUpdateExtensions};
+    use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions};
 
     fn push_pubkey(buf: &mut Vec<u8>, key: &Pubkey) {
         buf.extend_from_slice(key.as_ref());

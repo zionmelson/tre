@@ -8,7 +8,6 @@ pub mod notifier;
 pub mod planner;
 pub mod proto;
 pub mod runtime;
-pub mod stages;
 pub mod strategy;
 pub mod submission;
 pub mod telemetry;

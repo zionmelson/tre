@@ -24,9 +24,10 @@ use crate::builder::{
 use crate::core::{pin_current_thread, Lease, RingConsumer, RingProducer};
 use crate::telemetry::{self, Stage2PlanEvent};
 
-use super::types::{
-    BundleCandidate, FlashLoanSummary, PlannedInstruction, PlannedLookupTable, PoolQuoteDirection,
-    RouteLegPlan, RoutePlan, LB_CLMM_PROGRAM_ID,
+use crate::hydration::types::{LB_CLMM_PROGRAM_ID, PoolQuoteDirection};
+use crate::planner::types::{
+    BundleCandidate, FlashLoanSummary, PlannedInstruction, PlannedLookupTable, RouteLegPlan,
+    RoutePlan,
 };
 
 pub fn spawn_submit_stage(
@@ -777,8 +778,8 @@ mod tests {
     use crate::builder::{InstructionTemplate, TemplateCacheKey, TemplateMetadata, TemplatePatch};
     use crate::config::AppConfig;
     use crate::core::SlabPool;
-    use crate::stages::types::{BundleCandidate, Opportunity, TradeUpdate};
-    use crate::stages::types::{PoolQuoteDirection, RouteLegPlan, RoutePlan};
+    use crate::hydration::types::{PoolQuoteDirection, TradeUpdate};
+    use crate::planner::types::{BundleCandidate, Opportunity, RouteLegPlan, RoutePlan};
     use crate::template::TemplateContext;
     use anyhow::anyhow;
     use serde_json::json;

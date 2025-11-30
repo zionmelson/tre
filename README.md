@@ -1,6 +1,6 @@
 # tre-arb-bot
 
-Ultra-light Solana arbitrage executor that prioritizes latency, simplicity, and modular upgrades. The bot consumes CoreCast streams, transforms parsed pool events into cached swap/flash-loan instructions, and submits atomic bundles to the Jito block engine while keeping the critical path as small as possible. The runtime now uses a flat chain of single-producer/single-consumer rings with CPU-pinned stages for deterministic latency.
+Ultra-light Solana arbitrage executor tuned for the hydrator ↔ watcher architecture. Hydrator threads consume CoreCast streams, decode pool state directly in memory, and broadcast fresh price/liquidity snapshots to the watcher. The watcher owns strategy/graph search, clamps borrow sizing, and submits bundles to the Jito block engine within the 45 ms freshness budget—no disk caches or legacy stages in the hot path.
 
 ## Status
 
@@ -8,10 +8,10 @@ This repository currently provides:
 
 - Cargo project scaffolding with Tokio/tonic/prost wiring
 - Proto compilation for Bitquery CoreCast and Jito MEV endpoints
-- A flat SPSC runtime with lock-free rings, slab allocators, and CPU-affine stages (`runtime.rs`, `core/`, `stages/`)
-- A fully wired CoreCast → Strategy → Bundle pipeline with config management, IDL caching, instruction template hydration, flash-loan planning, and Prometheus-friendly telemetry counters
-- Bundle lifecycle tracking that streams `SubscribeBundleResults`, optionally taps the state-auction websocket feed, and publishes per-bundle alerts/metrics for accepted, rejected, finalized, or expired bundles
-- Documentation of the target architecture and deployment assumptions (see `docs/architecture.md`)
+- CPU-affine runtime with lock-free channels + slabs wiring hydrator threads to the fast watcher lane (`runtime.rs`, `core/`, `hydration/`, `planner.rs`)
+- A CoreCast → Hydrator → Watcher pipeline with config management, IDL caching, instruction template hydration, flash-loan planning, and Prometheus-friendly telemetry
+- Bundle lifecycle tracking that streams `SubscribeBundleResults`, taps the state-auction websocket feed, and publishes per-bundle alerts/metrics for accepted, rejected, finalized, or expired bundles
+- Documentation covering hydrator/watcher responsibilities and deployment assumptions (see `docs/hydrator_watcher.md` and `docs/architecture.md`)
 
 ## Quick Start
 
@@ -64,36 +64,36 @@ Submission tracking knobs live under the `submission` section of `config.json` (
 
 ### Leader Schedule Gating
 
-- Stage3 now consults a dedicated leader-schedule watcher that polls the configured `quicknode_rpcs` so bundles are only signed when the current slot’s leader is running Jito’s Blockspace Auction Mechanism (BAM).
+- The submission lane consults a dedicated leader-schedule watcher that polls the configured `quicknode_rpcs` so bundles are only signed when the current slot’s leader is running Jito’s Blockspace Auction Mechanism (BAM).
 - Populate `bam_validators.csv` with the canonical identity/vote accounts for every BAM-enabled validator (a starter list lives in the repo root). Use the top-level `bam_validator_csv` entry in `config.json` to point at refreshed snapshots when you regenerate the allowlist.
-- When the watcher reports a non-BAM leader or the snapshot falls stale, Stage3 simply spins without dequeuing new bundles; logs make it obvious why submissions paused.
+- When the watcher reports a non-BAM leader or the snapshot falls stale, the submission lane spins without dequeuing new bundles; logs make it obvious why submissions paused.
 - Refresh the CSV whenever Jito publishes new validators or you want to prioritize a different subset. A runtime restart is required so the new allowlist can be loaded at startup.
 
 ### Alerting
 
-Set `alerts.webhook_url` in `config.json` to mirror every arbitrage, bundle candidate, and Stage3 submission result to an external system (PagerDuty, Slack, etc.). The runtime always fans out to the logging sink, and will best-effort POST the same payload to the configured webhook with a short timeout so the hot path stays non-blocking. Use `alerts.environment` to distinguish between devnet, staging, and production fleets in downstream dashboards.
+Set `alerts.webhook_url` in `config.json` to mirror every arbitrage, bundle candidate, and submission-lane result to an external system (PagerDuty, Slack, etc.). The runtime always fans out to the logging sink, and will best-effort POST the same payload to the configured webhook with a short timeout so the hot path stays non-blocking. Use `alerts.environment` to distinguish between devnet, staging, and production fleets in downstream dashboards.
 
 ### Prometheus / Grafana
 
-- Expose metrics by setting `PROMETHEUS_METRICS_ADDR="0.0.0.0:9898"` (or any open port). Prometheus can scrape the `/` endpoint directly.
-- Track Stage1 capacity with `stage1_backpressure_events_total`. The `reason` label breaks events into `slab_exhausted`, `ring_full`, `overflow_queued`, `overflow_flushed`, and `overflow_dropped`. Sustained `slab_exhausted` or any non-zero `overflow_dropped` indicates the bundle pipeline is falling behind.
-- Monitor Stage2 planning health with `stage2_plan_events_total`. Look for spikes in `event="plan_failed"` or `event="retries_exhausted"` (reason `plan` or `prepare`).
-- Watch Stage3 send reliability via `stage3_retry_events_total`. Alerts should page when `event="retries_exhausted"` or `event="failure_recorded"` rises for `reason="sign"` (builder issues), `reason="submit"` (RPC/Jito), or `reason="context"` (Stage2 gaps). A healthy deployment should mostly emit `retry_flushed` when transient errors clear.
-- Recommended alert (drop into your rules file):
+- Expose metrics by setting `PROMETHEUS_METRICS_ADDR="0.0.0.0:9898"` (or any open port). Prometheus scrapes `/` for counters, histograms, and gauges.
+- Hydrator health: watch `hydration_adapter_ingest_total` (per adapter), `hydrator_queue_depth`, `hydrator_update_latency_ms`, and `hydration_stale_pool_total`. Sustained queue depth or stale pools mean CoreCast isn’t keeping up.
+- Watcher health: track `watcher_update_age_ms` (age of pool data when consumed), `watcher_strategy_latency_ms`, and `bundle_execution_retry_events_total{reason="sign|submit|context"}` for send issues.
+- Template/flash readiness: keep `hydration_template_age_ms`, `hydration_alt_age_ms`, `hydration_flash_routes_prepared`, and `hydration_backlog_items` on a single dashboard to highlight upstream starvation.
+- Recommended alert:
 
   ```yaml
-  - alert: Stage1BackpressureSustained
-    expr: sum(rate(stage1_backpressure_events_total{reason=~"slab_exhausted|ring_full|overflow_dropped"}[5m])) > 0
-    for: 2m
+  - alert: HydratorQueueLag
+    expr: avg_over_time(hydrator_queue_depth[1m]) > 0.7 * hydrator_queue_capacity
+    for: 1m
     labels:
       severity: critical
       service: tre-arb-bot
     annotations:
-      summary: Stage1 bundle pipeline is dropping work
-      description: "{{ $labels.environment }} has sustained Stage1 backpressure ({{ $value }} events/s)."
+      summary: Hydrator queue is saturating
+      description: "{{ $labels.environment }} hydrator queue is above 70% for >1m; watcher will soon see stale pools."
   ```
 
-- Grafana panel tip: plot `sum by (reason)(rate(stage1_backpressure_events_total[1m]))` as a stacked area chart next to detection latency so you can correlate regressions with backpressure spikes.
+- Grafana tip: overlay `quantile_over_time(0.99, watcher_update_age_ms[1m])` with `bundle_execution_latency_ms` and `bundle_execution_tip_multiplier_milli` to correlate stale data with missed fills. Label series by adapter/protocol for faster triage.
 
 ## Directory Layout
 
@@ -102,14 +102,15 @@ bitquery/               # CoreCast protos (compiled via build.rs)
 idls/pools/             # Pool IDLs → const instruction bytes (codegen emits pools_static.rs)
 jito/                   # Jito block engine/searcher protos
 src/
-  core/                 # Lock-free SPSC rings + slab allocator
-  stages/               # stage0_ingest → stage1_eval → stage2_submit implementations
-  codegen/              # Generated instruction templates (include! at build time)
-  runtime.rs            # Flat executor wiring + graceful shutdown
-  config.rs             # Config loader + validation
+  core/                 # Lock-free rings + slab allocator primitives shared by hydrator/watcher
+  hydration/            # CoreCast ingest, adapter decoders, runtime pool map, template cache
+  planner.rs            # Watcher fast lane: subscribes to hydrator feed, runs StrategyEngine
+  runtime.rs            # Thread wiring + graceful shutdown for hydrator, watcher, submitter
+  config.rs             # Config loader + validation (hydrator queues, borrow pct, endpoints)
   corecast.rs           # Credentialed CoreCast client + stream/channel pool management
-  strategy.rs           # Opportunity evaluation, deduping, and dynamic tip policy
-  bundle.rs             # Jito bundle client (single-endpoint today)
+  strategy.rs           # Opportunity evaluation, borrow sizing, and dynamic tip policy
+  bundle.rs             # Bundle tracker, telemetry, and submission helpers
+  submission.rs         # Builder + signer + dual-lane sender logic
   notifier.rs           # Placeholder Gmail/alert plumbing
   proto.rs              # tonic include_proto! glue
 ```

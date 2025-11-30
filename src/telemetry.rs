@@ -1,4 +1,10 @@
-use std::{convert::Infallible, env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    env,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use bs58;
@@ -22,41 +28,32 @@ static HTTP_SERVER: OnceCell<Option<JoinHandle<()>>> = OnceCell::new();
 
 struct TelemetryState {
     registry: Arc<Registry>,
-    path_latency: Histogram,
-    candidate_gauge: Gauge,
     detection_latency: Histogram,
-    stage3_latency: Histogram,
-    stage3_submissions: Family<Stage3StatusLabels, Counter>,
-    stage3_tip_lamports: Gauge,
-    stage3_bundle_hash: Gauge,
-    tip_multiplier_milli: Gauge,
+    execution_latency: Histogram,
+    execution_attempts: Family<Stage3StatusLabels, Counter>,
+    execution_tip_lamports: Gauge,
+    execution_bundle_hash: Gauge,
+    execution_tip_multiplier_milli: Gauge,
     bundle_result_latency: Histogram,
     bundle_result_status: Family<BundleResultLabels, Counter>,
-    stage1_backpressure_events: Family<Stage1BackpressureLabels, Counter>,
-    stage1_pool_drain_events: Family<Stage1PoolDrainLabels, Counter>,
     stage2_plan_events: Family<Stage2PlanLabels, Counter>,
     stage2_pool_blocks: Family<Stage2PoolLabels, Counter>,
-    stage3_retry_events: Family<Stage3RetryLabels, Counter>,
-    stage1_feed_gap_events: Family<Stage1FeedGapLabels, Counter>,
+    execution_retry_events: Family<Stage3RetryLabels, Counter>,
+    hydration_template_age_ms: Gauge,
+    hydration_alt_age_ms: Gauge,
+    hydration_backlog_gauge: Gauge,
+    hydration_template_cache_entries: Gauge,
+    hydration_alt_ready_tables: Gauge,
+    hydration_flash_routes_prepared: Gauge,
+    hydration_adapter_ingest: Family<HydrationAdapterLabels, Counter>,
+    graph_pool_count: Gauge,
+    graph_cycle_count: Gauge,
+    graph_snapshot_latency: Histogram,
 }
 
 impl TelemetryState {
     fn new() -> Self {
         let mut registry = Registry::default();
-
-        let path_latency = Histogram::new(exponential_buckets(1.0, 2.0, 20));
-        registry.register(
-            "stage1_path_search_us",
-            "Stage1 GraphManager multi-leg search duration in microseconds",
-            path_latency.clone(),
-        );
-
-        let candidate_gauge = Gauge::default();
-        registry.register(
-            "stage1_path_candidate_count",
-            "Candidate path count produced by Stage1 multi-hop search",
-            candidate_gauge.clone(),
-        );
 
         let detection_latency = Histogram::new(exponential_buckets(0.1, 2.0, 20));
         registry.register(
@@ -65,39 +62,38 @@ impl TelemetryState {
             detection_latency.clone(),
         );
 
-        let stage3_latency = Histogram::new(exponential_buckets(0.1, 2.0, 20));
+        let execution_latency = Histogram::new(exponential_buckets(0.1, 2.0, 20));
         registry.register(
-            "bundle_stage3_latency_ms",
-            "Elapsed milliseconds between opportunity detection and Stage3/Jito submission",
-            stage3_latency.clone(),
+            "bundle_execution_latency_ms",
+            "Elapsed milliseconds between opportunity detection and fast-lane bundle submission",
+            execution_latency.clone(),
+        );
+        let execution_attempts = Family::default();
+        registry.register(
+            "bundle_execution_attempts_total",
+            "Fast-lane bundle submission attempts partitioned by result",
+            execution_attempts.clone(),
         );
 
-        let stage3_submissions = Family::default();
+        let execution_tip_lamports = Gauge::default();
         registry.register(
-            "bundle_stage3_submissions_total",
-            "Stage3 bundle submission attempts partitioned by result",
-            stage3_submissions.clone(),
+            "bundle_execution_tip_lamports",
+            "Tip lamports observed in the last successful fast-lane bundle submission",
+            execution_tip_lamports.clone(),
         );
 
-        let stage3_tip_lamports = Gauge::default();
+        let execution_bundle_hash = Gauge::default();
         registry.register(
-            "bundle_stage3_tip_lamports",
-            "Tip lamports observed in the last successful Stage3 bundle submission",
-            stage3_tip_lamports.clone(),
-        );
-
-        let stage3_bundle_hash = Gauge::default();
-        registry.register(
-            "bundle_stage3_last_bundle_hash",
+            "bundle_execution_last_bundle_hash",
             "Lower 63 bits of the most recent bundle_id (decoded as base58) for correlation/debugging",
-            stage3_bundle_hash.clone(),
+            execution_bundle_hash.clone(),
         );
 
-        let tip_multiplier_milli = Gauge::default();
+        let execution_tip_multiplier_milli = Gauge::default();
         registry.register(
-            "bundle_stage3_tip_multiplier_milli",
+            "bundle_execution_tip_multiplier_milli",
             "Tip multiplier applied to the last bundle (scaled by 1e3)",
-            tip_multiplier_milli.clone(),
+            execution_tip_multiplier_milli.clone(),
         );
 
         let bundle_result_latency = Histogram::new(exponential_buckets(0.1, 2.0, 20));
@@ -114,20 +110,6 @@ impl TelemetryState {
             bundle_result_status.clone(),
         );
 
-        let stage1_backpressure_events = Family::default();
-        registry.register(
-            "stage1_backpressure_events_total",
-            "Stage1 bundle candidate backpressure events grouped by reason",
-            stage1_backpressure_events.clone(),
-        );
-
-        let stage1_pool_drain_events = Family::default();
-        registry.register(
-            "stage1_pool_drain_events_total",
-            "Stage1 pool-consumer drain patterns grouped by mode",
-            stage1_pool_drain_events.clone(),
-        );
-
         let stage2_plan_events = Family::default();
         registry.register(
             "stage2_plan_events_total",
@@ -142,38 +124,106 @@ impl TelemetryState {
             stage2_pool_blocks.clone(),
         );
 
-        let stage3_retry_events = Family::default();
+        let execution_retry_events = Family::default();
         registry.register(
-            "stage3_retry_events_total",
-            "Stage3 submission retry lifecycle grouped by event",
-            stage3_retry_events.clone(),
+            "bundle_execution_retry_events_total",
+            "Fast-lane submission retry lifecycle grouped by event",
+            execution_retry_events.clone(),
         );
 
-        let stage1_feed_gap_events = Family::default();
+        let hydration_template_age_ms = Gauge::default();
         registry.register(
-            "stage1_feed_gap_events_total",
-            "Stage1 ingest gaps grouped by cause",
-            stage1_feed_gap_events.clone(),
+            "hydration_template_age_ms",
+            "Milliseconds since the template cache last refreshed",
+            hydration_template_age_ms.clone(),
+        );
+
+        let hydration_alt_age_ms = Gauge::default();
+        registry.register(
+            "hydration_alt_age_ms",
+            "Milliseconds since the ALT manager last refreshed",
+            hydration_alt_age_ms.clone(),
+        );
+
+        let hydration_backlog_gauge = Gauge::default();
+        registry.register(
+            "hydration_backlog_items",
+            "Pending hydration jobs/backlog queued by the ALT manager",
+            hydration_backlog_gauge.clone(),
+        );
+
+        let hydration_template_cache_entries = Gauge::default();
+        registry.register(
+            "hydration_template_cache_entries",
+            "Number of hydrated instruction templates currently cached",
+            hydration_template_cache_entries.clone(),
+        );
+
+        let hydration_alt_ready_tables = Gauge::default();
+        registry.register(
+            "hydration_alt_ready_tables",
+            "Count of ALT tables ready for immediate use",
+            hydration_alt_ready_tables.clone(),
+        );
+
+        let hydration_flash_routes_prepared = Gauge::default();
+        registry.register(
+            "hydration_flash_routes_prepared",
+            "Flash-loan routes currently pre-built by the hydration service",
+            hydration_flash_routes_prepared.clone(),
+        );
+
+        let hydration_adapter_ingest = Family::default();
+        registry.register(
+            "hydration_adapter_ingest_total",
+            "Pool updates successfully applied per protocol adapter",
+            hydration_adapter_ingest.clone(),
+        );
+
+        let graph_pool_count = Gauge::default();
+        registry.register(
+            "graph_pool_count",
+            "Number of pools currently indexed by the graph service",
+            graph_pool_count.clone(),
+        );
+
+        let graph_cycle_count = Gauge::default();
+        registry.register(
+            "graph_cycle_count",
+            "Number of profitable arbitrage cycles currently tracked",
+            graph_cycle_count.clone(),
+        );
+
+        let graph_snapshot_latency = Histogram::new(exponential_buckets(0.05, 2.0, 20));
+        registry.register(
+            "graph_snapshot_latency_ms",
+            "Milliseconds between pool snapshot creation and graph ingestion",
+            graph_snapshot_latency.clone(),
         );
 
         Self {
             registry: Arc::new(registry),
-            path_latency,
-            candidate_gauge,
             detection_latency,
-            stage3_latency,
-            stage3_submissions,
-            stage3_tip_lamports,
-            stage3_bundle_hash,
-            tip_multiplier_milli,
+            execution_latency,
+            execution_attempts,
+            execution_tip_lamports,
+            execution_bundle_hash,
+            execution_tip_multiplier_milli,
             bundle_result_latency,
             bundle_result_status,
-            stage1_backpressure_events,
-            stage1_pool_drain_events,
             stage2_plan_events,
             stage2_pool_blocks,
-            stage3_retry_events,
-            stage1_feed_gap_events,
+            execution_retry_events,
+            hydration_template_age_ms,
+            hydration_alt_age_ms,
+            hydration_backlog_gauge,
+            hydration_template_cache_entries,
+            hydration_alt_ready_tables,
+            hydration_flash_routes_prepared,
+            hydration_adapter_ingest,
+            graph_pool_count,
+            graph_cycle_count,
+            graph_snapshot_latency,
         }
     }
 }
@@ -246,15 +296,6 @@ pub fn snapshot_metrics() -> Option<String> {
     })
 }
 
-pub fn record_path_search(duration: Duration, candidate_count: usize) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .path_latency
-            .observe(duration.as_secs_f64() * 1_000_000.0);
-        state.candidate_gauge.set(candidate_count as i64);
-    }
-}
-
 pub fn record_detection_latency(duration: Duration) {
     if let Some(state) = TELEMETRY.get() {
         state
@@ -266,7 +307,7 @@ pub fn record_detection_latency(duration: Duration) {
 pub fn record_stage3_latency(duration: Duration) {
     if let Some(state) = TELEMETRY.get() {
         state
-            .stage3_latency
+            .execution_latency
             .observe(duration.as_secs_f64() * 1_000.0);
     }
 }
@@ -276,7 +317,7 @@ pub fn record_tip_multiplier(multiplier: f64) {
         if multiplier.is_finite() {
             let scaled = (multiplier * 1_000.0).round();
             let clamped = scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
-            state.tip_multiplier_milli.set(clamped);
+            state.execution_tip_multiplier_milli.set(clamped);
         }
     }
 }
@@ -297,24 +338,25 @@ struct BundleResultLabels {
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct Stage1BackpressureLabels {
-    reason: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct Stage1PoolDrainLabels {
-    mode: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 struct Stage3RetryLabels {
     event: &'static str,
     reason: &'static str,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct Stage1FeedGapLabels {
+struct Stage2PlanLabels {
+    event: &'static str,
     reason: &'static str,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct Stage2PoolLabels {
+    pool_id: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct HydrationAdapterLabels {
+    adapter: String,
 }
 
 pub enum Stage3RetryEvent {
@@ -322,6 +364,24 @@ pub enum Stage3RetryEvent {
     RetryFlushed,
     RetriesExhausted(Stage3RetryReason),
     FailureRecorded(Stage3RetryReason),
+}
+
+pub enum Stage2PlanEvent {
+    PlanFailed,
+    PrepareFailed,
+}
+
+impl Stage2PlanEvent {
+    fn event(&self) -> &'static str {
+        "failure"
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Stage2PlanEvent::PlanFailed => "plan_failed",
+            Stage2PlanEvent::PrepareFailed => "prepare_failed",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -367,54 +427,18 @@ pub fn record_stage3_retry_event(event: Stage3RetryEvent) {
             event: event.event(),
             reason: event.reason(),
         };
-        state.stage3_retry_events.get_or_create(&labels).inc();
+        state.execution_retry_events.get_or_create(&labels).inc();
     }
 }
 
-pub enum Stage1FeedGapEvent {
-    MissingSnapshot,
-    BacklogQueued,
-    BacklogFlushed,
-    BacklogOverflow,
-}
-
-impl Stage1FeedGapEvent {
-    fn label(&self) -> &'static str {
-        match self {
-            Stage1FeedGapEvent::MissingSnapshot => "missing_snapshot",
-            Stage1FeedGapEvent::BacklogQueued => "backlog_queued",
-            Stage1FeedGapEvent::BacklogFlushed => "backlog_flushed",
-            Stage1FeedGapEvent::BacklogOverflow => "backlog_overflow",
-        }
-    }
-}
-
-pub fn record_stage1_feed_gap(event: Stage1FeedGapEvent) {
+pub fn record_stage2_plan_event(event: Stage2PlanEvent) {
     if let Some(state) = TELEMETRY.get() {
-        let labels = Stage1FeedGapLabels {
-            reason: event.label(),
+        let labels = Stage2PlanLabels {
+            event: event.event(),
+            reason: event.reason(),
         };
-        state.stage1_feed_gap_events.get_or_create(&labels).inc();
+        state.stage2_plan_events.get_or_create(&labels).inc();
     }
-}
-
-pub fn record_stage2_pool_block(pool_id: &str) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = Stage2PoolLabels {
-            pool_id: pool_id.to_string(),
-        };
-        state.stage2_pool_blocks.get_or_create(&labels).inc();
-    }
-}
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct Stage2PlanLabels {
-    event: &'static str,
-    reason: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct Stage2PoolLabels {
-    pool_id: String,
 }
 
 pub fn record_stage3_outcome(
@@ -430,23 +454,115 @@ pub fn record_stage3_outcome(
         let labels = Stage3StatusLabels {
             status: status_label,
         };
-        state.stage3_submissions.get_or_create(&labels).inc();
+        state.execution_attempts.get_or_create(&labels).inc();
 
         if matches!(status, Stage3SubmissionStatus::Success) {
             if let Some(tip) = tip_lamports {
-                state.stage3_tip_lamports.set(clamp_u64_to_i64(tip));
+                state.execution_tip_lamports.set(clamp_u64_to_i64(tip));
             }
             if let Some(id) = bundle_id {
                 if let Some(hash) = bundle_id_hash(id) {
-                    state.stage3_bundle_hash.set(hash);
+                    state.execution_bundle_hash.set(hash);
                 }
             }
         }
     }
 }
 
+pub fn record_hydration_template_refresh(last_refresh_unix_ms: u64) {
+    if let Some(state) = TELEMETRY.get() {
+        if let Some(age_ms) = age_since_unix_ms(last_refresh_unix_ms) {
+            state
+                .hydration_template_age_ms
+                .set(clamp_u64_to_i64(age_ms));
+        }
+    }
+}
+
+pub fn record_hydration_alt_refresh(last_refresh_unix_ms: u64) {
+    if let Some(state) = TELEMETRY.get() {
+        if let Some(age_ms) = age_since_unix_ms(last_refresh_unix_ms) {
+            state.hydration_alt_age_ms.set(clamp_u64_to_i64(age_ms));
+        }
+    }
+}
+
+pub fn record_hydration_backlog(pending_jobs: u64) {
+    if let Some(state) = TELEMETRY.get() {
+        state
+            .hydration_backlog_gauge
+            .set(clamp_u64_to_i64(pending_jobs));
+    }
+}
+
+pub fn record_hydration_template_count(template_count: u64) {
+    if let Some(state) = TELEMETRY.get() {
+        state
+            .hydration_template_cache_entries
+            .set(clamp_u64_to_i64(template_count));
+    }
+}
+
+pub fn record_hydration_alt_ready_tables(ready_tables: u64) {
+    if let Some(state) = TELEMETRY.get() {
+        state
+            .hydration_alt_ready_tables
+            .set(clamp_u64_to_i64(ready_tables));
+    }
+}
+
+pub fn record_hydration_flash_routes(prepared_routes: u64) {
+    if let Some(state) = TELEMETRY.get() {
+        state
+            .hydration_flash_routes_prepared
+            .set(clamp_u64_to_i64(prepared_routes));
+    }
+}
+
+pub fn record_graph_pool_count(count: usize) {
+    if let Some(state) = TELEMETRY.get() {
+        state.graph_pool_count.set(clamp_u64_to_i64(count as u64));
+    }
+}
+
+pub fn record_graph_cycle_count(count: usize) {
+    if let Some(state) = TELEMETRY.get() {
+        state.graph_cycle_count.set(clamp_u64_to_i64(count as u64));
+    }
+}
+
+pub fn record_graph_snapshot_latency(latency: Duration) {
+    if let Some(state) = TELEMETRY.get() {
+        state
+            .graph_snapshot_latency
+            .observe(latency.as_secs_f64() * 1_000.0);
+    }
+}
+
+pub fn record_hydration_adapter_ingest(adapter: &str) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationAdapterLabels {
+            adapter: adapter.to_string(),
+        };
+        state.hydration_adapter_ingest.get_or_create(&labels).inc();
+    }
+}
+
 fn clamp_u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn age_since_unix_ms(last_refresh_unix_ms: u64) -> Option<u64> {
+    if last_refresh_unix_ms == 0 {
+        return None;
+    }
+    let now_ms = unix_timestamp_millis()?;
+    now_ms.checked_sub(last_refresh_unix_ms)
+}
+
+fn unix_timestamp_millis() -> Option<u64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    u64::try_from(duration.as_millis()).ok()
 }
 
 fn bundle_id_hash(bundle_id: &str) -> Option<i64> {
@@ -497,103 +613,11 @@ pub fn record_bundle_result(status: BundleResultStatus, latency: Duration) {
     }
 }
 
-pub enum Stage1BackpressureEvent {
-    SlabExhausted,
-    RingFull,
-    OverflowQueued,
-    OverflowDropped,
-    OverflowFlushed,
-    TradeIntakePaused,
-}
-
-impl Stage1BackpressureEvent {
-    fn label(&self) -> &'static str {
-        match self {
-            Stage1BackpressureEvent::SlabExhausted => "slab_exhausted",
-            Stage1BackpressureEvent::RingFull => "ring_full",
-            Stage1BackpressureEvent::OverflowQueued => "overflow_queued",
-            Stage1BackpressureEvent::OverflowDropped => "overflow_dropped",
-            Stage1BackpressureEvent::OverflowFlushed => "overflow_flushed",
-            Stage1BackpressureEvent::TradeIntakePaused => "trade_intake_paused",
-        }
-    }
-}
-
-pub fn record_stage1_backpressure(event: Stage1BackpressureEvent) {
+pub fn record_stage2_pool_block(pool_id: &str) {
     if let Some(state) = TELEMETRY.get() {
-        let labels = Stage1BackpressureLabels {
-            reason: event.label(),
+        let labels = Stage2PoolLabels {
+            pool_id: pool_id.to_string(),
         };
-        state
-            .stage1_backpressure_events
-            .get_or_create(&labels)
-            .inc();
-    }
-}
-
-pub enum Stage1PoolDrainEvent {
-    Single,
-    Multiple,
-}
-
-impl Stage1PoolDrainEvent {
-    fn label(&self) -> &'static str {
-        match self {
-            Stage1PoolDrainEvent::Single => "single",
-            Stage1PoolDrainEvent::Multiple => "multiple",
-        }
-    }
-}
-
-pub fn record_stage1_pool_drain(event: Stage1PoolDrainEvent) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = Stage1PoolDrainLabels {
-            mode: event.label(),
-        };
-        state.stage1_pool_drain_events.get_or_create(&labels).inc();
-    }
-}
-
-pub enum Stage2PlanEvent {
-    PlanFailed,
-    PrepareFailed,
-    RetryQueuedPlan,
-    RetryQueuedPrepare,
-    RetryFlushed,
-    RetriesExhaustedPlan,
-    RetriesExhaustedPrepare,
-}
-
-impl Stage2PlanEvent {
-    fn event(&self) -> &'static str {
-        match self {
-            Stage2PlanEvent::PlanFailed => "plan_failed",
-            Stage2PlanEvent::PrepareFailed => "prepare_failed",
-            Stage2PlanEvent::RetryQueuedPlan => "retry_queued",
-            Stage2PlanEvent::RetryQueuedPrepare => "retry_queued",
-            Stage2PlanEvent::RetryFlushed => "retry_flushed",
-            Stage2PlanEvent::RetriesExhaustedPlan => "retries_exhausted",
-            Stage2PlanEvent::RetriesExhaustedPrepare => "retries_exhausted",
-        }
-    }
-
-    fn reason(&self) -> &'static str {
-        match self {
-            Stage2PlanEvent::PlanFailed | Stage2PlanEvent::RetryQueuedPlan => "plan",
-            Stage2PlanEvent::PrepareFailed | Stage2PlanEvent::RetryQueuedPrepare => "prepare",
-            Stage2PlanEvent::RetryFlushed => "retry",
-            Stage2PlanEvent::RetriesExhaustedPlan => "plan",
-            Stage2PlanEvent::RetriesExhaustedPrepare => "prepare",
-        }
-    }
-}
-
-pub fn record_stage2_plan_event(event: Stage2PlanEvent) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = Stage2PlanLabels {
-            event: event.event(),
-            reason: event.reason(),
-        };
-        state.stage2_plan_events.get_or_create(&labels).inc();
+        state.stage2_pool_blocks.get_or_create(&labels).inc();
     }
 }

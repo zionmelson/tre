@@ -12,7 +12,7 @@ use crate::builder::{BuilderHandle, BuilderStage};
 use crate::bundle::{BundleClient, BundleTracker, PendingSubmission};
 use crate::core::{pin_current_thread, Lease, RingConsumer};
 use crate::notifier::{BundleSubmissionEvent, BundleSubmissionStatus, Notifier};
-use crate::stages::types::BundleCandidate;
+use crate::planner::types::BundleCandidate;
 use crate::telemetry::{self, Stage3SubmissionStatus};
 use crate::tip_pressure;
 

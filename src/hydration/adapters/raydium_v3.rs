@@ -20,7 +20,7 @@ use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
 use crate::builder::{AmmV3PoolMeta, BuilderHandle};
-use crate::stages::types::{
+use crate::hydration::types::{
     PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, RaydiumV3PoolExtras,
     RAYDIUM_V3_INPUT_UTILIZATION_BPS,
 };
@@ -922,14 +922,6 @@ fn build_raydium_alt_accounts(
     accounts
 }
 
-fn order_mints(base: Pubkey, quote: Pubkey) -> (Pubkey, Pubkey) {
-    if base.to_bytes() <= quote.to_bytes() {
-        (base, quote)
-    } else {
-        (quote, base)
-    }
-}
-
 fn order_mints_with_programs(
     base: Pubkey,
     quote: Pubkey,
@@ -1234,8 +1226,6 @@ struct RaydiumPoolHydrator {
     pool_cache: AsyncHydrator<Pubkey, HydratedPoolMeta>,
     tick_array_cache: DashMap<(Pubkey, i32), HydratedTickArray>,
     hydrated_tick_sets: DashSet<Pubkey>,
-    amm_config_cache: Arc<DashMap<Pubkey, HydratedAmmConfig>>,
-    missing_amm_configs: Arc<DashMap<Pubkey, Instant>>,
     mint_program_cache: DashMap<Pubkey, Pubkey>,
     missing_mints: DashMap<Pubkey, Instant>,
     retry_backoff: Duration,
@@ -1259,12 +1249,10 @@ impl RaydiumPoolHydrator {
         }
 
         let clients = Arc::new(client_list);
-        let amm_config_cache = Arc::new(DashMap::new());
-        let missing_amm_configs = Arc::new(DashMap::new());
+        let fetch_amm_cache = Arc::new(DashMap::new());
+        let fetch_missing = Arc::new(DashMap::new());
         let retry_backoff = Duration::from_millis(config.hydration_retry_ms.max(1));
         let fetch_clients = clients.clone();
-        let fetch_amm_cache = amm_config_cache.clone();
-        let fetch_missing = missing_amm_configs.clone();
         let pool_cache = AsyncHydrator::new("raydium_pool", fetch_clients.len(), move |pool| {
             fetch_raydium_pool_meta(
                 fetch_clients.as_ref(),
@@ -1281,8 +1269,6 @@ impl RaydiumPoolHydrator {
             pool_cache,
             tick_array_cache: DashMap::new(),
             hydrated_tick_sets: DashSet::new(),
-            amm_config_cache,
-            missing_amm_configs,
             mint_program_cache: DashMap::new(),
             missing_mints: DashMap::new(),
             retry_backoff,
@@ -1485,16 +1471,8 @@ impl RaydiumPoolHydrator {
         Some(selected)
     }
 
-    fn should_skip_missing_config(&self, key: &Pubkey) -> bool {
-        Self::should_skip_missing(&self.missing_amm_configs, key, self.retry_backoff)
-    }
-
     fn should_skip_missing_mint(&self, key: &Pubkey) -> bool {
         Self::should_skip_missing(&self.missing_mints, key, self.retry_backoff)
-    }
-
-    fn mark_missing_config(&self, key: Pubkey) -> bool {
-        Self::record_missing(&self.missing_amm_configs, key)
     }
 
     fn mark_missing_mint(&self, key: Pubkey) -> bool {

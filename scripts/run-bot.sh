@@ -6,4 +6,7 @@ set -euo pipefail
 : "${RUST_LOG:=debug}"
 export PROMETHEUS_METRICS_ADDR RUST_LOG
 
+echo "[run-bot] Hydration workers: template cache, ALT manager, flash planner"
+echo "[run-bot] Fast execution workers: planner, signer pool, dual senders"
+
 cargo run --bin tre-arb-bot -- "$@" >> output.txt 

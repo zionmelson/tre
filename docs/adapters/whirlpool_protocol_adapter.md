@@ -3,8 +3,8 @@
 ## Goals & Scope
 
 - Implement a production-ready `ProtocolAdapter` for Whirlpool concentrated-liquidity pools as defined in `idls/pools/whirlpool.json`.
-- Normalize CoreCast Whirlpool state into an internal cache so Stage1 strategies can request quotes without bespoke CLMM math.
-- Generate deterministic `SwapTemplate` payloads for the Whirlpool `swap` instruction (and `twoHopSwap` later) so Stage2 can bundle transactions without recomputing ticks or PDAs.
+- Normalize CoreCast Whirlpool state into an internal cache so the fast execution lane can request quotes without bespoke CLMM math.
+- Generate deterministic `SwapTemplate` payloads for the Whirlpool `swap` instruction (and `twoHopSwap` later) inside the hydration lane so bundling requires no recomputing of ticks or PDAs.
 - Expose adapter-level health/telemetry signals that describe when Whirlpool liquidity is actionable, stale, rate-limited, or missing tick coverage.
 
 ## Responsibilities
@@ -25,7 +25,7 @@
 
 ## API Shape
 
-The adapter conforms to the shared trait used by Stage1/Stage2:
+The adapter conforms to the shared trait used by the hydration + fast execution lanes:
 
 ```rust
 pub struct WhirlpoolAdapter {
@@ -72,7 +72,7 @@ pub struct WhirlpoolState {
 4. **Exact-in solver** – Treat `amount` as input, deduct trading fees upfront, and iteratively consume liquidity segments until exhausted or tick coverage ends. Return actual output, fee breakdown, next `sqrt_price`, and `edge_bps` relative to mid price.
 5. **Exact-out solver** – Reverse the solver by computing the input required to achieve the desired output, rejecting requests that exceed `other_amount_threshold` or run out of liquidity prior to completion.
 6. **Slippage & guardrails** – Respect caller-provided `sqrt_price_limit` (set to `0`/`u128::MAX` for open) and short-circuit with `InvalidSqrtPriceLimitDirection` equivalent when incompatible.
-7. **Reward & fee accounting** – Update fee growth / reward trackers (if provided) so Stage1 can expose net APR or reward accrual insights without re-reading on-chain state.
+7. **Reward & fee accounting** – Update fee growth / reward trackers (if provided) so the fast execution lane can expose net APR or reward accrual insights without re-reading on-chain state.
 
 ## Instruction Templating
 
@@ -92,7 +92,7 @@ pub struct WhirlpoolState {
   10. `tick_array2`
   11. `oracle`
 - **Remaining accounts** – Append adaptive-fee oracle (writable), supplemental tick arrays, transfer-hook programs, or memo program entries exactly as described in the IDL `RemainingAccountsInfo` hints.
-- **Template metadata** – Embed signer expectations, compute budget recommendations, and tick-array coverage summary inside `SwapTemplate::context` so Stage2 can react when coverage changes mid-bundle.
+- **Template metadata** – Embed signer expectations, compute budget recommendations, and tick-array coverage summary inside `SwapTemplate::context` so the fast execution planner can react when coverage changes mid-bundle.
 
 ## Validation & Telemetry
 
@@ -113,7 +113,7 @@ pub struct WhirlpoolState {
 3. **State cache + hydration** – Wire `ingest_pool_update` to merge stream deltas, fetch on-chain accounts as needed, and maintain tick-array coverage. Unit-test using fixture accounts extracted from mainnet RPC.
 4. **Pricing engine** – Implement `quote_exact_in/out` using a reusable `whirlpool_math` module; validate via proptests comparing against recorded on-chain swaps (`docs/swaps/whirlpool-swaps.md` examples).
 5. **Template builder** – Encode account metas and args via the generated IDL bindings; integration-test by simulating swaps on `solana-test-validator` with known pools.
-6. **Stage plumbing** – Register the adapter in Stage0 ingestion (pool detection), Stage1 quote aggregator, and Stage2 submission, ensuring config toggles exist in `config.json`.
+6. **Lane plumbing** – Register the adapter in the hydration ingestion loop (pool detection), feed it into the fast execution quote aggregator, and wire submission policies accordingly, ensuring config toggles exist in `config.json`.
 7. **Observability** – Add tracing spans + metrics; document adapter in `docs/architecture.md` and add runbooks for tick-array cache misses.
 
 ## Testing & Tooling
@@ -127,7 +127,7 @@ pub struct WhirlpoolState {
 ## Risks & Open Questions
 
 - **Tick-array availability** – CoreCast may not stream all arrays needed for a swap path; we need a policy for on-demand RPC fetch vs. prefetch vs. quote rejection.
-- **Adaptive-fee oracle writes** – Some pools require writable oracle accounts; determine whether Stage2 supplies them via `remaining_accounts` or the adapter marks them writable by default.
+- **Adaptive-fee oracle writes** – Some pools require writable oracle accounts; determine whether the fast execution lane supplies them via `remaining_accounts` or the adapter marks them writable by default.
 - **Transfer-hook pools** – Token-2022 mints with hooks demand extra accounts; we must standardize how config/IDL hints inject those dependencies.
 - **Slot lag** – Delayed CoreCast messages could cause stale sqrt price vs. on-chain reality; consider cross-checking `recent_blockhash` slot before publishing quotes.
 - **Two-hop routing** – Future multi-hop support needs a canonical API for passing intermediate whirlpools and tick arrays; design should leave room without breaking trait signatures.

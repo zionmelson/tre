@@ -6,7 +6,6 @@ use std::{
 };
 
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
@@ -15,7 +14,7 @@ use uint::construct_uint;
 use super::hydration::AsyncHydrator;
 
 use crate::builder::{BuilderHandle, WhirlpoolPoolAccounts, WhirlpoolPoolMeta};
-use crate::stages::types::{
+use crate::hydration::types::{
     PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, WhirlpoolPoolExtras,
     WHIRLPOOL_INPUT_UTILIZATION_BPS,
 };
@@ -26,7 +25,6 @@ use super::{
 };
 
 const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN";
-const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TICK_ARRAY_SEED: &[u8] = b"tick_array";
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
@@ -46,10 +44,6 @@ mod u256 {
 pub use u256::U256;
 
 const DEFAULT_WHIRLPOOL_HYDRATION_RETRY_MS: u64 = 60_000;
-
-static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program should be valid")
-});
 
 #[derive(Debug, Clone)]
 pub struct WhirlpoolAdapterConfig {
@@ -799,7 +793,6 @@ struct HydratedPoolMeta {
 #[derive(Clone, Debug)]
 struct HydratedTickArray {
     address: Pubkey,
-    pool: Pubkey,
     start_tick_index: i32,
     ticks: Vec<TickEntry>,
 }
@@ -1249,7 +1242,6 @@ fn parse_tick_array_account(
 
     Some(HydratedTickArray {
         address,
-        pool: whirlpool,
         start_tick_index,
         ticks,
     })
@@ -1999,7 +1991,7 @@ mod math {
 mod tests {
     use super::*;
     use crate::hydration::adapters::{QuoteRequest, SwapDirection};
-    use crate::stages::types::{PoolSnapshot, PoolUpdateExtensions};
+    use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions};
     use dashmap::DashMap;
 
     #[test]
@@ -2256,7 +2248,6 @@ mod tests {
         }
         let array = HydratedTickArray {
             address: Pubkey::new_unique(),
-            pool,
             start_tick_index,
             ticks,
         };

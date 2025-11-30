@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 const NEGATIVE_CYCLE_EPSILON: f64 = 1e-12;
 
-use crate::stages::types::PoolSnapshot;
+use crate::hydration::types::PoolSnapshot;
 use crate::token_pair::TokenPair;
 
 /// Represents a concrete swap leg along a path through the liquidity graph.
@@ -710,7 +710,7 @@ struct WeightedEdgeCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stages::types::PoolUpdateExtensions;
+    use crate::hydration::types::PoolUpdateExtensions;
     use std::time::Instant;
 
     fn snapshot(
