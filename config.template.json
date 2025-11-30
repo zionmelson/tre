@@ -41,6 +41,32 @@
     "JUP": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
     "WSOL": "So11111111111111111111111111111111111111112"
   },
+  "atas": {
+    "USDC": "$ENV{TRE_ATA_USDC}",
+    "USDT": "$ENV{TRE_ATA_USDT}",
+    "TRUMP": "$ENV{TRE_ATA_TRUMP}",
+    "MET": "$ENV{TRE_ATA_MET}",
+    "ZEC": "$ENV{TRE_ATA_ZEC}",
+    "WETH": "$ENV{TRE_ATA_WETH}",
+    "WBTC": "$ENV{TRE_ATA_WBTC}",
+    "mSOL": "$ENV{TRE_ATA_MSOL}",
+    "JTO": "$ENV{TRE_ATA_JTO}",
+    "JUP": "$ENV{TRE_ATA_JUP}",
+    "WSOL": "$ENV{TRE_ATA_WSOL}"
+  },
+  "host_fee_accounts": {
+    "USDC": "$ENV{TRE_ATA_USDC}",
+    "USDT": "$ENV{TRE_ATA_USDT}",
+    "TRUMP": "$ENV{TRE_ATA_TRUMP}",
+    "MET": "$ENV{TRE_ATA_MET}",
+    "ZEC": "$ENV{TRE_ATA_ZEC}",
+    "WETH": "$ENV{TRE_ATA_WETH}",
+    "WBTC": "$ENV{TRE_ATA_WBTC}",
+    "mSOL": "$ENV{TRE_ATA_MSOL}",
+    "JTO": "$ENV{TRE_ATA_JTO}",
+    "JUP": "$ENV{TRE_ATA_JUP}",
+    "WSOL": "$ENV{TRE_ATA_WSOL}"
+  },
   "token_pairs": [
     [
       "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -250,19 +276,23 @@
   "quicknode_rpcs": ["$ENV{TRE_QUICKNODE_RPC_PRIMARY}"],
   "protocols": {
     "raydium_v3": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500
     },
     "cp_amm": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500,
+      "max_utilization_bps": 4000
     },
     "lb_clmm": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500,
+      "max_utilization_bps": 4000
     },
     "lifinity_v2": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500,
+      "max_utilization_bps": 4000
     },
     "whirlpool": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500,
+      "max_utilization_bps": 4000
     }
   },
   "corecast": {

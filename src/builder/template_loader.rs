@@ -489,9 +489,12 @@ fn build_lb_clmm_params(
     let program_id = Pubkey::from_str(template.program_id)
         .with_context(|| format!("invalid program id {}", template.program_id))?;
     let mut accounts = convert_accounts(template.accounts)?;
-    if let Some(meta) = pool_meta {
+    let pool_accounts = if let Some(meta) = pool_meta {
         apply_lb_clmm_pool_accounts(template.accounts, &mut accounts, meta)?;
-    }
+        Some(meta.accounts.clone())
+    } else {
+        None
+    };
 
     let mut data = Vec::with_capacity(128);
     data.extend_from_slice(&template.discriminator);
@@ -515,6 +518,8 @@ fn build_lb_clmm_params(
         tlv_bytes: 0,
         template_hash,
         alt_handle,
+        account_specs: template.accounts,
+        pool_accounts,
     })
 }
 

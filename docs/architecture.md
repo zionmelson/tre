@@ -1,3 +1,67 @@
+# Fast-Lane Executor Architecture
+
+## Objectives
+
+- **Freshness first:** Every data artifact (trade, pool snapshot, template, ALT, flash reserve, blockhash) carries a source timestamp plus a hard time-to-live. Objects older than 40 ms are rejected immediately, guaranteeing sub-50 ms detection-to-submit latency.
+- **Simple pipeline:** Collapse to two hot paths (fast vs slow) instead of four blocking stages. The fast path owns planning, signing, and submission on a single core; the slow path runs hydrators and warmers without touching live trades.
+- **Always-on submissions:** No gating on validator identity or global throttling. Multiple submission lanes (Jito + TPU fanout) fire in parallel the moment a plan is ready.
+- **Observability-enforced safety:** A watchdog samples freshness and latency continuously. Any breach tears down trading automatically rather than allowing stale bundles to leak.
+
+## High-Level Flow
+
+1. **Bootstrap:** Load config, wallets, and IDLs; hydrate static templates; spin the freshness bus (shared channels that broadcast updates + timestamps to subscribers).
+2. **Ingress:** A single Tokio runtime consumes CoreCast trade/pool streams and Solana account subscriptions. Each message is timestamped at arrival; if it is already too old (>30 ms) it is dropped. Fresh updates enter the planner ring immediately.
+3. **Fast Path Planner:** Runs on one pinned thread. It maintains pool state, graph search, flash-loan sizing, and template readiness metadata. When a trade arrives it either emits a fully hydrated `BundlePlan` within ~20 ms or discards the trade if any dependency is missing. No retry queues are used.
+4. **Signing & Submission:** The same thread (or a pair of co-located threads) signs bundles using prebuilt skeletons and immediately dispatches them through both submission lanes. Each bundle carries `fresh_until = min(all resource TTLs)`; if `now > fresh_until` the plan is dropped before signing.
+5. **Slow Path Support:** Background tasks (template hydrators, ALT updates, flash-reserve monitors) stream account changes and push freshness events into the bus. They never block trades; they only update readiness state so future trades can succeed.
+6. **Watchdog & Telemetry:** A guard thread samples detection-to-submit latency, data ages, and submission outcomes every few milliseconds. Any SLA violation toggles the system to degraded, halting trading until freshness recovers.
+
+## Component Responsibilities
+
+- `config` – Adds freshness TTLs, fast-/slow-path CPU pinning, submission lane settings, and watchdog thresholds.
+- `corecast` – Tokio streams with bounded reconnect backoff (≤25 ms) and explicit timestamping. Emits `TradeUpdate` and `PoolUpdate` events with source slot/ts.
+- `hydrators` (new) – Subscribe to Solana accounts (templates, ALTs, flash-loan reserves) and emit `ResourceReady` or `ResourceInvalidated` messages containing slot/time metadata.
+- `planner` – Replaces `stage1_eval` + `stage2_submit`. Performs graph search, flash-loan checks, template assignment, and message construction in one pass. Rejects trades whose dependencies exceed TTL.
+- `submission` – Replaces `stage3_send`. Manages signer pool, blockhash cache (TPU gossip), telemetry, and dual-lane submission (Jito gRPC + raw TPU broadcast). No throttling or leader gating exists.
+- `watchdog` – Continuously verifies `now - resource.timestamp <= ttl` for all active artifacts and `bundle_latency_ms <= 50`. When breached it flips a shared atomic that stops the planner and emits alerts.
+- `telemetry` – Exports freshness histograms (`data_age_ms` per resource type), bundle latency, drop reasons, and submission outcomes. Alerts fire off the watchdog plus Prometheus rules.
+
+## Data Freshness Contract
+
+- Every struct implements `FreshResource { timestamp: Instant, ttl: Duration }`.
+- `TradeUpdate`, `PoolSnapshot`, `InstructionTemplate`, `AltHandle`, `FlashReserve`, `Blockhash`, and `RoutePlan` embed this metadata.
+- Planner logic enforces `now <= resource.fresh_until()` before using it; otherwise the trade is skipped.
+- Subsystems that mutate shared state must issue invalidate events whenever accounts change.
+- Bundles carry `fresh_until = min(resource fresh_until)` so Stage3 can drop stale work without re-checking each dependency.
+
+## Submission Strategy
+
+- **Blockhash acquisition:** Replace the RPC polling cache with a TPU listener that streams new blockhashes every slot, keeping age <10 ms.
+- **Multi-lane send:** After signing, push bundle bytes to (a) Jito gRPC and (b) direct TPU fanout simultaneously. Failures on one lane never block the other.
+- **No BAM gate:** Validator allowlists now inform tipping heuristics, not gating. If a leader is hostile, we adjust tips or disable that lane via config, but the pipe stays open.
+- **Circuit breakers:** If submissions fail for >N ms, watchdog pauses trading and raises an alert.
+
+## Implementation Roadmap
+
+1. **Telemetry + watchdog scaffolding** (new crate modules, metrics, config toggles).
+2. **Builder refactor:** add freshness metadata, streaming hydrators, and TTL enforcement inside `builder::template_cache`, `alt_manager`, `flash_loan`, and `blockhash`.
+3. **Planner rewrite:** merge current `stage1_eval` + `stage2_submit` into `planner.rs`, add fast/slow path separation, remove retry queues, and enforce freshness at selection time.
+4. **Submission rewrite:** new `submission.rs` hosting signing plus dual-lane sending, eliminating `stage3_send` throttles and gates.
+5. **Runtime wiring:** update `runtime.rs` to spawn the new planner, submission worker(s), hydrators, and watchdog; remove legacy stage threads and rings.
+6. **Doc/tests/config:** update configs, scripts, README, and integration tests to exercise the new limits and SLA alerts.
+
+## Operational Guardrails
+
+- **Auto-halt on SLA breach:** Watchdog flips the `trading_enabled` atomic when any metric exceeds its budget. Manual override requires an operator flag.
+- **Instrument everything:** Each drop path records `drop_reason` (stale_trade, stale_template, stale_blockhash, watchdog_pause, etc.). Sustained drops indicate systemic freshness problems.
+- **Rehearsal plan:** Provide feature flags to run the new fast path in shadow mode, mirroring trades but not sending bundles until confidence is built.
+
+## Future Extensions
+
+- Add automated lane scoring (Jito vs TPU latency comparisons) to route hot bundles toward the fastest path dynamically.
+- Explore co-locating the planner on the same machine as the validator to reduce network hop count.
+- Integrate hardware timestamping (SO_TIMESTAMPING) for even tighter freshness accounting once supported by the RPC stack.
+
 # Ultra-Light Flat Executor Architecture
 
 ## Goals & Constraints

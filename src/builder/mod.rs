@@ -1,14 +1,15 @@
-mod alt_manager;
 mod blockhash;
 mod bundle_builder;
-mod flash_loan;
 mod mev_guard;
-mod template_cache;
 mod template_loader;
 pub mod templates;
 mod tx_graph;
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Result};
 
@@ -22,39 +23,28 @@ use solana_sdk::signature::{read_keypair_file, Keypair, Signer};
 use solana_sdk::transaction::VersionedTransaction;
 use tracing::warn;
 
-pub use alt_manager::{AltManager, AltManagerStats};
-pub use bundle_builder::{BundleBuildContext, BundleInstructionPlan, BundleLookupTablePlan};
-pub use flash_loan::{
+pub use crate::hydration::alt_manager::{AltManager, AltManagerStats};
+pub use crate::hydration::flash_loan::{
     compute_flash_loan_fee, FlashLoanPlanner, FlashLoanRoutePlan, FLASH_LOAN_BPS_DENOMINATOR,
     SOLEND_FLASH_LOAN_FEE_BPS,
 };
-pub use mev_guard::MevGuard;
-pub use template_cache::{
+pub use crate::hydration::template_cache::{
     AltHandleId, AmmV3Field, AmmV3FieldLayout, AmmV3PoolAccounts, AmmV3TemplateParams, CpAmmField,
     CpAmmFieldLayout, CpAmmTemplateParams, InstructionTemplate, LbClmmField, LbClmmFieldLayout,
     LbClmmTemplateParams, LifinityField, LifinityFieldLayout, LifinityTemplateParams,
     TemplateCache, TemplateCacheKey, TemplateCacheStats, TemplateFieldKind, TemplateMetadata,
     TemplatePatch, TemplateSlice, WhirlpoolField, WhirlpoolFieldLayout, WhirlpoolTemplateParams,
 };
+pub use crate::hydration::TemplateReadiness;
+pub use bundle_builder::{BundleBuildContext, BundleInstructionPlan, BundleLookupTablePlan};
+pub use mev_guard::MevGuard;
 pub use tx_graph::TxGraph;
 
 #[derive(Clone)]
 pub struct BuilderHandle(Arc<BuilderContext>);
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TemplateReadiness {
-    pub template_ready: bool,
-    pub alt_ready: bool,
-}
-
-impl TemplateReadiness {
-    pub const fn missing() -> Self {
-        Self {
-            template_ready: false,
-            alt_ready: false,
-        }
-    }
-}
+const TEMPLATE_FRESHNESS_TTL: Duration = Duration::from_millis(40);
+const ALT_FRESHNESS_TTL: Duration = Duration::from_millis(40);
 
 impl BuilderHandle {
     pub fn new(config: Arc<AppConfig>) -> Result<Self> {
@@ -85,6 +75,14 @@ impl BuilderHandle {
         &self.0.mev_guard
     }
 
+    pub fn token_account_for_mint(&self, mint: &Pubkey) -> Option<Pubkey> {
+        self.0.token_atas.get(mint).copied()
+    }
+
+    pub fn host_fee_account_for_mint(&self, mint: &Pubkey) -> Option<Pubkey> {
+        self.0.host_fee_accounts.get(mint).copied()
+    }
+
     pub fn recent_blockhash(&self) -> Result<Hash> {
         self.0.blockhash_cache.latest()
     }
@@ -109,6 +107,7 @@ impl BuilderHandle {
             seq,
             self.0.payer_pubkey,
             &self.0.template_cache,
+            &self.0.token_atas,
             blockhash,
             prefix_instructions,
             legs,
@@ -120,7 +119,12 @@ impl BuilderHandle {
         &self,
         plan: &bundle_builder::BundleInstructionPlan,
     ) -> Result<Vec<AccountMeta>> {
-        bundle_builder::hydrate_accounts_for_plan(&self.0.template_cache, plan, self.0.payer_pubkey)
+        bundle_builder::hydrate_accounts_for_plan(
+            &self.0.template_cache,
+            plan,
+            self.0.payer_pubkey,
+            &self.0.token_atas,
+        )
     }
 
     pub fn sign_bundle(
@@ -149,14 +153,24 @@ impl BuilderHandle {
     ) -> TemplateReadiness {
         let key = TemplateCacheKey::new(*pool, direction);
         if let Some(template) = self.0.template_cache.get(&key) {
-            let alt_ready = template
-                .alt_handle
-                .map(|handle| self.0.alt_manager.table_info(handle).is_some())
-                .unwrap_or(true);
-            let template_ready = template.is_hydrated();
+            let now = Instant::now();
+            let template_deadline = template.fresh_until(TEMPLATE_FRESHNESS_TTL);
+            let template_ready = template.is_hydrated() && now <= template_deadline;
+            let (alt_ready, alt_fresh_until) = match template.alt_handle {
+                Some(handle) => match self.0.alt_manager.table_info(handle) {
+                    Some(info) => {
+                        let deadline = info.fresh_until(ALT_FRESHNESS_TTL);
+                        (now <= deadline, Some(deadline))
+                    }
+                    None => (false, None),
+                },
+                None => (true, Some(now + ALT_FRESHNESS_TTL)),
+            };
             TemplateReadiness {
                 template_ready,
                 alt_ready,
+                template_fresh_until: Some(template_deadline),
+                alt_fresh_until,
             }
         } else {
             TemplateReadiness::missing()
@@ -242,6 +256,8 @@ struct BuilderContext {
     payer_pubkey: Pubkey,
     auth: Arc<Keypair>,
     auth_pubkey: Pubkey,
+    token_atas: HashMap<Pubkey, Pubkey>,
+    host_fee_accounts: HashMap<Pubkey, Pubkey>,
 }
 
 impl BuilderContext {
@@ -275,17 +291,23 @@ impl BuilderContext {
         let payer = Arc::new(payer);
         let auth = Arc::new(auth);
 
+        let token_atas = config.token_ata_map().clone();
+        let host_fee_accounts = config.host_fee_account_map().clone();
+        let mev_guard = MevGuard::new(config.clone());
+
         Ok(Self {
             template_cache,
             alt_manager: AltManager::new(config.clone())?,
             tx_graph: TxGraph::new(),
             flash_loan: FlashLoanPlanner::new(config.clone())?,
-            mev_guard: MevGuard::new(config),
+            mev_guard,
             blockhash_cache,
             payer_pubkey: payer.pubkey(),
             payer,
             auth_pubkey: auth.pubkey(),
             auth,
+            token_atas,
+            host_fee_accounts,
         })
     }
 }

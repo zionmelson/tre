@@ -2,10 +2,12 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
+use solana_sdk::pubkey::Pubkey;
 
 use crate::token_pair::TokenPair;
 
@@ -19,6 +21,8 @@ const ENV_JITO_TIP_STREAM_URL: &str = "TRE_JITO_TIP_STREAM_URL";
 const ENV_JITO_AUCTION_STREAM_URL: &str = "TRE_JITO_AUCTION_STREAM_URL";
 const ENV_JITO_CA_PEM: &str = "TRE_JITO_CA_PEM";
 const ENV_QUICKNODE_RPCS: &str = "TRE_QUICKNODE_RPCS";
+const ENV_ENABLE_FAST_LANE: &str = "TRE_ENABLE_FAST_LANE";
+const ENV_HYDRATION_ONLY_MODE: &str = "TRE_HYDRATION_ONLY_MODE";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -26,6 +30,10 @@ pub struct AppConfig {
     pub jito: JitoConfig,
     pub corecast: CoreCastConfig,
     pub tokens: HashMap<String, String>,
+    #[serde(default)]
+    pub atas: HashMap<String, String>,
+    #[serde(default)]
+    pub host_fee_accounts: HashMap<String, String>,
     #[serde(default)]
     pub token_pairs: Vec<[String; 2]>,
     #[serde(default)]
@@ -43,8 +51,14 @@ pub struct AppConfig {
     pub alerts: AlertingConfig,
     #[serde(default)]
     pub submission: SubmissionTrackingConfig,
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
     #[serde(default, deserialize_with = "deserialize_optional_path")]
     pub bam_validator_csv: Option<PathBuf>,
+    #[serde(skip)]
+    token_atas: HashMap<Pubkey, Pubkey>,
+    #[serde(skip)]
+    host_fee_atas: HashMap<Pubkey, Pubkey>,
 }
 
 impl AppConfig {
@@ -57,9 +71,27 @@ impl AppConfig {
         config.apply_env_overrides();
         config.populate_token_pairs_from_tokens();
         config.normalize_token_pairs();
+        config.populate_token_atas()?;
+        config.populate_host_fee_accounts()?;
         config.apply_protocol_defaults();
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn token_ata_for_mint(&self, mint: &Pubkey) -> Option<Pubkey> {
+        self.token_atas.get(mint).copied()
+    }
+
+    pub fn token_ata_map(&self) -> &HashMap<Pubkey, Pubkey> {
+        &self.token_atas
+    }
+
+    pub fn host_fee_account_for_mint(&self, mint: &Pubkey) -> Option<Pubkey> {
+        self.host_fee_atas.get(mint).copied()
+    }
+
+    pub fn host_fee_account_map(&self) -> &HashMap<Pubkey, Pubkey> {
+        &self.host_fee_atas
     }
 
     pub fn token_pair_allowlist(&self) -> HashSet<TokenPair> {
@@ -90,6 +122,12 @@ impl AppConfig {
         self.protocols
             .get(protocol)
             .and_then(|entry| entry.hydration_retry_ms)
+    }
+
+    pub fn protocol_max_utilization_bps(&self, protocol: &str) -> Option<u64> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.max_utilization_bps)
     }
 
     pub fn bam_validator_csv_path(&self) -> PathBuf {
@@ -173,6 +211,88 @@ impl AppConfig {
         self.token_pairs = normalized;
     }
 
+    fn populate_token_atas(&mut self) -> Result<()> {
+        self.token_atas.clear();
+        if self.atas.is_empty() {
+            return Ok(());
+        }
+
+        let mut missing = Vec::new();
+        for (symbol, mint_str) in &self.tokens {
+            let mint = Pubkey::from_str(mint_str).with_context(|| {
+                format!("invalid mint {} configured for token {}", mint_str, symbol)
+            })?;
+            if let Some(ata_str) = self.atas.get(symbol).or_else(|| self.atas.get(mint_str)) {
+                let ata = Pubkey::from_str(ata_str).with_context(|| {
+                    format!("invalid ata {} configured for token {}", ata_str, symbol)
+                })?;
+                self.token_atas.insert(mint, ata);
+            } else {
+                missing.push(symbol.clone());
+            }
+        }
+
+        for (label, ata_str) in &self.atas {
+            if self.tokens.contains_key(label) {
+                continue;
+            }
+            if let Ok(mint) = Pubkey::from_str(label) {
+                if self.token_atas.contains_key(&mint) {
+                    continue;
+                }
+                let ata = Pubkey::from_str(ata_str).with_context(|| {
+                    format!("invalid ata {} configured for mint {}", ata_str, label)
+                })?;
+                self.token_atas.insert(mint, ata);
+            }
+        }
+
+        ensure!(
+            missing.is_empty(),
+            "atas missing entries for tokens: {}",
+            missing.join(", ")
+        );
+
+        Ok(())
+    }
+
+    fn populate_host_fee_accounts(&mut self) -> Result<()> {
+        self.host_fee_atas.clear();
+        if self.host_fee_accounts.is_empty() {
+            return Ok(());
+        }
+
+        for (label, ata_str) in &self.host_fee_accounts {
+            let mint_str = self.tokens.get(label);
+            let mint = if let Some(symbol_mint) = mint_str {
+                Pubkey::from_str(symbol_mint).with_context(|| {
+                    format!(
+                        "invalid mint {} configured for token {}",
+                        symbol_mint, label
+                    )
+                })?
+            } else {
+                Pubkey::from_str(label).with_context(|| {
+                    format!(
+                        "host_fee_accounts key {} must be a known token symbol or mint",
+                        label
+                    )
+                })?
+            };
+
+            let ata = Pubkey::from_str(ata_str).with_context(|| {
+                format!(
+                    "invalid host fee account {} configured for {}",
+                    ata_str, label
+                )
+            })?;
+
+            self.host_fee_atas.insert(mint, ata);
+        }
+
+        Ok(())
+    }
+
     fn hydrate_env_references(&mut self) -> Result<()> {
         hydrate_string(&mut self.corecast.authorization, "corecast.authorization")?;
         hydrate_string(&mut self.corecast.address, "corecast.address")?;
@@ -222,6 +342,12 @@ impl AppConfig {
         }
         if let Some(list) = env_list(ENV_QUICKNODE_RPCS) {
             self.quicknode_rpcs = list;
+        }
+        if let Some(enabled) = env_bool(ENV_ENABLE_FAST_LANE) {
+            self.pipeline.enable_fast_lane = enabled;
+        }
+        if let Some(enabled) = env_bool(ENV_HYDRATION_ONLY_MODE) {
+            self.pipeline.hydration_only_mode = enabled;
         }
     }
 }
@@ -312,6 +438,22 @@ pub struct PerfTuning {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct PipelineConfig {
+    pub enable_fast_lane: bool,
+    pub hydration_only_mode: bool,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            enable_fast_lane: true,
+            hydration_only_mode: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct SubmissionTrackingConfig {
     pub pending_ttl_secs: u64,
     pub sweep_interval_secs: u64,
@@ -328,6 +470,8 @@ pub struct ProtocolConfig {
     pub rpc_endpoints: Vec<String>,
     #[serde(default)]
     pub hydration_retry_ms: Option<u64>,
+    #[serde(default)]
+    pub max_utilization_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -452,6 +596,14 @@ fn env_list(name: &str) -> Option<Vec<String>> {
 
 fn env_path(name: &str) -> Option<PathBuf> {
     env_string(name).map(|value| expand_tilde(&value))
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env_string(name).and_then(|value| match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    })
 }
 
 fn parse_env_reference(value: &str) -> Option<String> {

@@ -12,15 +12,15 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, warn};
 
-use crate::adapters::{
-    CpAmmAdapter, CpAmmAdapterConfig, LbClmmAdapter, LbClmmAdapterConfig, LifinityAdapter,
-    LifinityAdapterConfig, ProtocolAdapter, QuoteRequest, QuoteResponse, RaydiumV3Adapter,
-    RaydiumV3AdapterConfig, SwapDirection, WhirlpoolAdapter, WhirlpoolAdapterConfig,
-};
 use crate::builder::templates::SwapTemplateDirection;
 use crate::builder::{BuilderHandle, BuilderStage, TemplateReadiness};
 use crate::config::AppConfig;
 use crate::core::{pin_current_thread, Lease, RingConsumer, RingProducer, SlabPool};
+use crate::hydration::adapters::{
+    CpAmmAdapter, CpAmmAdapterConfig, LbClmmAdapter, LbClmmAdapterConfig, LifinityAdapter,
+    LifinityAdapterConfig, ProtocolAdapter, QuoteRequest, QuoteResponse, RaydiumV3Adapter,
+    RaydiumV3AdapterConfig, SwapDirection, WhirlpoolAdapter, WhirlpoolAdapterConfig,
+};
 use crate::notifier::Notifier;
 use crate::strategy::StrategyEngine;
 use crate::telemetry::{self, Stage1BackpressureEvent, Stage1FeedGapEvent, Stage1PoolDrainEvent};
@@ -28,7 +28,10 @@ use crate::telemetry::{self, Stage1BackpressureEvent, Stage1FeedGapEvent, Stage1
 use super::graph_manager::{ArbitrageOpportunity, GraphManager, PathLeg, PoolPath};
 use super::types::{
     compute_edge_bps, BundleCandidate, Opportunity, PoolBidirectionalQuotes, PoolQuoteDirection,
-    PoolSnapshot, PoolUpdate, RouteLegPlan, RoutePlan, TradeUpdate,
+    PoolSnapshot, PoolUpdate, RouteLegPlan, RoutePlan, TradeUpdate, CP_AMM_INPUT_UTILIZATION_BPS,
+    CP_AMM_PROGRAM_ID, LB_CLMM_INPUT_UTILIZATION_BPS, LB_CLMM_PROGRAM_ID,
+    LIFINITY_V2_INPUT_UTILIZATION_BPS, LIFINITY_V2_PROGRAM_ID, RAYDIUM_V3_INPUT_UTILIZATION_BPS,
+    RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_INPUT_UTILIZATION_BPS, WHIRLPOOL_PROGRAM_ID,
 };
 
 const MAX_MULTI_LEG_PATHS: usize = 4;
@@ -42,6 +45,9 @@ const RESERVE_HYDRATE_INTERVAL_SECS: u64 = 15;
 const READINESS_RETRY_DELAY_MS: u64 = 50;
 const MAX_PENDING_READINESS_TRADES: usize = 512;
 const MAX_READINESS_RETRIES: u32 = 24;
+const LIQUIDITY_SAFETY_BPS: u64 = 50; // keep 0.5% buffer in each pool
+const BPS_DENOMINATOR: u64 = 10_000;
+const MAX_ROUTE_RESIZE_ATTEMPTS: usize = 5;
 
 struct PathSearchProfile {
     total_duration: Duration,
@@ -998,51 +1004,112 @@ fn build_route_plan(
         return None;
     }
 
-    let mut legs = Vec::with_capacity(path.len());
-    let mut running_amount = initial_input_amount;
+    let mut attempt = 0;
+    let mut start_amount = initial_input_amount;
 
-    for leg in &path.legs {
-        let snapshot = snapshots.get(&leg.pool_id)?;
-        let direction = quote_direction_for_leg(snapshot, leg)?;
-        let quote = snapshot.quote(direction)?.clone();
-        let input_amount = running_amount;
-        let estimated_output_amount = estimate_output_amount(input_amount, quote.price());
-        let min_output_amount = quote
-            .min_output_amount
-            .and_then(|min_out| scale_quote_amount(min_out, quote.notional, input_amount));
-        let limit_price = quote.limit_price;
-        let price_impact_limit_bps = quote.price_impact_limit_bps;
-        running_amount = estimated_output_amount;
+    while attempt < MAX_ROUTE_RESIZE_ATTEMPTS && start_amount > 0 {
+        attempt += 1;
+        let mut legs = Vec::with_capacity(path.len());
+        let mut running_amount = start_amount;
+        let mut needs_resize: Option<u64> = None;
 
-        legs.push(RouteLegPlan {
-            pool_id: leg.pool_id.clone(),
-            program_id: leg.program_id.clone(),
-            input_mint: leg.input_mint.clone(),
-            output_mint: leg.output_mint.clone(),
-            input_amount,
-            estimated_output_amount,
-            effective_price: quote.price(),
-            fee_bps: quote.fee_bps,
-            estimated_slippage_bps: quote.slippage_bps(),
-            template_fee_bps: quote.template_fee_bps,
-            direction,
-            sqrt_price_limit: quote.sqrt_price_limit,
-            min_output_amount,
-            limit_price,
-            price_impact_limit_bps,
-            context: quote.context.clone(),
-            template_ready: false,
-            alt_ready: false,
+        for leg in &path.legs {
+            let snapshot = match snapshots.get(&leg.pool_id) {
+                Some(snapshot) => snapshot,
+                None => return None,
+            };
+            let direction = match quote_direction_for_leg(snapshot, leg) {
+                Some(direction) => direction,
+                None => return None,
+            };
+            if let Some(capacity) = pool_input_capacity(snapshot, direction) {
+                if capacity == 0 {
+                    return None;
+                }
+                if running_amount > capacity {
+                    needs_resize =
+                        scale_initial_input_for_capacity(start_amount, running_amount, capacity);
+                    break;
+                }
+            }
+
+            let quote = match snapshot.quote(direction) {
+                Some(quote) => quote.clone(),
+                None => return None,
+            };
+            let input_amount = running_amount;
+            let estimated_output_amount = estimate_output_amount(input_amount, quote.price());
+            let min_output_amount = quote
+                .min_output_amount
+                .and_then(|min_out| scale_quote_amount(min_out, quote.notional, input_amount));
+            let limit_price = quote.limit_price;
+            let price_impact_limit_bps = quote.price_impact_limit_bps;
+
+            if let Some(output_capacity) = pool_output_capacity(snapshot, direction) {
+                if output_capacity == 0 {
+                    return None;
+                }
+                if estimated_output_amount > output_capacity {
+                    needs_resize = scale_initial_input_for_capacity(
+                        start_amount,
+                        estimated_output_amount,
+                        output_capacity,
+                    );
+                    break;
+                }
+            }
+
+            running_amount = estimated_output_amount;
+
+            legs.push(RouteLegPlan {
+                pool_id: leg.pool_id.clone(),
+                program_id: leg.program_id.clone(),
+                input_mint: leg.input_mint.clone(),
+                output_mint: leg.output_mint.clone(),
+                input_amount,
+                estimated_output_amount,
+                effective_price: quote.price(),
+                fee_bps: quote.fee_bps,
+                estimated_slippage_bps: quote.slippage_bps(),
+                template_fee_bps: quote.template_fee_bps,
+                direction,
+                sqrt_price_limit: quote.sqrt_price_limit,
+                min_output_amount,
+                limit_price,
+                price_impact_limit_bps,
+                context: quote.context.clone(),
+                template_ready: false,
+                alt_ready: false,
+            });
+        }
+
+        if let Some(resized) = needs_resize {
+            let adjusted = if resized >= start_amount {
+                start_amount.saturating_sub(1)
+            } else {
+                resized
+            };
+            if adjusted == 0 {
+                return None;
+            }
+            start_amount = adjusted;
+            continue;
+        }
+
+        if legs.len() != path.len() {
+            return None;
+        }
+
+        return Some(RoutePlan {
+            start_mint: path.start_mint.clone(),
+            end_mint: path.end_mint.clone(),
+            legs,
+            estimated_final_output_amount: Some(running_amount),
+            flash_loan_permitted: false,
         });
     }
 
-    Some(RoutePlan {
-        start_mint: path.start_mint.clone(),
-        end_mint: path.end_mint.clone(),
-        legs,
-        estimated_final_output_amount: Some(running_amount),
-        flash_loan_permitted: false,
-    })
+    None
 }
 
 fn candidate_paths_for_trade(
@@ -1120,6 +1187,90 @@ fn quote_direction_for_leg(snapshot: &PoolSnapshot, leg: &PathLeg) -> Option<Poo
     }
 }
 
+fn normalized_capacity(raw: u128) -> Option<u64> {
+    if raw == 0 {
+        return None;
+    }
+    let capped = raw.min(u64::MAX as u128) as u64;
+    let buffer = ((capped as u128)
+        .saturating_mul(LIQUIDITY_SAFETY_BPS as u128)
+        .checked_div(BPS_DENOMINATOR as u128)
+        .unwrap_or(0)) as u64;
+    if capped <= 1 {
+        return Some(0);
+    }
+    let buffer = buffer.max(1);
+    Some(capped.saturating_sub(buffer))
+}
+
+fn pool_input_capacity(snapshot: &PoolSnapshot, direction: PoolQuoteDirection) -> Option<u64> {
+    let mut raw = match direction {
+        PoolQuoteDirection::BaseToQuote => snapshot.base_post_amount,
+        PoolQuoteDirection::QuoteToBase => snapshot.quote_post_amount,
+    };
+    raw = apply_program_specific_input_clamps(&snapshot.program_id, raw);
+    normalized_capacity(raw)
+}
+
+fn pool_output_capacity(snapshot: &PoolSnapshot, direction: PoolQuoteDirection) -> Option<u64> {
+    let program = snapshot.program_id.as_str();
+    if program != CP_AMM_PROGRAM_ID
+        && program != LB_CLMM_PROGRAM_ID
+        && program != LIFINITY_V2_PROGRAM_ID
+        && program != WHIRLPOOL_PROGRAM_ID
+    {
+        return None;
+    }
+    let raw = match direction {
+        PoolQuoteDirection::BaseToQuote => snapshot.quote_post_amount,
+        PoolQuoteDirection::QuoteToBase => snapshot.base_post_amount,
+    };
+    normalized_capacity(raw)
+}
+
+fn apply_program_specific_input_clamps(program_id: &str, raw: u128) -> u128 {
+    match program_id {
+        RAYDIUM_V3_PROGRAM_ID => clamp_raw_input(raw, RAYDIUM_V3_INPUT_UTILIZATION_BPS),
+        CP_AMM_PROGRAM_ID => clamp_raw_input(raw, CP_AMM_INPUT_UTILIZATION_BPS),
+        LB_CLMM_PROGRAM_ID => clamp_raw_input(raw, LB_CLMM_INPUT_UTILIZATION_BPS),
+        LIFINITY_V2_PROGRAM_ID => clamp_raw_input(raw, LIFINITY_V2_INPUT_UTILIZATION_BPS),
+        WHIRLPOOL_PROGRAM_ID => clamp_raw_input(raw, WHIRLPOOL_INPUT_UTILIZATION_BPS),
+        _ => raw,
+    }
+}
+
+fn clamp_raw_input(raw: u128, utilization_bps: u64) -> u128 {
+    if utilization_bps >= BPS_DENOMINATOR {
+        return raw;
+    }
+    raw.saturating_mul(utilization_bps as u128)
+        .checked_div(BPS_DENOMINATOR as u128)
+        .unwrap_or(0)
+        .max(1)
+}
+
+fn scale_initial_input_for_capacity(
+    initial_input: u64,
+    offending_leg_input: u64,
+    capacity: u64,
+) -> Option<u64> {
+    if offending_leg_input == 0 || capacity == 0 {
+        return None;
+    }
+    if capacity >= offending_leg_input {
+        return Some(initial_input);
+    }
+    let scaled = (initial_input as u128)
+        .saturating_mul(capacity as u128)
+        .checked_div(offending_leg_input as u128)?;
+    let clipped = scaled.min(initial_input as u128).min(u64::MAX as u128) as u64;
+    if clipped == 0 {
+        None
+    } else {
+        Some(clipped)
+    }
+}
+
 fn estimate_output_amount(input: u64, price: f64) -> u64 {
     if price <= 0.0 {
         return 0;
@@ -1182,8 +1333,8 @@ mod tests {
             slot: 0,
             base_mint: base.into(),
             quote_mint: quote.into(),
-            base_post_amount: 1,
-            quote_post_amount: 1,
+            base_post_amount: 1_000_000,
+            quote_post_amount: 1_000_000,
             updated_at: Instant::now(),
             quotes: Some(PoolBidirectionalQuotes {
                 base_to_quote: quote_side(base, quote, base_price),
@@ -1231,6 +1382,209 @@ mod tests {
         assert_eq!(plan.legs[1].input_amount, 200);
         assert_eq!(plan.legs[1].estimated_output_amount, 100);
         assert_eq!(plan.estimated_final_output_amount, Some(100));
+    }
+
+    #[test]
+    fn clamps_route_input_to_pool_capacity() {
+        let mut snapshots = HashMap::new();
+        let mut pool_ab = snapshot_with_quotes("pool-ab", "A", "B", 1.0, 1.0);
+        pool_ab.base_post_amount = 2_000;
+        pool_ab.quote_post_amount = 2_000;
+        snapshots.insert("pool-ab".into(), pool_ab);
+
+        let mut pool_ba = snapshot_with_quotes("pool-ba", "B", "A", 1.0, 1.0);
+        pool_ba.base_post_amount = 1_500;
+        pool_ba.quote_post_amount = 1_500;
+        snapshots.insert("pool-ba".into(), pool_ba);
+
+        let path = PoolPath {
+            start_mint: "A".into(),
+            end_mint: "A".into(),
+            legs: vec![
+                PathLeg {
+                    pool_id: "pool-ab".into(),
+                    program_id: "prog".into(),
+                    input_mint: "A".into(),
+                    output_mint: "B".into(),
+                },
+                PathLeg {
+                    pool_id: "pool-ba".into(),
+                    program_id: "prog".into(),
+                    input_mint: "B".into(),
+                    output_mint: "A".into(),
+                },
+            ],
+        };
+
+        let plan = build_route_plan(&path, &snapshots, 5_000).expect("route plan");
+        assert_eq!(plan.legs.len(), 2);
+        assert!(plan.legs[0].input_amount <= 1_493);
+        assert!(plan.legs[0].input_amount > 0);
+        assert_eq!(
+            plan.legs[1].input_amount,
+            plan.legs[0].estimated_output_amount
+        );
+        assert!(plan.legs[1].input_amount <= 1_493);
+    }
+
+    #[test]
+    fn clamps_cp_amm_route_to_output_liquidity() {
+        let mut snapshots = HashMap::new();
+        let mut pool_ab = snapshot_with_quotes("pool-ab", "A", "B", 1.0, 1.0);
+        pool_ab.program_id = CP_AMM_PROGRAM_ID.to_string();
+        pool_ab.base_post_amount = 10_000;
+        pool_ab.quote_post_amount = 1_200;
+        snapshots.insert("pool-ab".into(), pool_ab);
+
+        let mut pool_ba = snapshot_with_quotes("pool-ba", "B", "A", 1.0, 1.0);
+        pool_ba.program_id = CP_AMM_PROGRAM_ID.to_string();
+        pool_ba.base_post_amount = 10_000;
+        pool_ba.quote_post_amount = 10_000;
+        snapshots.insert("pool-ba".into(), pool_ba);
+
+        let path = PoolPath {
+            start_mint: "A".into(),
+            end_mint: "A".into(),
+            legs: vec![
+                PathLeg {
+                    pool_id: "pool-ab".into(),
+                    program_id: CP_AMM_PROGRAM_ID.to_string(),
+                    input_mint: "A".into(),
+                    output_mint: "B".into(),
+                },
+                PathLeg {
+                    pool_id: "pool-ba".into(),
+                    program_id: CP_AMM_PROGRAM_ID.to_string(),
+                    input_mint: "B".into(),
+                    output_mint: "A".into(),
+                },
+            ],
+        };
+
+        let plan = build_route_plan(&path, &snapshots, 5_000).expect("route plan");
+        assert_eq!(plan.legs.len(), 2);
+        assert_eq!(plan.legs[0].input_amount, 1_194);
+        assert_eq!(plan.legs[0].estimated_output_amount, 1_194);
+        assert!(plan.legs[0].estimated_output_amount <= 1_194);
+    }
+
+    #[test]
+    fn clamps_lb_clmm_route_to_output_liquidity() {
+        let mut snapshots = HashMap::new();
+        let mut pool_ab = snapshot_with_quotes("pool-ab", "A", "B", 1.0, 1.0);
+        pool_ab.program_id = LB_CLMM_PROGRAM_ID.to_string();
+        pool_ab.base_post_amount = 5_000_000;
+        pool_ab.quote_post_amount = 2_000;
+        snapshots.insert("pool-ab".into(), pool_ab);
+
+        let mut pool_ba = snapshot_with_quotes("pool-ba", "B", "A", 1.0, 1.0);
+        pool_ba.program_id = LB_CLMM_PROGRAM_ID.to_string();
+        pool_ba.base_post_amount = 5_000_000;
+        pool_ba.quote_post_amount = 5_000_000;
+        snapshots.insert("pool-ba".into(), pool_ba);
+
+        let path = PoolPath {
+            start_mint: "A".into(),
+            end_mint: "A".into(),
+            legs: vec![
+                PathLeg {
+                    pool_id: "pool-ab".into(),
+                    program_id: LB_CLMM_PROGRAM_ID.to_string(),
+                    input_mint: "A".into(),
+                    output_mint: "B".into(),
+                },
+                PathLeg {
+                    pool_id: "pool-ba".into(),
+                    program_id: LB_CLMM_PROGRAM_ID.to_string(),
+                    input_mint: "B".into(),
+                    output_mint: "A".into(),
+                },
+            ],
+        };
+
+        let plan = build_route_plan(&path, &snapshots, 5_000).expect("route plan");
+        assert_eq!(plan.legs.len(), 2);
+        assert!(plan.legs[0].input_amount <= 1_994);
+        assert!(plan.legs[0].estimated_output_amount <= 1_994);
+        assert!(plan.legs[0].input_amount > 0);
+    }
+
+    #[test]
+    fn clamps_lifinity_route_to_output_liquidity() {
+        let mut snapshots = HashMap::new();
+        let mut pool_ab = snapshot_with_quotes("pool-ab", "A", "B", 1.0, 1.0);
+        pool_ab.program_id = LIFINITY_V2_PROGRAM_ID.to_string();
+        pool_ab.base_post_amount = 8_000_000;
+        pool_ab.quote_post_amount = 1_000;
+        snapshots.insert("pool-ab".into(), pool_ab);
+
+        let mut pool_ba = snapshot_with_quotes("pool-ba", "B", "A", 1.0, 1.0);
+        pool_ba.program_id = LIFINITY_V2_PROGRAM_ID.to_string();
+        pool_ba.base_post_amount = 8_000_000;
+        pool_ba.quote_post_amount = 8_000_000;
+        snapshots.insert("pool-ba".into(), pool_ba);
+
+        let path = PoolPath {
+            start_mint: "A".into(),
+            end_mint: "A".into(),
+            legs: vec![
+                PathLeg {
+                    pool_id: "pool-ab".into(),
+                    program_id: LIFINITY_V2_PROGRAM_ID.to_string(),
+                    input_mint: "A".into(),
+                    output_mint: "B".into(),
+                },
+                PathLeg {
+                    pool_id: "pool-ba".into(),
+                    program_id: LIFINITY_V2_PROGRAM_ID.to_string(),
+                    input_mint: "B".into(),
+                    output_mint: "A".into(),
+                },
+            ],
+        };
+
+        let plan = build_route_plan(&path, &snapshots, 5_000).expect("route plan");
+        assert!(plan.legs[0].estimated_output_amount <= 995);
+        assert!(plan.legs[0].input_amount > 0);
+    }
+
+    #[test]
+    fn clamps_whirlpool_route_to_output_liquidity() {
+        let mut snapshots = HashMap::new();
+        let mut pool_ab = snapshot_with_quotes("pool-ab", "A", "B", 1.0, 1.0);
+        pool_ab.program_id = WHIRLPOOL_PROGRAM_ID.to_string();
+        pool_ab.base_post_amount = 6_000_000;
+        pool_ab.quote_post_amount = 2_500;
+        snapshots.insert("pool-ab".into(), pool_ab);
+
+        let mut pool_ba = snapshot_with_quotes("pool-ba", "B", "A", 1.0, 1.0);
+        pool_ba.program_id = WHIRLPOOL_PROGRAM_ID.to_string();
+        pool_ba.base_post_amount = 6_000_000;
+        pool_ba.quote_post_amount = 6_000_000;
+        snapshots.insert("pool-ba".into(), pool_ba);
+
+        let path = PoolPath {
+            start_mint: "A".into(),
+            end_mint: "A".into(),
+            legs: vec![
+                PathLeg {
+                    pool_id: "pool-ab".into(),
+                    program_id: WHIRLPOOL_PROGRAM_ID.to_string(),
+                    input_mint: "A".into(),
+                    output_mint: "B".into(),
+                },
+                PathLeg {
+                    pool_id: "pool-ba".into(),
+                    program_id: WHIRLPOOL_PROGRAM_ID.to_string(),
+                    input_mint: "B".into(),
+                    output_mint: "A".into(),
+                },
+            ],
+        };
+
+        let plan = build_route_plan(&path, &snapshots, 5_000).expect("route plan");
+        assert!(plan.legs[0].estimated_output_amount <= 2_494);
+        assert!(plan.legs[0].input_amount > 0);
     }
 }
 
@@ -1337,6 +1691,9 @@ fn cp_amm_config(config: &AppConfig) -> CpAmmAdapterConfig {
     if let Some(retry_ms) = config.protocol_hydration_retry_ms("cp_amm") {
         adapter_config.hydration_retry_ms = retry_ms.max(1);
     }
+    if let Some(util_bps) = config.protocol_max_utilization_bps("cp_amm") {
+        adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
+    }
     adapter_config
 }
 
@@ -1347,6 +1704,9 @@ fn lb_clmm_config(config: &AppConfig) -> LbClmmAdapterConfig {
     };
     if let Some(retry_ms) = config.protocol_hydration_retry_ms("lb_clmm") {
         adapter_config.hydration_retry_ms = retry_ms.max(1);
+    }
+    if let Some(util_bps) = config.protocol_max_utilization_bps("lb_clmm") {
+        adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
     }
     adapter_config
 }
@@ -1359,6 +1719,9 @@ fn lifinity_config(config: &AppConfig) -> LifinityAdapterConfig {
     if let Some(retry_ms) = config.protocol_hydration_retry_ms("lifinity_v2") {
         adapter_config.hydration_retry_ms = retry_ms.max(1);
     }
+    if let Some(util_bps) = config.protocol_max_utilization_bps("lifinity_v2") {
+        adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
+    }
     adapter_config
 }
 
@@ -1369,6 +1732,9 @@ fn whirlpool_config(config: &AppConfig) -> WhirlpoolAdapterConfig {
     };
     if let Some(retry_ms) = config.protocol_hydration_retry_ms("whirlpool") {
         adapter_config.hydration_retry_ms = retry_ms.max(1);
+    }
+    if let Some(util_bps) = config.protocol_max_utilization_bps("whirlpool") {
+        adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
     }
     adapter_config
 }

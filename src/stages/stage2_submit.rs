@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -26,7 +26,7 @@ use crate::telemetry::{self, Stage2PlanEvent};
 
 use super::types::{
     BundleCandidate, FlashLoanSummary, PlannedInstruction, PlannedLookupTable, PoolQuoteDirection,
-    RouteLegPlan, RoutePlan,
+    RouteLegPlan, RoutePlan, LB_CLMM_PROGRAM_ID,
 };
 
 pub fn spawn_submit_stage(
@@ -56,7 +56,6 @@ fn run(
     let planner = InstructionPlanner::new(Some(&builder));
     let mut last_alt_stats = Instant::now() - Duration::from_secs(30);
     let mev_revision = builder.mev_guard().current_revision();
-    let mut retry_queue: VecDeque<Lease<BundleCandidate>> = VecDeque::new();
     info!(mev_revision, "stage2 submit online");
     while !stop.load(Ordering::Relaxed) {
         builder.heartbeat(BuilderStage::SubmitHotPath);
@@ -64,15 +63,8 @@ fn run(
             log_alt_manager_status(&builder);
             last_alt_stats = Instant::now();
         }
-        if let Some((bundle, source)) = pop_work_item(&consumer, &mut retry_queue) {
-            process_bundle(
-                bundle,
-                source,
-                &planner,
-                &builder,
-                &producer,
-                &mut retry_queue,
-            );
+        if let Some(bundle) = consumer.pop() {
+            process_bundle(bundle, &planner, &builder, &producer);
         } else {
             thread::yield_now();
             thread::sleep(Duration::from_millis(10));
@@ -82,56 +74,30 @@ fn run(
     Ok(())
 }
 
-const MAX_STAGE2_ATTEMPTS: u8 = 3;
-const STAGE2_RETRY_QUEUE_CAPACITY: usize = 128;
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum BundleSource {
-    Fresh,
-    Retry,
-}
-
-fn pop_work_item(
-    consumer: &RingConsumer<Lease<BundleCandidate>>,
-    retry_queue: &mut VecDeque<Lease<BundleCandidate>>,
-) -> Option<(Lease<BundleCandidate>, BundleSource)> {
-    if let Some(bundle) = retry_queue.pop_front() {
-        Some((bundle, BundleSource::Retry))
-    } else {
-        consumer.pop().map(|bundle| (bundle, BundleSource::Fresh))
-    }
-}
-
 fn process_bundle(
     mut bundle: Lease<BundleCandidate>,
-    source: BundleSource,
     planner: &InstructionPlanner,
     builder: &BuilderHandle,
     producer: &RingProducer<Lease<BundleCandidate>>,
-    retry_queue: &mut VecDeque<Lease<BundleCandidate>>,
 ) {
     match prepare_bundle(&mut bundle, planner, builder) {
         Ok(()) => {
-            if matches!(source, BundleSource::Retry) {
-                telemetry::record_stage2_plan_event(Stage2PlanEvent::RetryFlushed);
-            }
             if bundle.bundle_context.is_some() {
                 if producer.push(bundle).is_err() {
-                    warn!("stage3 queue rejected bundle candidate");
+                    warn!("submission queue rejected bundle candidate");
                 }
             } else {
                 warn!(
                     seq = bundle.seq,
                     "bundle missing context after planning; dropping"
                 );
-                drop(bundle);
             }
         }
         Err(Stage2Failure::Plan(err)) => {
-            handle_stage2_failure(bundle, err, FailureKind::Plan, retry_queue);
+            handle_stage2_failure(bundle, err, FailureKind::Plan, builder);
         }
         Err(Stage2Failure::Prepare(err)) => {
-            handle_stage2_failure(bundle, err, FailureKind::Prepare, retry_queue);
+            handle_stage2_failure(bundle, err, FailureKind::Prepare, builder);
         }
     }
 }
@@ -140,30 +106,17 @@ fn handle_stage2_failure(
     mut bundle: Lease<BundleCandidate>,
     err: anyhow::Error,
     kind: FailureKind,
-    retry_queue: &mut VecDeque<Lease<BundleCandidate>>,
+    builder: &BuilderHandle,
 ) {
     let attempt = bundle.stage2_attempts.saturating_add(1);
     bundle.stage2_attempts = attempt;
     warn!(seq = bundle.seq, attempt, error = %err, ?kind, "stage2 planning failure");
-    let (failure_event, retry_event, exhausted_event) = match kind {
-        FailureKind::Plan => (
-            Stage2PlanEvent::PlanFailed,
-            Stage2PlanEvent::RetryQueuedPlan,
-            Stage2PlanEvent::RetriesExhaustedPlan,
-        ),
-        FailureKind::Prepare => (
-            Stage2PlanEvent::PrepareFailed,
-            Stage2PlanEvent::RetryQueuedPrepare,
-            Stage2PlanEvent::RetriesExhaustedPrepare,
-        ),
-    };
-    telemetry::record_stage2_plan_event(failure_event);
-    if attempt < MAX_STAGE2_ATTEMPTS && retry_queue.len() < STAGE2_RETRY_QUEUE_CAPACITY {
-        telemetry::record_stage2_plan_event(retry_event);
-        retry_queue.push_back(bundle);
-    } else {
-        telemetry::record_stage2_plan_event(exhausted_event);
-        drop(bundle);
+    match kind {
+        FailureKind::Plan => telemetry::record_stage2_plan_event(Stage2PlanEvent::PlanFailed),
+        FailureKind::Prepare => telemetry::record_stage2_plan_event(Stage2PlanEvent::PrepareFailed),
+    }
+    if let Some(plan) = bundle.flash_loan_reservation.take() {
+        builder.flash_loan_planner().release_route(&plan);
     }
 }
 
@@ -223,12 +176,14 @@ fn build_tip_instruction(bundle: &BundleCandidate, payer: Pubkey) -> Option<Inst
 }
 
 fn compute_budget_instruction_count(swaps: &[PlannedInstruction]) -> usize {
-    swaps
+    let needs_limit = swaps
         .iter()
-        .filter_map(|ix| ix.context.compute_unit_limit)
-        .max()
-        .map(|_| 1)
-        .unwrap_or(0)
+        .any(|ix| ix.context.compute_unit_limit.is_some());
+    let needs_price = swaps
+        .iter()
+        .any(|ix| ix.context.compute_unit_price.is_some());
+
+    needs_limit as usize + needs_price as usize
 }
 
 #[derive(Debug)]
@@ -426,19 +381,10 @@ struct TipFundingPlan {
     close_account: Instruction,
 }
 
-const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvR93dthLvYbAphit9L8ZsfsZp7r4HQJDebg");
 const SPL_TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const WSOL_MINT_PUBKEY: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
 const TIP_BUFFER_SEED_PREFIX: &str = "tipbuf";
 const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
-
-fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[owner.as_ref(), SPL_TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
-        &ASSOCIATED_TOKEN_PROGRAM_ID,
-    )
-    .0
-}
 
 struct InstructionPlanner<'a> {
     builder: Option<&'a BuilderHandle>,
@@ -479,6 +425,7 @@ impl<'a> InstructionPlanner<'a> {
             });
         }
 
+        self.ensure_no_duplicate_heavy_legs(&instructions)?;
         self.warn_missing_lookup_tables(&instructions);
 
         let mut planned = PlannedRouteInstructions::with_swaps(instructions);
@@ -514,6 +461,19 @@ impl<'a> InstructionPlanner<'a> {
         }
 
         Ok(planned)
+    }
+
+    fn ensure_no_duplicate_heavy_legs(&self, instructions: &[PlannedInstruction]) -> Result<()> {
+        let mut lb_pools = HashSet::new();
+        for ix in instructions {
+            if ix.program_id == LB_CLMM_PROGRAM_ID && !lb_pools.insert(ix.pool_id.clone()) {
+                bail!(
+                    "route contains duplicate lb_clmm leg for pool {}",
+                    ix.pool_id
+                );
+            }
+        }
+        Ok(())
     }
 
     fn ensure_leg_ready(&self, leg: &RouteLegPlan) -> Result<()> {
@@ -605,7 +565,12 @@ impl<'a> InstructionPlanner<'a> {
                 first_swap.program_id
             )
         })?;
-        let destination = derive_associated_token_address(&payer, &start_mint);
+        let destination = builder.token_account_for_mint(&start_mint).ok_or_else(|| {
+            anyhow!(
+                "flash-loan mint {} missing configured token ATA",
+                route.start_mint
+            )
+        })?;
         let route_plan = flash_planner.plan_route_by_mint(&start_mint, borrow_amount)?;
         ensure!(
             route_plan.allows_receiver_program(&receiver_program),
@@ -837,6 +802,7 @@ mod tests {
             write_keypair_file(&auth, &auth_path).expect("write auth");
 
             let quote_mint = Pubkey::new_unique();
+            let wsol_ata = Pubkey::new_unique();
             let config_path = temp_dir.path().join("config.json");
             let config_json = json!({
                 "wallets": {
@@ -854,6 +820,9 @@ mod tests {
                     "cache": {"warm_capacity": 1, "channel_capacity": 1}
                 },
                 "tokens": {},
+                "atas": {
+                    (WSOL_MINT_PUBKEY.to_string()): wsol_ata.to_string()
+                },
                 "token_pairs": [[WSOL_MINT_PUBKEY.to_string(), quote_mint.to_string()]],
                 "program_addresses": [],
                 "flash_loans": {
@@ -983,6 +952,7 @@ mod tests {
             template_hash: [0; 32],
             alt_handle: None,
             metadata: TemplateMetadata::None,
+            hydrated_at: Instant::now(),
         };
         builder.template_cache().insert(template);
 
@@ -1073,47 +1043,28 @@ mod tests {
     }
 
     #[test]
-    fn requeues_until_attempt_limit() {
-        let pool = SlabPool::new(4);
-        let mut retry_queue = VecDeque::new();
-        let bundle = pool
-            .try_acquire(sample_candidate(1))
+    fn stage2_failure_releases_flash_loan_plan() {
+        let fixture = BuilderTestFixture::with_flash_loan_receiver(Pubkey::new_unique());
+        let builder = fixture.builder();
+        let planner = builder.flash_loan_planner();
+        let borrow_amount = 500_000;
+        let route_plan = planner
+            .plan_route_by_mint(&WSOL_MINT_PUBKEY, borrow_amount)
+            .expect("route plan");
+        let outstanding_after_plan = planner.outstanding_borrow_lamports();
+
+        let pool = SlabPool::new(1);
+        let mut bundle = pool
+            .try_acquire(sample_candidate(42))
             .expect("lease available");
+        bundle.flash_loan_reservation = Some(route_plan);
 
-        handle_stage2_failure(bundle, anyhow!("boom"), FailureKind::Plan, &mut retry_queue);
-        assert_eq!(retry_queue.len(), 1, "first failure enqueues bundle");
+        handle_stage2_failure(bundle, anyhow!("boom"), FailureKind::Plan, &builder);
 
-        let bundle = retry_queue.pop_front().expect("bundle queued");
-        assert_eq!(bundle.stage2_attempts, 1);
-        handle_stage2_failure(bundle, anyhow!("boom"), FailureKind::Plan, &mut retry_queue);
-        assert_eq!(retry_queue.len(), 1, "second failure still enqueues");
-
-        let bundle = retry_queue.pop_front().expect("bundle queued twice");
-        assert_eq!(bundle.stage2_attempts, 2);
-        handle_stage2_failure(bundle, anyhow!("boom"), FailureKind::Plan, &mut retry_queue);
-        assert!(retry_queue.is_empty(), "third failure exhausts retries");
-    }
-
-    #[test]
-    fn drops_when_retry_queue_full() {
-        let pool = SlabPool::new(STAGE2_RETRY_QUEUE_CAPACITY + 1);
-        let mut retry_queue = VecDeque::with_capacity(STAGE2_RETRY_QUEUE_CAPACITY);
-        for seq in 0..STAGE2_RETRY_QUEUE_CAPACITY {
-            let lease = pool
-                .try_acquire(sample_candidate(seq as u64))
-                .expect("lease available");
-            retry_queue.push_back(lease);
-        }
-        assert_eq!(retry_queue.len(), STAGE2_RETRY_QUEUE_CAPACITY);
-        let available_before = pool.available();
-
-        let bundle = pool
-            .try_acquire(sample_candidate(9_999))
-            .expect("remaining slot");
-        handle_stage2_failure(bundle, anyhow!("boom"), FailureKind::Plan, &mut retry_queue);
-
-        assert_eq!(retry_queue.len(), STAGE2_RETRY_QUEUE_CAPACITY);
-        assert_eq!(pool.available(), available_before, "lease released on drop");
+        assert_eq!(
+            planner.outstanding_borrow_lamports(),
+            outstanding_after_plan.saturating_sub(borrow_amount)
+        );
     }
 
     fn sample_candidate(seq: u64) -> BundleCandidate {

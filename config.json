@@ -23,6 +23,10 @@
     "result_stream_backoff_ms": 500,
     "auction_stream_backoff_ms": 1500
   },
+  "pipeline": {
+    "enable_fast_lane": true,
+    "hydration_only_mode": false
+  },
   "bam_validator_csv": "bam_validators.csv",
   "tokens": {
     "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -36,6 +40,32 @@
     "JTO": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
     "JUP": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
     "WSOL": "So11111111111111111111111111111111111111112"
+  },
+  "atas": {
+    "USDC": "Abfr3JkVvwA4ax6EJD9GRtupwmgYyDxjC5CoqN7fFaL1",
+    "USDT": "F23dwj9LDHERujDB21Mhrk948qoeMVzhusBd9kYbjjcq",
+    "TRUMP": "GgQ7QZW514kCHeiiNcuS6gGsRYo7Wnq2tkM1JTFyzd6x",
+    "MET": "4cLM1saJ3dAKUQUT54dSDz4HXBPd5eSuNz5urobti7bc",
+    "ZEC": "EJ7iNdUC4ic11eDFRySTb3HeYpFjHWrV9a8gYyB6uMMv",
+    "WETH": "9Y112DKRiy4rqFybVroBMe57tzDHSaBTJaVfVvR22fAc",
+    "WBTC": "9gMpBvW1eQZfGb8QVQVChiQ9fx8L6e4tYTKZcTTLwQz",
+    "mSOL": "8GH6oBA72ae6itiBrQcqQxMRZfHGpx3pRoGR5kFnsxQC",
+    "JTO": "5cKXffn59mpkPxLoXjAto9z4P8XG3J6NPqByimAqrC5n",
+    "JUP": "AL8xH5GWwiafCUWSETrjYf3ut4VJEAgHX4LyhDbWgvLE",
+    "WSOL": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+  },
+  "host_fee_accounts": {
+    "USDC": "86c98kDpXLJQbyEwSfyhien97zVkWkDKBxbL8XfAq9SN",
+    "USDT": "2MVsCGsaX3kG1sGumDqWqVZ8NeGcZTbMCU345NyMzJFn",
+    "TRUMP": "HX2CPauKHKvQuEV3PdWXnRYe9XksSYkkPLERT9yXksDi",
+    "MET": "Cgg1Z9pwvWa4ryQMxmAbjpxLrE8cDFTtnVs5v4bD6BCx",
+    "ZEC": "GN7Kp3bSCE7GPTNN7BRcSAz46k7RfqCrTbJxRkgYqM8X",
+    "WETH": "CBqXQsUu8vK6zR7Lvt98s4Ukuuz7fVM1GLcom7oAcMt6",
+    "WBTC": "ji1n2Z5SUepzHFuMucHmJNqbtArjAakPkSt1t3pScv6",
+    "mSOL": "5RvSBjG4bHGLW2KjZn9Ppc3Ym5nc1H3LWHBXwSrB799",
+    "JTO": "AQSFBz5oYwoniDWxVdsE1HchCJ75JJwwJESECAQ3pauL",
+    "JUP": "ymvCdyh3EqrTJM6iodGuLT3KU7EAfP1hXDty5gx1kcT",
+    "WSOL": "8EjvD86dv55Qgp7jxX1ZN5TQUWbkifdp1cMC9YgXYBFH"
   },
   "token_pairs": [
     [
@@ -375,19 +405,19 @@
   ],
   "protocols": {
     "raydium_v3": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500
     },
     "cp_amm": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500
     },
     "lb_clmm": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500
     },
     "lifinity_v2": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500
     },
     "whirlpool": {
-      "hydration_retry_ms": 10000
+      "hydration_retry_ms": 500
     }
   },
   "corecast": {

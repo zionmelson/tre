@@ -102,26 +102,42 @@ impl PoolUpdateExtensions {
     }
 }
 
-const CP_AMM_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+pub const CP_AMM_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+pub const CP_AMM_INPUT_UTILIZATION_BPS: u64 = 4_000;
 static CP_AMM_PROGRAM_PUBKEY: Lazy<Pubkey> =
     Lazy::new(|| Pubkey::from_str(CP_AMM_PROGRAM_ID).expect("static cp_amm program id"));
 
-const RAYDIUM_V3_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+pub const RAYDIUM_V3_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 static RAYDIUM_V3_PROGRAM_PUBKEY: Lazy<Pubkey> =
     Lazy::new(|| Pubkey::from_str(RAYDIUM_V3_PROGRAM_ID).expect("static Raydium v3 program id"));
+pub const RAYDIUM_V3_INPUT_UTILIZATION_BPS: u64 = 4_000;
+pub const LB_CLMM_INPUT_UTILIZATION_BPS: u64 = 2_000;
 const POOL_SEED: &[u8] = b"pool";
 const OBSERVATION_SEED: &[u8] = b"observation";
 const VAULT_SEED: &[u8] = b"pool_vault";
-const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+pub const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 static LB_CLMM_PROGRAM_PUBKEY: Lazy<Pubkey> =
     Lazy::new(|| Pubkey::from_str(LB_CLMM_PROGRAM_ID).expect("static lb_clmm program id"));
-const LIFINITY_V2_PROGRAM_ID: &str = "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c";
+const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+static MEMO_PROGRAM_PUBKEY: Lazy<Pubkey> =
+    Lazy::new(|| Pubkey::from_str(MEMO_PROGRAM_ID).expect("static memo program id"));
+const LB_CLMM_SWAP_METHODS: &[&str] = &[
+    "swap",
+    "swap2",
+    "swap_exact_out",
+    "swap_exact_out2",
+    "swap_with_price_impact",
+    "swap_with_price_impact2",
+];
+pub const LIFINITY_V2_PROGRAM_ID: &str = "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c";
 static LIFINITY_V2_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str(LIFINITY_V2_PROGRAM_ID).expect("static Lifinity AMM v2 program id")
 });
-const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN";
+pub const LIFINITY_V2_INPUT_UTILIZATION_BPS: u64 = 4_000;
+pub const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN";
 static WHIRLPOOL_PROGRAM_PUBKEY: Lazy<Pubkey> =
     Lazy::new(|| Pubkey::from_str(WHIRLPOOL_PROGRAM_ID).expect("static Whirlpool program id"));
+pub const WHIRLPOOL_INPUT_UTILIZATION_BPS: u64 = 4_000;
 
 fn parse_raydium_v3_extras(event: &PoolLiquidityChangeEvent) -> Option<RaydiumV3PoolExtras> {
     let dex = event.dex.as_ref()?;
@@ -262,32 +278,60 @@ fn parse_lb_clmm_extras(event: &PoolLiquidityChangeEvent) -> Option<LbClmmPoolEx
 
     let instruction = event.instruction.as_ref()?;
     let program = instruction.program.as_ref()?;
-    let lookup = InstructionAccountLookup::new(program, &instruction.accounts);
+    let swap_accounts = if is_lb_clmm_swap_method(program.method.as_str()) {
+        lb_clmm_swap_accounts(&instruction.accounts)
+    } else {
+        None
+    };
     let market = event.market.as_ref();
     let base_currency = market.and_then(|m| m.base_currency.as_ref());
     let quote_currency = market.and_then(|m| m.quote_currency.as_ref());
     let base_side = event.base_currency.as_ref();
     let quote_side = event.quote_currency.as_ref();
 
-    let mut extras = LbClmmPoolExtras {
-        reserve_x: lookup_account_string(&lookup, &["reserve_x", "reserveX"]),
-        reserve_y: lookup_account_string(&lookup, &["reserve_y", "reserveY"]),
-        token_x_mint: lookup_account_string(&lookup, &["token_x_mint", "tokenXMint"])
-            .or_else(|| currency_mint(base_currency).map(|pk| pk.to_string())),
-        token_y_mint: lookup_account_string(&lookup, &["token_y_mint", "tokenYMint"])
-            .or_else(|| currency_mint(quote_currency).map(|pk| pk.to_string())),
-        token_x_program: lookup_account_string(&lookup, &["token_x_program", "tokenXProgram"])
-            .or_else(|| currency_program(base_currency).map(|pk| pk.to_string())),
-        token_y_program: lookup_account_string(&lookup, &["token_y_program", "tokenYProgram"])
-            .or_else(|| currency_program(quote_currency).map(|pk| pk.to_string())),
-        oracle: lookup_account_string(&lookup, &["oracle"]),
-        bin_array_bitmap_extension: lookup_account_string(
+    let mut extras = LbClmmPoolExtras::default();
+
+    if let Some(accounts) = swap_accounts {
+        extras.reserve_x = Some(accounts.reserve_x.to_string());
+        extras.reserve_y = Some(accounts.reserve_y.to_string());
+        extras.token_x_mint = Some(accounts.token_x_mint.to_string());
+        extras.token_y_mint = Some(accounts.token_y_mint.to_string());
+        extras.token_x_program = Some(accounts.token_x_program.to_string());
+        extras.token_y_program = Some(accounts.token_y_program.to_string());
+        extras.oracle = Some(accounts.oracle.to_string());
+        extras.bin_array_bitmap_extension =
+            accounts.bin_array_bitmap_extension.map(|pk| pk.to_string());
+        extras.host_fee_account = accounts.host_fee_in.map(|pk| pk.to_string());
+    } else {
+        let lookup = InstructionAccountLookup::new(program, &instruction.accounts);
+        extras.reserve_x = lookup_account_string(&lookup, &["reserve_x", "reserveX"]);
+        extras.reserve_y = lookup_account_string(&lookup, &["reserve_y", "reserveY"]);
+        extras.token_x_mint = lookup_account_string(&lookup, &["token_x_mint", "tokenXMint"]);
+        extras.token_y_mint = lookup_account_string(&lookup, &["token_y_mint", "tokenYMint"]);
+        extras.token_x_program =
+            lookup_account_string(&lookup, &["token_x_program", "tokenXProgram"]);
+        extras.token_y_program =
+            lookup_account_string(&lookup, &["token_y_program", "tokenYProgram"]);
+        extras.oracle = lookup_account_string(&lookup, &["oracle"]);
+        extras.bin_array_bitmap_extension = lookup_account_string(
             &lookup,
             &["bin_array_bitmap_extension", "binArrayBitmapExtension"],
-        ),
-        host_fee_account: lookup_account_string(&lookup, &["host_fee_in", "hostFeeIn"]),
-        ..Default::default()
-    };
+        );
+        extras.host_fee_account = lookup_account_string(&lookup, &["host_fee_in", "hostFeeIn"]);
+    }
+
+    extras.token_x_mint = extras
+        .token_x_mint
+        .or_else(|| currency_mint(base_currency).map(|pk| pk.to_string()));
+    extras.token_y_mint = extras
+        .token_y_mint
+        .or_else(|| currency_mint(quote_currency).map(|pk| pk.to_string()));
+    extras.token_x_program = extras
+        .token_x_program
+        .or_else(|| currency_program(base_currency).map(|pk| pk.to_string()));
+    extras.token_y_program = extras
+        .token_y_program
+        .or_else(|| currency_program(quote_currency).map(|pk| pk.to_string()));
 
     if let Some(side) = base_side {
         extras.reserve_x_balance = Some(side.post_amount as u128);
@@ -297,6 +341,116 @@ fn parse_lb_clmm_extras(event: &PoolLiquidityChangeEvent) -> Option<LbClmmPoolEx
     }
 
     lb_clmm_extras_if_any(extras)
+}
+
+#[derive(Clone, Copy)]
+struct LbClmmSwapAccounts {
+    reserve_x: Pubkey,
+    reserve_y: Pubkey,
+    token_x_mint: Pubkey,
+    token_y_mint: Pubkey,
+    oracle: Pubkey,
+    bin_array_bitmap_extension: Option<Pubkey>,
+    host_fee_in: Option<Pubkey>,
+    token_x_program: Pubkey,
+    token_y_program: Pubkey,
+}
+
+fn lb_clmm_swap_accounts(accounts: &[ProtoAccount]) -> Option<LbClmmSwapAccounts> {
+    if accounts.len() < 13 {
+        return None;
+    }
+
+    let mut index = 0usize;
+    skip_account(accounts, &mut index)?; // lb_pair
+
+    let bin_array_bitmap_extension = if let Some(account) = accounts.get(index) {
+        if !is_token_account(account) {
+            let pk = pubkey_from_bytes(&account.address)?;
+            index += 1;
+            Some(pk)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let reserve_x = take_pubkey(accounts, &mut index)?;
+    let reserve_y = take_pubkey(accounts, &mut index)?;
+    skip_account(accounts, &mut index)?; // user_token_in
+    skip_account(accounts, &mut index)?; // user_token_out
+    let token_x_mint = take_pubkey(accounts, &mut index)?;
+    let token_y_mint = take_pubkey(accounts, &mut index)?;
+    let oracle = take_pubkey(accounts, &mut index)?;
+    let host_fee_in = if let Some(account) = accounts.get(index) {
+        if is_token_account(account) {
+            let pk = pubkey_from_bytes(&account.address)?;
+            index += 1;
+            Some(pk)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    skip_account(accounts, &mut index)?; // user
+    let token_x_program = take_pubkey(accounts, &mut index)?;
+    let token_y_program = take_pubkey(accounts, &mut index)?;
+
+    if let Some(account) = accounts.get(index) {
+        if is_memo_program(account) {
+            index += 1;
+        }
+    }
+
+    // Ensure the trailing event authority and program accounts exist even though we
+    // do not currently consume them.
+    accounts.get(index)?;
+    accounts.get(index + 1)?;
+
+    Some(LbClmmSwapAccounts {
+        reserve_x,
+        reserve_y,
+        token_x_mint,
+        token_y_mint,
+        oracle,
+        bin_array_bitmap_extension,
+        host_fee_in,
+        token_x_program,
+        token_y_program,
+    })
+}
+
+fn skip_account(accounts: &[ProtoAccount], index: &mut usize) -> Option<()> {
+    if *index >= accounts.len() {
+        return None;
+    }
+    *index += 1;
+    Some(())
+}
+
+fn take_pubkey(accounts: &[ProtoAccount], index: &mut usize) -> Option<Pubkey> {
+    let account = accounts.get(*index)?;
+    let key = pubkey_from_bytes(&account.address)?;
+    *index += 1;
+    Some(key)
+}
+
+fn is_token_account(account: &ProtoAccount) -> bool {
+    account.token.is_some()
+}
+
+fn is_memo_program(account: &ProtoAccount) -> bool {
+    pubkey_from_bytes(&account.address)
+        .map(|pk| pk == *MEMO_PROGRAM_PUBKEY)
+        .unwrap_or(false)
+}
+
+fn is_lb_clmm_swap_method(method: &str) -> bool {
+    LB_CLMM_SWAP_METHODS
+        .iter()
+        .any(|candidate| *candidate == method)
 }
 
 fn lb_clmm_extras_if_any(extras: LbClmmPoolExtras) -> Option<LbClmmPoolExtras> {
@@ -487,7 +641,7 @@ mod tests {
     use super::*;
     use crate::proto::solana_messages::{
         Account as ProtoAccount, Currency, DexInfo, DexMarket, ParsedIdlInstruction,
-        PoolLiquidityChangeEvent, PoolSide, Program,
+        PoolLiquidityChangeEvent, PoolSide, Program, TokenInfo,
     };
 
     fn proto_account(address: &Pubkey) -> ProtoAccount {
@@ -496,6 +650,25 @@ mod tests {
             is_signer: false,
             is_writable: false,
             token: None,
+        }
+    }
+
+    fn spl_token_account(
+        address: &Pubkey,
+        mint: &Pubkey,
+        owner: &Pubkey,
+        program: &Pubkey,
+    ) -> ProtoAccount {
+        ProtoAccount {
+            address: address.to_bytes().to_vec(),
+            is_signer: false,
+            is_writable: true,
+            token: Some(TokenInfo {
+                mint: mint.to_bytes().to_vec(),
+                owner: owner.to_bytes().to_vec(),
+                decimals: 6,
+                program_id: program.to_bytes().to_vec(),
+            }),
         }
     }
 
@@ -588,6 +761,19 @@ mod tests {
         }
     }
 
+    fn parsed_instruction_with_method(
+        account_names: Vec<&str>,
+        accounts: Vec<ProtoAccount>,
+        method: &str,
+    ) -> ParsedIdlInstruction {
+        let mut instruction = parsed_instruction(account_names, accounts);
+        if let Some(program) = instruction.program.as_mut() {
+            program.name = method.to_string();
+            program.method = method.to_string();
+        }
+        instruction
+    }
+
     #[test]
     fn parses_raydium_accounts_and_bumps() {
         let amm_config = Pubkey::new_from_array([1u8; 32]);
@@ -649,6 +835,22 @@ mod tests {
     }
 
     fn cp_amm_market(pool_id: &Pubkey, base: &Pubkey, quote: &Pubkey) -> DexMarket {
+        DexMarket {
+            market_address: pool_id.to_bytes().to_vec(),
+            base_currency: Some(proto_currency(base)),
+            quote_currency: Some(proto_currency(quote)),
+        }
+    }
+
+    fn lb_clmm_dex_info() -> DexInfo {
+        DexInfo {
+            program_address: LB_CLMM_PROGRAM_PUBKEY.to_bytes().to_vec(),
+            protocol_name: String::from("lb_clmm"),
+            protocol_family: String::from("lb_clmm"),
+        }
+    }
+
+    fn lb_clmm_market(pool_id: &Pubkey, base: &Pubkey, quote: &Pubkey) -> DexMarket {
         DexMarket {
             market_address: pool_id.to_bytes().to_vec(),
             base_currency: Some(proto_currency(base)),
@@ -726,6 +928,158 @@ mod tests {
             extras.referral_token_account,
             Some(referral_token_account.to_string())
         );
+    }
+
+    #[test]
+    fn lb_clmm_swap_accounts_without_optionals() {
+        let pool = Pubkey::new_unique();
+        let reserve_x = Pubkey::new_unique();
+        let reserve_y = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let user_token_in = Pubkey::new_unique();
+        let user_token_out = Pubkey::new_unique();
+        let token_x_mint = Pubkey::new_unique();
+        let token_y_mint = Pubkey::new_unique();
+        let oracle = Pubkey::new_unique();
+        let event_authority = Pubkey::new_unique();
+        let spl_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            .expect("spl token program id");
+
+        let accounts = vec![
+            proto_account(&pool),
+            spl_token_account(&reserve_x, &token_x_mint, &pool, &spl_program),
+            spl_token_account(&reserve_y, &token_y_mint, &pool, &spl_program),
+            spl_token_account(&user_token_in, &token_x_mint, &user, &spl_program),
+            spl_token_account(&user_token_out, &token_y_mint, &user, &spl_program),
+            proto_account(&token_x_mint),
+            proto_account(&token_y_mint),
+            proto_account(&oracle),
+            proto_account(&user),
+            proto_account(&spl_program),
+            proto_account(&spl_program),
+            proto_account(&event_authority),
+            proto_account(&LB_CLMM_PROGRAM_PUBKEY),
+        ];
+
+        let instruction = parsed_instruction_with_method(
+            vec![
+                "lb_pair",
+                "reserve_x",
+                "reserve_y",
+                "user_token_in",
+                "user_token_out",
+                "token_x_mint",
+                "token_y_mint",
+                "oracle",
+                "user",
+                "token_x_program",
+                "token_y_program",
+                "event_authority",
+                "program",
+            ],
+            accounts,
+            "swap",
+        );
+
+        let event = PoolLiquidityChangeEvent {
+            instruction_index: 0,
+            dex: Some(lb_clmm_dex_info()),
+            market: Some(lb_clmm_market(&pool, &token_x_mint, &token_y_mint)),
+            base_currency: Some(pool_side(1)),
+            quote_currency: Some(pool_side(1)),
+            instruction: Some(instruction),
+        };
+
+        let extras = parse_lb_clmm_extras(&event).expect("extras must parse");
+        assert_eq!(extras.reserve_x, Some(reserve_x.to_string()));
+        assert_eq!(extras.reserve_y, Some(reserve_y.to_string()));
+        assert_eq!(extras.token_x_mint, Some(token_x_mint.to_string()));
+        assert_eq!(extras.token_y_mint, Some(token_y_mint.to_string()));
+        assert_eq!(extras.oracle, Some(oracle.to_string()));
+        assert_eq!(extras.token_x_program, Some(spl_program.to_string()));
+        assert_eq!(extras.token_y_program, Some(spl_program.to_string()));
+        assert!(extras.bin_array_bitmap_extension.is_none());
+        assert!(extras.host_fee_account.is_none());
+    }
+
+    #[test]
+    fn lb_clmm_swap_accounts_with_optionals() {
+        let pool = Pubkey::new_unique();
+        let bitmap_extension = Pubkey::new_unique();
+        let reserve_x = Pubkey::new_unique();
+        let reserve_y = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let user_token_in = Pubkey::new_unique();
+        let user_token_out = Pubkey::new_unique();
+        let host_fee = Pubkey::new_unique();
+        let token_x_mint = Pubkey::new_unique();
+        let token_y_mint = Pubkey::new_unique();
+        let oracle = Pubkey::new_unique();
+        let event_authority = Pubkey::new_unique();
+        let spl_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            .expect("spl token program id");
+
+        let accounts = vec![
+            proto_account(&pool),
+            proto_account(&bitmap_extension),
+            spl_token_account(&reserve_x, &token_x_mint, &pool, &spl_program),
+            spl_token_account(&reserve_y, &token_y_mint, &pool, &spl_program),
+            spl_token_account(&user_token_in, &token_x_mint, &user, &spl_program),
+            spl_token_account(&user_token_out, &token_y_mint, &user, &spl_program),
+            proto_account(&token_x_mint),
+            proto_account(&token_y_mint),
+            proto_account(&oracle),
+            spl_token_account(&host_fee, &token_x_mint, &user, &spl_program),
+            proto_account(&user),
+            proto_account(&spl_program),
+            proto_account(&spl_program),
+            proto_account(&MEMO_PROGRAM_PUBKEY),
+            proto_account(&event_authority),
+            proto_account(&LB_CLMM_PROGRAM_PUBKEY),
+        ];
+
+        let instruction = parsed_instruction_with_method(
+            vec![
+                "lb_pair",
+                "bin_array_bitmap_extension",
+                "reserve_x",
+                "reserve_y",
+                "user_token_in",
+                "user_token_out",
+                "token_x_mint",
+                "token_y_mint",
+                "oracle",
+                "host_fee_in",
+                "user",
+                "token_x_program",
+                "token_y_program",
+                "memo_program",
+                "event_authority",
+                "program",
+            ],
+            accounts,
+            "swap2",
+        );
+
+        let event = PoolLiquidityChangeEvent {
+            instruction_index: 0,
+            dex: Some(lb_clmm_dex_info()),
+            market: Some(lb_clmm_market(&pool, &token_x_mint, &token_y_mint)),
+            base_currency: Some(pool_side(1)),
+            quote_currency: Some(pool_side(1)),
+            instruction: Some(instruction),
+        };
+
+        let extras = parse_lb_clmm_extras(&event).expect("extras must parse");
+        assert_eq!(
+            extras.bin_array_bitmap_extension,
+            Some(bitmap_extension.to_string())
+        );
+        assert_eq!(extras.host_fee_account, Some(host_fee.to_string()));
+        assert_eq!(extras.reserve_x, Some(reserve_x.to_string()));
+        assert_eq!(extras.reserve_y, Some(reserve_y.to_string()));
+        assert_eq!(extras.token_x_program, Some(spl_program.to_string()));
+        assert_eq!(extras.token_y_program, Some(spl_program.to_string()));
     }
 
     #[test]

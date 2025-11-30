@@ -3,18 +3,22 @@ use std::sync::{
     Arc,
 };
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::{signal, task};
+use tracing::info;
 
 use crate::builder::BuilderHandle;
 use crate::bundle::{BundleClient, BundleTracker};
-use crate::cluster::{self, LeaderScheduleGate};
 use crate::config::AppConfig;
-use crate::core::{Lease, SlabPool, SpscRing};
+use crate::core::{Lease, RingConsumer, SpscRing};
+use crate::hydration::{HydrationService, HydrationSnapshot};
 use crate::notifier::Notifier;
-use crate::stages::{self, BundleCandidate, PoolUpdate, TradeUpdate};
+use crate::planner::{spawn_fast_lane_planner, PlannerConfig};
+use crate::stages::types::BundleCandidate;
 use crate::strategy::StrategyEngine;
+use crate::submission::{self, SubmissionConfig};
 
 pub struct ExecutorRuntime {
     stop: Arc<AtomicBool>,
@@ -25,61 +29,49 @@ pub struct ExecutorRuntime {
 impl ExecutorRuntime {
     pub fn spawn(config: Arc<AppConfig>) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
-
-        let trade_pool = SlabPool::new(config.perf.opportunity_slab);
-        let pool_update_pool = SlabPool::new(config.perf.opportunity_slab);
-        let bundle_pool = SlabPool::new(config.perf.bundle_slab);
-        let (trade_tx, trade_rx) =
-            SpscRing::<Lease<TradeUpdate>>::with_capacity(config.perf.ring_capacity).into_split();
-        let (pool_tx, pool_rx) =
-            SpscRing::<Lease<PoolUpdate>>::with_capacity(config.perf.ring_capacity).into_split();
-        let (bundle_tx, bundle_rx) =
-            SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
-                .into_split();
-        let (submit_tx, submit_rx) =
-            SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
-                .into_split();
+        let hydration_only = config.pipeline.hydration_only_mode;
+        let fast_lane_enabled = config.pipeline.enable_fast_lane && !hydration_only;
+        if hydration_only {
+            info!("hydration-only mode enabled; execution lanes disabled");
+        }
+        if !fast_lane_enabled && !hydration_only {
+            return Err(anyhow!(
+                "fast lane disabled but legacy execution path has been removed; set pipeline.enable_fast_lane=true or enable hydration_only_mode"
+            ));
+        }
 
         let mut handles = Vec::new();
         let builder = BuilderHandle::new(config.clone())?;
+        let hydration_service = HydrationService::new(builder.clone());
         let strategy = Arc::new(StrategyEngine::new(config.clone())?);
         let notifier = Arc::new(Notifier::new(strategy.clone(), config.clone()));
-        let bam_allowlist = Arc::new(cluster::BamValidatorSet::load_from_csv(
-            config.bam_validator_csv_path(),
-        )?);
-        let (leader_state, leader_handle) =
-            cluster::spawn_leader_schedule_watcher(stop.clone(), config.quicknode_rpcs.clone())?;
-        handles.push(leader_handle);
-        let leader_gate = Arc::new(LeaderScheduleGate::new(leader_state.clone(), bam_allowlist));
+        let (hydration_tx, hydration_rx) =
+            SpscRing::<HydrationSnapshot>::with_capacity(config.perf.ring_capacity).into_split();
+        handles.push(hydration_service.spawn_snapshot_worker(stop.clone(), hydration_tx)?);
 
-        handles.push(stages::spawn_ingest_stage(
-            stop.clone(),
-            Some(config.perf.ingest_core),
-            config.clone(),
-            trade_pool.clone(),
-            trade_tx,
-            pool_update_pool.clone(),
-            pool_tx,
-        )?);
-        handles.push(stages::spawn_eval_stage(
+        if hydration_only {
+            handles.push(spawn_snapshot_drain(stop.clone(), hydration_rx)?);
+            info!("hydration-only topology active; planner + submitter skipped");
+            return Ok(Self {
+                stop,
+                handles,
+                _config: config,
+            });
+        }
+
+        let (planner_tx, planner_rx) =
+            SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
+                .into_split();
+
+        handles.push(spawn_fast_lane_planner(
             stop.clone(),
             Some(config.perf.eval_core),
-            config.clone(),
-            trade_rx,
-            pool_rx,
-            bundle_tx,
-            bundle_pool.clone(),
+            hydration_rx,
+            planner_tx,
             builder.clone(),
-            notifier.clone(),
-            strategy.clone(),
+            PlannerConfig::default(),
         )?);
-        handles.push(stages::spawn_submit_stage(
-            stop.clone(),
-            Some(config.perf.submit_core),
-            bundle_rx,
-            submit_tx,
-            builder.clone(),
-        )?);
+
         let bundle_client = Arc::new(BundleClient::new(config.clone(), builder.auth_signer())?);
         let (tracker, mut tracker_handles) = BundleTracker::spawn(
             stop.clone(),
@@ -88,16 +80,15 @@ impl ExecutorRuntime {
             builder.auth_signer(),
         )?;
         handles.append(&mut tracker_handles);
-        handles.push(stages::spawn_send_stage(
+        handles.push(submission::spawn_fast_lane_submitter(
             stop.clone(),
-            None,
-            submit_rx,
+            Some(config.perf.submit_core),
+            planner_rx,
             builder.clone(),
             bundle_client,
             notifier.clone(),
             tracker,
-            leader_gate,
-            config.quicknode_rpcs.clone(),
+            SubmissionConfig::default(),
         )?);
 
         Ok(Self {
@@ -132,6 +123,22 @@ fn describe_panic(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
     } else {
         "unknown panic".to_string()
     }
+}
+
+fn spawn_snapshot_drain(
+    stop: Arc<AtomicBool>,
+    consumer: RingConsumer<HydrationSnapshot>,
+) -> Result<thread::JoinHandle<Result<()>>> {
+    thread::Builder::new()
+        .name("hydration_drain".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                while consumer.pop().is_some() {}
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        })
+        .map_err(Into::into)
 }
 
 pub async fn run(config: Arc<AppConfig>) -> Result<()> {

@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -15,8 +15,8 @@ use crate::template::TemplateContext;
 
 use super::{
     AmmV3Field, AmmV3PoolAccounts, CpAmmField, CpAmmPoolAccounts, InstructionTemplate, LbClmmField,
-    LifinityField, LifinityPoolAccounts, TemplateCache, TemplateCacheKey, TemplateFieldKind,
-    TemplateMetadata, TemplatePatch, WhirlpoolField, WhirlpoolPoolAccounts,
+    LbClmmPoolAccounts, LifinityField, LifinityPoolAccounts, TemplateCache, TemplateCacheKey,
+    TemplateFieldKind, TemplateMetadata, TemplatePatch, WhirlpoolField, WhirlpoolPoolAccounts,
 };
 
 static CP_AMM_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
@@ -37,14 +37,6 @@ static MEMO_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
 static JITO_DONT_FRONT_ACCOUNT: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str("jitodontfront111111111111111111111111111111")
         .expect("static jitodontfront pubkey")
-});
-static ASSOCIATED_TOKEN_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str("ATokenGPvR93dthLvYbAphit9L8ZsfsZp7r4HQJDebg")
-        .expect("static associated token program id")
-});
-static SPL_TOKEN_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-        .expect("static spl token program id")
 });
 
 const CP_AMM_HOST_FEE_INDEX: usize = 11;
@@ -93,6 +85,7 @@ pub fn build_bundle(
     seq: u64,
     payer: Pubkey,
     cache: &TemplateCache,
+    token_atas: &HashMap<Pubkey, Pubkey>,
     blockhash: Hash,
     prefix_instructions: &[Instruction],
     plans: &[BundleInstructionPlan],
@@ -106,10 +99,12 @@ pub fn build_bundle(
         prefix_instructions.len() + suffix_instructions.len() + plans.len().saturating_mul(2) + 1,
     );
     let prefix_includes_compute_budget = prefix_instructions
-        .first()
-        .map(|ix| ix.program_id == *COMPUTE_BUDGET_PROGRAM_ID)
-        .unwrap_or(false);
+        .iter()
+        .any(|ix| ix.program_id == *COMPUTE_BUDGET_PROGRAM_ID);
     if !prefix_includes_compute_budget {
+        if let Some(price) = required_compute_unit_price(plans) {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(price));
+        }
         if let Some(limit) = required_compute_unit_limit(plans) {
             instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(limit));
         }
@@ -117,7 +112,7 @@ pub fn build_bundle(
     instructions.extend_from_slice(prefix_instructions);
     for plan in plans {
         let template = resolve_template(cache, plan)?;
-        let instruction = hydrate_instruction(plan, template.as_ref(), payer)
+        let instruction = hydrate_instruction(plan, template.as_ref(), payer, token_atas)
             .with_context(|| format!("failed to hydrate plan for pool {}", plan.pool_id))?;
         instructions.push(instruction);
     }
@@ -154,6 +149,7 @@ fn hydrate_instruction(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
     payer: Pubkey,
+    token_atas: &HashMap<Pubkey, Pubkey>,
 ) -> Result<Instruction> {
     let mut data = (*template.data).clone();
     for patch in template.patches.iter() {
@@ -161,8 +157,9 @@ fn hydrate_instruction(
     }
 
     let mut accounts = template.accounts.as_ref().to_vec();
-    hydrate_template_accounts(plan, template, payer, &mut accounts)?;
+    hydrate_template_accounts(plan, template, payer, token_atas, &mut accounts)?;
     apply_template_context(plan, template, &mut accounts)?;
+    prune_optional_accounts(template, &mut accounts);
     rewrite_placeholder_signers(plan, &mut accounts, payer);
 
     Ok(Instruction {
@@ -176,6 +173,7 @@ fn hydrate_template_accounts(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
     payer: Pubkey,
+    token_atas: &HashMap<Pubkey, Pubkey>,
     accounts: &mut [AccountMeta],
 ) -> Result<()> {
     match &template.metadata {
@@ -194,6 +192,7 @@ fn hydrate_template_accounts(
                 plan,
                 template,
                 payer,
+                token_atas,
                 account_specs,
                 pool_accounts,
                 accounts,
@@ -213,6 +212,27 @@ fn hydrate_template_accounts(
                 plan,
                 template,
                 payer,
+                token_atas,
+                account_specs,
+                pool_accounts,
+                accounts,
+            )
+        }
+        TemplateMetadata::LbClmm {
+            account_specs,
+            pool_accounts,
+        } => {
+            let pool_accounts = pool_accounts.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "template for pool {} missing lb_clmm account metadata",
+                    plan.pool_id
+                )
+            })?;
+            hydrate_lb_clmm_accounts(
+                plan,
+                template,
+                payer,
+                token_atas,
                 account_specs,
                 pool_accounts,
                 accounts,
@@ -232,6 +252,7 @@ fn hydrate_template_accounts(
                 plan,
                 template,
                 payer,
+                token_atas,
                 account_specs,
                 pool_accounts,
                 accounts,
@@ -251,6 +272,7 @@ fn hydrate_template_accounts(
                 plan,
                 template,
                 payer,
+                token_atas,
                 account_specs,
                 pool_accounts,
                 accounts,
@@ -263,6 +285,7 @@ fn hydrate_amm_v3_accounts(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
     default_payer: Pubkey,
+    token_atas: &HashMap<Pubkey, Pubkey>,
     specs: &[AccountSpec],
     pool_accounts: &AmmV3PoolAccounts,
     accounts: &mut [AccountMeta],
@@ -276,8 +299,18 @@ fn hydrate_amm_v3_accounts(
     }
 
     let authority = plan.context.payer.unwrap_or(default_payer);
-    let mint0_ata = derive_associated_token_address(&authority, &pool_accounts.mint0);
-    let mint1_ata = derive_associated_token_address(&authority, &pool_accounts.mint1);
+    let mint0_ata = config_token_account(
+        token_atas,
+        &pool_accounts.mint0,
+        &plan.pool_id,
+        "amm_v3 mint0",
+    )?;
+    let mint1_ata = config_token_account(
+        token_atas,
+        &pool_accounts.mint1,
+        &plan.pool_id,
+        "amm_v3 mint1",
+    )?;
     let context_input_account = plan.context.input_token_account;
     let context_output_account = plan.context.output_token_account;
 
@@ -356,6 +389,7 @@ fn hydrate_cp_amm_accounts(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
     default_payer: Pubkey,
+    token_atas: &HashMap<Pubkey, Pubkey>,
     specs: &[AccountSpec],
     pool_accounts: &CpAmmPoolAccounts,
     accounts: &mut [AccountMeta],
@@ -369,12 +403,24 @@ fn hydrate_cp_amm_accounts(
     }
 
     let authority = plan.context.payer.unwrap_or(default_payer);
-    let input_account = plan.context.input_token_account.unwrap_or_else(|| {
-        derive_associated_token_address(&authority, &pool_accounts.token_a_mint)
-    });
-    let output_account = plan.context.output_token_account.unwrap_or_else(|| {
-        derive_associated_token_address(&authority, &pool_accounts.token_b_mint)
-    });
+    let input_account = match plan.context.input_token_account {
+        Some(account) => account,
+        None => config_token_account(
+            token_atas,
+            &pool_accounts.token_a_mint,
+            &plan.pool_id,
+            "cp_amm input",
+        )?,
+    };
+    let output_account = match plan.context.output_token_account {
+        Some(account) => account,
+        None => config_token_account(
+            token_atas,
+            &pool_accounts.token_b_mint,
+            &plan.pool_id,
+            "cp_amm output",
+        )?,
+    };
     let host_fee_account = plan
         .context
         .host_fee_account
@@ -410,10 +456,97 @@ fn hydrate_cp_amm_accounts(
     Ok(())
 }
 
+fn hydrate_lb_clmm_accounts(
+    plan: &BundleInstructionPlan,
+    template: &InstructionTemplate,
+    default_payer: Pubkey,
+    token_atas: &HashMap<Pubkey, Pubkey>,
+    specs: &[AccountSpec],
+    pool_accounts: &LbClmmPoolAccounts,
+    accounts: &mut [AccountMeta],
+) -> Result<()> {
+    if specs.len() != accounts.len() {
+        bail!(
+            "template account/spec length mismatch ({} != {})",
+            accounts.len(),
+            specs.len()
+        );
+    }
+
+    let authority = plan.context.payer.unwrap_or(default_payer);
+    let mint0_ata = config_token_account(
+        token_atas,
+        &pool_accounts.mint_for_role(SwapMintRole::Mint0),
+        &plan.pool_id,
+        "lb_clmm mint0",
+    )?;
+    let mint1_ata = config_token_account(
+        token_atas,
+        &pool_accounts.mint_for_role(SwapMintRole::Mint1),
+        &plan.pool_id,
+        "lb_clmm mint1",
+    )?;
+    let context_input_account = plan.context.input_token_account;
+    let context_output_account = plan.context.output_token_account;
+    let host_fee_account = plan.context.host_fee_account.or(pool_accounts.host_fee_in);
+
+    for (index, (meta, spec)) in accounts.iter_mut().zip(specs.iter()).enumerate() {
+        if spec.address.is_some() {
+            continue;
+        }
+
+        match spec.name {
+            "lb_pair" => {
+                meta.pubkey = template.key.pool_id;
+            }
+            "user" => {
+                meta.pubkey = authority;
+            }
+            "user_token_in" => {
+                let role = spec.mint_role.ok_or_else(|| {
+                    anyhow!(
+                        "lb_clmm account {} missing mint role metadata (index {})",
+                        spec.name,
+                        index
+                    )
+                })?;
+                let fallback = match role {
+                    SwapMintRole::Mint0 => mint0_ata,
+                    SwapMintRole::Mint1 => mint1_ata,
+                };
+                meta.pubkey = context_input_account.unwrap_or(fallback);
+            }
+            "user_token_out" => {
+                let role = spec.mint_role.ok_or_else(|| {
+                    anyhow!(
+                        "lb_clmm account {} missing mint role metadata (index {})",
+                        spec.name,
+                        index
+                    )
+                })?;
+                let fallback = match role {
+                    SwapMintRole::Mint0 => mint0_ata,
+                    SwapMintRole::Mint1 => mint1_ata,
+                };
+                meta.pubkey = context_output_account.unwrap_or(fallback);
+            }
+            "host_fee_in" => {
+                if let Some(pk) = host_fee_account {
+                    meta.pubkey = pk;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 fn hydrate_lifinity_accounts(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
     default_payer: Pubkey,
+    token_atas: &HashMap<Pubkey, Pubkey>,
     specs: &[AccountSpec],
     pool_accounts: &LifinityPoolAccounts,
     accounts: &mut [AccountMeta],
@@ -480,14 +613,14 @@ fn hydrate_lifinity_accounts(
         }
     };
 
-    let user_input_account = plan
-        .context
-        .input_token_account
-        .unwrap_or_else(|| derive_associated_token_address(&user_authority, &input_mint));
-    let user_output_account = plan
-        .context
-        .output_token_account
-        .unwrap_or_else(|| derive_associated_token_address(&user_authority, &output_mint));
+    let user_input_account = match plan.context.input_token_account {
+        Some(account) => account,
+        None => config_token_account(token_atas, &input_mint, &plan.pool_id, "lifinity input")?,
+    };
+    let user_output_account = match plan.context.output_token_account {
+        Some(account) => account,
+        None => config_token_account(token_atas, &output_mint, &plan.pool_id, "lifinity output")?,
+    };
 
     for (meta, spec) in accounts.iter_mut().zip(specs.iter()) {
         if spec.address.is_some() {
@@ -519,6 +652,7 @@ fn hydrate_whirlpool_accounts(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
     default_payer: Pubkey,
+    token_atas: &HashMap<Pubkey, Pubkey>,
     specs: &[AccountSpec],
     pool_accounts: &WhirlpoolPoolAccounts,
     accounts: &mut [AccountMeta],
@@ -537,23 +671,26 @@ fn hydrate_whirlpool_accounts(
     let output_mint = Pubkey::from_str(&plan.output_mint)
         .with_context(|| format!("invalid output mint {}", plan.output_mint))?;
 
-    let ata_for = |mint: &Pubkey| derive_associated_token_address(&authority, mint);
-    let owner_account_for_mint = |mint: &Pubkey| -> Pubkey {
+    let owner_account_for_mint = |mint: &Pubkey| -> Result<Pubkey> {
         if *mint == input_mint {
-            plan.context
-                .input_token_account
-                .unwrap_or_else(|| ata_for(mint))
+            if let Some(account) = plan.context.input_token_account {
+                return Ok(account);
+            }
         } else if *mint == output_mint {
-            plan.context
-                .output_token_account
-                .unwrap_or_else(|| ata_for(mint))
-        } else {
-            ata_for(mint)
+            if let Some(account) = plan.context.output_token_account {
+                return Ok(account);
+            }
         }
+        token_atas.get(mint).copied().with_context(|| {
+            format!(
+                "token ATA missing for mint {} (whirlpool owner account) in pool {}",
+                mint, plan.pool_id
+            )
+        })
     };
 
-    let owner_account_a = owner_account_for_mint(&pool_accounts.token_mint_a);
-    let owner_account_b = owner_account_for_mint(&pool_accounts.token_mint_b);
+    let owner_account_a = owner_account_for_mint(&pool_accounts.token_mint_a)?;
+    let owner_account_b = owner_account_for_mint(&pool_accounts.token_mint_b)?;
     let vault_a = pool_accounts
         .token_vault_a
         .ok_or_else(|| anyhow!("template for pool {} missing token_vault_a", plan.pool_id))?;
@@ -630,12 +767,18 @@ fn hydrate_whirlpool_accounts(
     Ok(())
 }
 
-fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[owner.as_ref(), SPL_TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
-        &ASSOCIATED_TOKEN_PROGRAM_ID,
-    )
-    .0
+fn config_token_account(
+    token_atas: &HashMap<Pubkey, Pubkey>,
+    mint: &Pubkey,
+    pool_id: &str,
+    role: &str,
+) -> Result<Pubkey> {
+    token_atas.get(mint).copied().with_context(|| {
+        format!(
+            "token ATA missing for mint {} ({} in pool {})",
+            mint, role, pool_id
+        )
+    })
 }
 
 fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [u8]) -> Result<()> {
@@ -780,7 +923,9 @@ fn apply_template_context(
         accounts.extend(plan.context.remaining_accounts.iter().cloned());
     }
 
-    ensure_dont_front_account(accounts);
+    if plan.context.requires_dont_front {
+        ensure_dont_front_account(accounts);
+    }
 
     Ok(())
 }
@@ -789,10 +934,11 @@ pub(crate) fn hydrate_accounts_for_plan(
     cache: &TemplateCache,
     plan: &BundleInstructionPlan,
     payer: Pubkey,
+    token_atas: &HashMap<Pubkey, Pubkey>,
 ) -> Result<Vec<AccountMeta>> {
     let template = resolve_template(cache, plan)?;
     let mut accounts = template.accounts.as_ref().to_vec();
-    hydrate_template_accounts(plan, template.as_ref(), payer, &mut accounts)?;
+    hydrate_template_accounts(plan, template.as_ref(), payer, token_atas, &mut accounts)?;
     apply_template_context(plan, template.as_ref(), &mut accounts)?;
     rewrite_placeholder_signers(plan, &mut accounts, payer);
     Ok(accounts)
@@ -828,6 +974,36 @@ fn ensure_dont_front_account(accounts: &mut Vec<AccountMeta>) {
     accounts.push(AccountMeta::new_readonly(*JITO_DONT_FRONT_ACCOUNT, false));
 }
 
+fn prune_optional_accounts(template: &InstructionTemplate, accounts: &mut Vec<AccountMeta>) {
+    let Some(specs) = account_specs_for_template(template) else {
+        return;
+    };
+    if specs.len() != accounts.len() {
+        return;
+    }
+
+    let mut pruned = Vec::with_capacity(accounts.len());
+    for (spec, meta) in specs.iter().zip(accounts.iter()) {
+        if spec.is_optional && meta.pubkey == Pubkey::default() {
+            continue;
+        }
+        pruned.push(meta.clone());
+    }
+
+    *accounts = pruned;
+}
+
+fn account_specs_for_template(template: &InstructionTemplate) -> Option<&'static [AccountSpec]> {
+    match template.metadata {
+        TemplateMetadata::None => None,
+        TemplateMetadata::AmmV3 { account_specs, .. } => Some(account_specs),
+        TemplateMetadata::CpAmm { account_specs, .. } => Some(account_specs),
+        TemplateMetadata::LbClmm { account_specs, .. } => Some(account_specs),
+        TemplateMetadata::Lifinity { account_specs, .. } => Some(account_specs),
+        TemplateMetadata::Whirlpool { account_specs, .. } => Some(account_specs),
+    }
+}
+
 fn apply_host_fee_account(
     program_id: Pubkey,
     accounts: &mut [AccountMeta],
@@ -852,6 +1028,13 @@ fn required_compute_unit_limit(plans: &[BundleInstructionPlan]) -> Option<u32> {
     plans
         .iter()
         .filter_map(|plan| plan.context.compute_unit_limit)
+        .max()
+}
+
+fn required_compute_unit_price(plans: &[BundleInstructionPlan]) -> Option<u64> {
+    plans
+        .iter()
+        .filter_map(|plan| plan.context.compute_unit_price)
         .max()
 }
 
@@ -896,6 +1079,7 @@ mod tests {
     use solana_sdk::instruction::AccountMeta;
     use std::convert::TryInto;
     use std::sync::Arc as StdArc;
+    use std::time::Instant;
 
     #[test]
     fn builds_message_from_plan() {
@@ -923,8 +1107,18 @@ mod tests {
         };
 
         let payer = Pubkey::new_unique();
-        let ctx =
-            build_bundle(1, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let token_atas = HashMap::new();
+        let ctx = build_bundle(
+            1,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan],
+            &[],
+        )
+        .expect("bundle");
         assert_eq!(ctx.instructions.len(), 1);
         assert_eq!(ctx.lookup_tables.len(), 0);
         assert_eq!(ctx.instructions[0].data[..8], 42u64.to_le_bytes());
@@ -978,10 +1172,12 @@ mod tests {
         plan_b.amount_in = 3;
 
         let payer = Pubkey::new_unique();
+        let token_atas = HashMap::new();
         let ctx = build_bundle(
             9,
             payer,
             &cache,
+            &token_atas,
             Hash::default(),
             &[],
             &[plan_a, plan_b],
@@ -1018,8 +1214,18 @@ mod tests {
         plan.context.compute_unit_limit = Some(400_000);
 
         let payer = Pubkey::new_unique();
-        let ctx =
-            build_bundle(5, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let token_atas = HashMap::new();
+        let ctx = build_bundle(
+            5,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan],
+            &[],
+        )
+        .expect("bundle");
 
         assert_eq!(ctx.instructions.len(), 2);
         assert_eq!(
@@ -1096,8 +1302,18 @@ mod tests {
         };
 
         let payer = Pubkey::new_unique();
-        let ctx =
-            build_bundle(7, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let token_atas = HashMap::new();
+        let ctx = build_bundle(
+            7,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan],
+            &[],
+        )
+        .expect("bundle");
         let ix = &ctx.instructions[0];
         assert_eq!(ix.accounts[CP_AMM_HOST_FEE_INDEX].pubkey, host_fee);
         assert_eq!(ix.accounts.len(), accounts.len() + 1);
@@ -1151,8 +1367,18 @@ mod tests {
         };
 
         let payer = Pubkey::new_unique();
-        let ctx =
-            build_bundle(11, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let token_atas = HashMap::new();
+        let ctx = build_bundle(
+            11,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan],
+            &[],
+        )
+        .expect("bundle");
         let ix = &ctx.instructions[0];
         let memo_pos = ix
             .accounts
@@ -1206,8 +1432,18 @@ mod tests {
         };
 
         let payer = Pubkey::new_unique();
-        let ctx =
-            build_bundle(13, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let token_atas = HashMap::new();
+        let ctx = build_bundle(
+            13,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan],
+            &[],
+        )
+        .expect("bundle");
         let memo_count = ctx.instructions[0]
             .accounts
             .iter()
@@ -1256,8 +1492,18 @@ mod tests {
         };
 
         let payer = Pubkey::new_unique();
-        let ctx =
-            build_bundle(21, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let token_atas = HashMap::new();
+        let ctx = build_bundle(
+            21,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan],
+            &[],
+        )
+        .expect("bundle");
         let encoded = u64::from_le_bytes(ctx.instructions[0].data[..8].try_into().unwrap());
         let tolerance = u64::from(DEFAULT_SLIPPAGE_TOLERANCE_BPS);
         let slip = expected_output_amount
@@ -1306,8 +1552,18 @@ mod tests {
         };
 
         let payer = Pubkey::new_unique();
-        let ctx =
-            build_bundle(23, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let token_atas = HashMap::new();
+        let ctx = build_bundle(
+            23,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan],
+            &[],
+        )
+        .expect("bundle");
         let encoded = u64::from_le_bytes(ctx.instructions[0].data[..8].try_into().unwrap());
         assert_eq!(encoded, explicit_min);
     }
@@ -1346,8 +1602,18 @@ mod tests {
         };
 
         let payer = Pubkey::new_unique();
-        let ctx =
-            build_bundle(17, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let token_atas = HashMap::new();
+        let ctx = build_bundle(
+            17,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan],
+            &[],
+        )
+        .expect("bundle");
         assert_eq!(ctx.instructions[0].accounts[0].pubkey, payer);
     }
 
@@ -1389,8 +1655,18 @@ mod tests {
         };
 
         let payer = Pubkey::new_unique();
-        let ctx =
-            build_bundle(19, payer, &cache, Hash::default(), &[], &[plan], &[]).expect("bundle");
+        let token_atas = HashMap::new();
+        let ctx = build_bundle(
+            19,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan],
+            &[],
+        )
+        .expect("bundle");
         assert_eq!(ctx.instructions[0].accounts[0].pubkey, override_authority);
     }
 
@@ -1436,8 +1712,9 @@ mod tests {
             lookup_table: None,
         };
 
-        let hydrated =
-            hydrate_accounts_for_plan(&cache, &plan, Pubkey::new_unique()).expect("accounts");
+        let token_atas = HashMap::new();
+        let hydrated = hydrate_accounts_for_plan(&cache, &plan, Pubkey::new_unique(), &token_atas)
+            .expect("accounts");
         assert_eq!(hydrated[CP_AMM_HOST_FEE_INDEX].pubkey, host_fee);
         let memo_pos = hydrated
             .iter()
@@ -1497,7 +1774,14 @@ mod tests {
         };
 
         let payer = Pubkey::new_unique();
-        let hydrated = hydrate_accounts_for_plan(&cache, &plan, payer).expect("accounts");
+        let mut token_atas = HashMap::new();
+        let owner_ata0 = Pubkey::new_unique();
+        let owner_ata1 = Pubkey::new_unique();
+        token_atas.insert(pool_accounts.mint0, owner_ata0);
+        token_atas.insert(pool_accounts.mint1, owner_ata1);
+
+        let hydrated =
+            hydrate_accounts_for_plan(&cache, &plan, payer, &token_atas).expect("accounts");
         let payer_idx = find_account_index(specs, "payer");
         assert_eq!(hydrated[payer_idx].pubkey, payer);
 
@@ -1516,8 +1800,6 @@ mod tests {
             pool_accounts.observation_state
         );
 
-        let owner_ata0 = super::derive_associated_token_address(&payer, &pool_accounts.mint0);
-        let owner_ata1 = super::derive_associated_token_address(&payer, &pool_accounts.mint1);
         let input_user_idx = find_account_index(specs, "input_token_account");
         let output_user_idx = find_account_index(specs, "output_token_account");
         assert_eq!(hydrated[input_user_idx].pubkey, owner_ata0);
@@ -1578,14 +1860,17 @@ mod tests {
         };
 
         let fallback_payer = Pubkey::new_unique();
-        let hydrated = hydrate_accounts_for_plan(&cache, &plan, fallback_payer).expect("accounts");
+        let mut token_atas = HashMap::new();
+        let owner_ata0 = Pubkey::new_unique();
+        let owner_ata1 = Pubkey::new_unique();
+        token_atas.insert(pool_accounts.mint0, owner_ata0);
+        token_atas.insert(pool_accounts.mint1, owner_ata1);
+
+        let hydrated = hydrate_accounts_for_plan(&cache, &plan, fallback_payer, &token_atas)
+            .expect("accounts");
         let payer_idx = find_account_index(specs, "payer");
         assert_eq!(hydrated[payer_idx].pubkey, override_payer);
 
-        let owner_ata0 =
-            super::derive_associated_token_address(&override_payer, &pool_accounts.mint0);
-        let owner_ata1 =
-            super::derive_associated_token_address(&override_payer, &pool_accounts.mint1);
         let input_user_idx = find_account_index(specs, "input_token_account");
         let output_user_idx = find_account_index(specs, "output_token_account");
         assert_eq!(hydrated[input_user_idx].pubkey, owner_ata0);
@@ -1647,15 +1932,20 @@ mod tests {
             lookup_table: None,
         };
 
-        let hydrated = hydrate_accounts_for_plan(&cache, &plan, payer).expect("whirlpool accounts");
+        let mut token_atas = HashMap::new();
+        let owner_a = Pubkey::new_unique();
+        let owner_b = Pubkey::new_unique();
+        token_atas.insert(pool_accounts.token_mint_a, owner_a);
+        token_atas.insert(pool_accounts.token_mint_b, owner_b);
+
+        let hydrated = hydrate_accounts_for_plan(&cache, &plan, payer, &token_atas)
+            .expect("whirlpool accounts");
 
         let authority_idx = find_account_index(specs, "tokenAuthority");
         assert_eq!(hydrated[authority_idx].pubkey, payer);
 
         let owner_a_idx = find_account_index(specs, "tokenOwnerAccountA");
         let owner_b_idx = find_account_index(specs, "tokenOwnerAccountB");
-        let owner_a = super::derive_associated_token_address(&payer, &pool_accounts.token_mint_a);
-        let owner_b = super::derive_associated_token_address(&payer, &pool_accounts.token_mint_b);
         assert_eq!(hydrated[owner_a_idx].pubkey, owner_a);
         assert_eq!(hydrated[owner_b_idx].pubkey, owner_b);
 
@@ -1721,6 +2011,7 @@ mod tests {
             template_hash: [0u8; 32],
             alt_handle: None,
             metadata: TemplateMetadata::None,
+            hydrated_at: Instant::now(),
         };
         cache.insert(template);
         program_id
@@ -1759,6 +2050,7 @@ mod tests {
                 account_specs: specs,
                 pool_accounts: Some(pool_accounts),
             },
+            hydrated_at: Instant::now(),
         };
         cache.insert(template);
     }
@@ -1796,6 +2088,7 @@ mod tests {
                 account_specs: specs,
                 pool_accounts: Some(pool_accounts),
             },
+            hydrated_at: Instant::now(),
         };
         cache.insert(template);
     }
