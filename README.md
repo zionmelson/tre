@@ -50,7 +50,7 @@ Environment variables:
 - `ARBITRAGE_CONFIG`: optional path override for `config.json` (defaults to repo root).
 - `RUST_LOG`: set to control tracing verbosity (defaults to `warn,tre-arb-bot=info`).
 - `TRE_ALT_REGISTRY`: optional path override for the persisted ALT registry snapshot. Defaults to `alt_registry.json` in the working directory and allows restarts to reuse existing lookup tables without rebuilding them.
-- `TRE_CORECAST_ADDRESS` / `TRE_CORECAST_AUTHORIZATION`: override `corecast.address` or `corecast.authorization` without editing JSON. Place `$ENV{TRE_CORECAST_AUTHORIZATION}` inside `config.json` or `config.template.json` to reference the variable directly.
+- `TRE_CORECAST_ADDRESS` / `TRE_CORECAST_AUTHORIZATION`: override `corecast.address` or `corecast.authorization` without editing JSON. Place `$ENV{TRE_CORECAST_AUTHORIZATION}` inside `config.json` to reference the variable directly.
 - `TRE_JITO_ENDPOINTS`: comma/line separated list that overrides `jito.endpoints`. Individual URLs can also be specified via `$ENV{...}` tokens.
 - `TRE_JITO_API_TOKEN`, `TRE_JITO_TIP_FLOOR_URL`, `TRE_JITO_TIP_STREAM_URL`, `TRE_JITO_CA_PEM`: override sensitive Jito parameters without storing them on disk.
 - `TRE_BAM_VALIDATOR_CSV`: override the BAM validator CSV path.
@@ -59,7 +59,7 @@ Environment variables:
 - `TRE_DRY_RUN_MODE`: set to `true` to keep the planner hot while discarding bundle submissions (the `--dry-run` script flag toggles this automatically).
 - `alerts.webhook_url`: optional HTTPS endpoint that receives JSON bundle/arbitrage lifecycle events; pair with `alerts.environment` to tag messages by deployment.
 
-Submission tracking knobs live under the `submission` section of `config.json` (or `config.template.json`). You can safely check in the template that only contains `$ENV{VAR}` placeholders for secrets while keeping the real `config.json` ignored (see `.gitignore`). Use the template as the canonical reference in docs and CI.
+Submission tracking knobs live under the `submission` section of `config.json`. Use the checked-in file as the canonical reference, copy it for each deployment, and swap any sensitive values with `$ENV{VAR}` placeholders so secrets stay outside of version control.
 
 ### Docker & CI
 

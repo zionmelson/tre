@@ -18,7 +18,7 @@ pub const SOLEND_FLASH_LOAN_FEE_BPS: u64 = 5; // 0.05% per Solend fee schedule
 pub const FLASH_LOAN_BPS_DENOMINATOR: u64 = 10_000;
 const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN";
+const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
 static DEFAULT_FLASH_LOAN_ALLOWED_PROGRAMS: Lazy<Vec<Pubkey>> = Lazy::new(|| {
     [

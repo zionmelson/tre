@@ -22,7 +22,7 @@ pub use service::{HydrationService, HydrationSnapshot, TemplateReadiness};
 pub use template_cache::{
     AltHandleId, AmmV3Field, AmmV3FieldLayout, AmmV3PoolAccounts, AmmV3TemplateParams, CpAmmField,
     CpAmmFieldLayout, CpAmmTemplateParams, InstructionTemplate, LbClmmField, LbClmmFieldLayout,
-    LbClmmTemplateParams, LifinityField, LifinityFieldLayout, LifinityTemplateParams,
-    TemplateCache, TemplateCacheKey, TemplateCacheStats, TemplateFieldKind, TemplateMetadata,
-    TemplatePatch, TemplateSlice, WhirlpoolField, WhirlpoolFieldLayout, WhirlpoolTemplateParams,
+    LbClmmTemplateParams, TemplateCache, TemplateCacheKey, TemplateCacheStats, TemplateFieldKind,
+    TemplateMetadata, TemplatePatch, TemplateSlice, WhirlpoolField, WhirlpoolFieldLayout,
+    WhirlpoolTemplateParams,
 };

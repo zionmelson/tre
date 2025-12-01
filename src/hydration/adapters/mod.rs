@@ -5,14 +5,12 @@ use crate::hydration::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate}
 mod cp_amm;
 mod hydration;
 mod lb_clmm;
-mod lifinity_v2;
 mod raydium_v3;
 mod whirlpool;
 
 pub use crate::template::TemplateContext;
 pub use cp_amm::{CpAmmAdapter, CpAmmAdapterConfig, CpAmmState};
 pub use lb_clmm::{LbClmmAdapter, LbClmmAdapterConfig, LbClmmState};
-pub use lifinity_v2::{LifinityAdapter, LifinityAdapterConfig, LifinityPoolState};
 pub use raydium_v3::{RaydiumV3Adapter, RaydiumV3AdapterConfig, RaydiumV3State};
 pub use whirlpool::{WhirlpoolAdapter, WhirlpoolAdapterConfig, WhirlpoolState};
 

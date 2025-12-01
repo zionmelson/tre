@@ -7,9 +7,9 @@ use solana_sdk::pubkey::Pubkey;
 use crate::builder::BuilderHandle;
 use crate::config::AppConfig;
 use crate::hydration::adapters::{
-    CpAmmAdapter, CpAmmAdapterConfig, LbClmmAdapter, LbClmmAdapterConfig, LifinityAdapter,
-    LifinityAdapterConfig, ProtocolAdapter, QuoteRequest, QuoteResponse, RaydiumV3Adapter,
-    RaydiumV3AdapterConfig, SwapDirection, WhirlpoolAdapter, WhirlpoolAdapterConfig,
+    CpAmmAdapter, CpAmmAdapterConfig, LbClmmAdapter, LbClmmAdapterConfig, ProtocolAdapter,
+    QuoteRequest, QuoteResponse, RaydiumV3Adapter, RaydiumV3AdapterConfig, SwapDirection,
+    WhirlpoolAdapter, WhirlpoolAdapterConfig,
 };
 use crate::hydration::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate, TradeUpdate};
 
@@ -41,13 +41,6 @@ impl AdapterBook {
             &mut adapters,
             Arc::new(LbClmmAdapter::new(
                 lb_clmm_config(config.as_ref()),
-                Some(builder.clone()),
-            )),
-        );
-        register_adapter(
-            &mut adapters,
-            Arc::new(LifinityAdapter::new(
-                lifinity_config(config.as_ref()),
                 Some(builder.clone()),
             )),
         );
@@ -142,20 +135,6 @@ fn lb_clmm_config(config: &AppConfig) -> LbClmmAdapterConfig {
         adapter_config.hydration_retry_ms = retry_ms.max(1);
     }
     if let Some(util_bps) = config.protocol_max_utilization_bps("lb_clmm") {
-        adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
-    }
-    adapter_config
-}
-
-fn lifinity_config(config: &AppConfig) -> LifinityAdapterConfig {
-    let mut adapter_config = LifinityAdapterConfig {
-        rpc_endpoints: config.protocol_rpc_endpoints("lifinity_v2"),
-        ..Default::default()
-    };
-    if let Some(retry_ms) = config.protocol_hydration_retry_ms("lifinity_v2") {
-        adapter_config.hydration_retry_ms = retry_ms.max(1);
-    }
-    if let Some(util_bps) = config.protocol_max_utilization_bps("lifinity_v2") {
         adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
     }
     adapter_config

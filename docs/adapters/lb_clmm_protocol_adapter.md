@@ -1,180 +1,92 @@
-# lb_clmm Protocol Adapter Design
+# Meteora lb_clmm Protocol Adapter
 
-## Goals & Scope
+This note documents how our lb_clmm adapter mirrors Meteora’s dynamic liquidity-bin market maker. Keep it synced with the upstream references below plus `docs/swaps/lb_clmm_swap.md` for account layouts.
 
-- Deliver a production-ready implementation of the shared `ProtocolAdapter` trait for the `lb_clmm` liquidity-bin CLMM program (`LBUZ…Pwxo`, IDL v0.10.1) documented in `docs/swaps/lb_clmm_swap.md`.
-- Normalize CoreCast-derived pool state (bin configs, vault balances, oracle state, dynamic fee params) so the fast execution lane quotes against protocol-agnostic math.
-- Emit deterministic `SwapTemplate` payloads for `swap`, `swap2`, `swap_exact_out*`, and `swap_with_price_impact*` inside the hydration lane so bundling requires no lb_clmm-specific knowledge.
-- Provide adapter-level validation, risk flags, and telemetry so strategies can filter quotes that violate bin-range, activation, or price-impact constraints.
+## Upstream References (GitHub)
 
-## Responsibilities
+| Component                                                     | Purpose                                                                                                               | Link                                                                                 |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `commons/src/math/price_math.rs`                              | `get_price_from_id` and SCALE math that convert bin ids/bin step into Q64.64 prices                                   | <https://github.com/MeteoraAg/dlmm-sdk/blob/main/commons/src/math/price_math.rs>     |
+| `commons/src/math/u64x64_math.rs`                             | Fixed-point exponentiation (`pow`) and rounding bounds that gate bin id ranges                                        | <https://github.com/MeteoraAg/dlmm-sdk/blob/main/commons/src/math/u64x64_math.rs>    |
+| `commons/src/math/utils.rs` & `u128x128_math.rs`              | `safe_*` helpers plus 256-bit mul/div kernels used by bin math and fee calculations                                   | <https://github.com/MeteoraAg/dlmm-sdk/tree/main/commons/src/math>                   |
+| `commons/src/extensions/lb_pair.rs`                           | `LbPairExtension` trait covering volatility updates, fee computation, token program resolution, and bitmap navigation | <https://github.com/MeteoraAg/dlmm-sdk/blob/main/commons/src/extensions/lb_pair.rs>  |
+| `commons/src/extensions/bin.rs`                               | `BinExtension::swap`, price caching, and host-fee splitting logic per bin                                             | <https://github.com/MeteoraAg/dlmm-sdk/blob/main/commons/src/extensions/bin.rs>      |
+| `commons/src/extensions/bin_array.rs` & `bin_array_bitmap.rs` | Helpers for mapping bin ids to PDAs plus bitmap scans for liquidity discovery                                         | <https://github.com/MeteoraAg/dlmm-sdk/tree/main/commons/src/extensions>             |
+| `commons/src/extensions/position.rs`                          | Range lookups for liquidity chunks; informs hydration of which bin arrays to cache                                    | <https://github.com/MeteoraAg/dlmm-sdk/blob/main/commons/src/extensions/position.rs> |
+| `commons/src/conversions/*.rs`                                | `PairStatus`, `PairType`, `ActivationType`, and token-program flag decoding mirrored inside adapter validation        | <https://github.com/MeteoraAg/dlmm-sdk/tree/main/commons/src/conversions>            |
 
-1. **State ingestion** – Parse CoreCast `PoolLiquidityChangeStreamMessage` extras (bin step, active bin id, reserves, oracle window, volatility, fee config) into an `LbClmmState` cache keyed by pool `Pubkey`.
-2. **Static hydration** – Backfill immutable metadata (token mints/programs, reserve vault PDAs, bin array PDAs, host-fee settings) from `idls/pools/lb_clmm.json` or a one-time RPC fetch the first time we see a pool.
-3. **Pricing** – Offer `quote_exact_in`/`quote_exact_out` solvers that walk bins, apply fee tiers & volatility adjustments, and enforce guardrails (`min_amount_out`, `max_price_impact_bps`).
-4. **Instruction templating** – Produce `SwapTemplate` structs that target the correct instruction variant (`swap`, `swap2`, `swap_exact_out`, `swap_with_price_impact`, plus their `*2` hook-aware forms) with ordered account metas, bin-array/bitmap extension wiring, oracle mutability, and serialized args.
-5. **Validation & telemetry** – Mark quotes with adapter-specific statuses (`PreActivation`, `PoolDisabled`, `InsufficientBins`, `VolatilityClamp`, etc.) and emit structured metrics for stale state, hook misconfigurations, or repeated error codes (6003/6042/6077).
+Any upstream change across those modules should be mirrored here and in the hydration/pricing code paths that depend on them.
 
-## Inputs & Data Sources
+## Adapter Goals & Scope
 
-- **CoreCast stream** (`bitquery/solana/token_block_message.proto`) for per-slot updates on reserves, bin bitmaps, oracle observations, and volatility-derived fee multipliers.
-- **lb_clmm IDL** (`idls/pools/lb_clmm.json`) for authoritative layouts (`LbPair`, `BinArray`, `Oracle`, `SwapParameters`, `RemainingAccountsInfo`).
-- **Swap reference** (`docs/swaps/lb_clmm_swap.md`) for account ordering, optional accounts, memo + transfer-hook behavior, host-fee rules, and error catalog.
-- **Config overrides** (`config.json`) for adapter tuning (bin TTL, oracle horizon, compute-budget overrides, host-fee toggles).
-- **Runtime RPC client** (shared by hydration + fast execution lanes) for lazy hydration of bin arrays or verifying Token-2022 hook metadata.
+1. Quote lb_clmm pools exactly like `LbPairExtension::swap` would, including variable fee adjustments, host/referral fee distribution, and bitmap-assisted bin traversal.
+2. Emit deterministic `SwapTemplate` payloads for all supported instructions (`swap2`, `swap_with_price_impact2`, `swap_exact_out2`) so fast execution never re-derives PDAs or account order.
+3. Surface adapter-specific health signals (`PreActivation`, `VolatilityClamp`, `InsufficientBins`, `MissingBitmapExtension`) plus structured telemetry for state freshness and template composition.
 
-## API Shape
+## Data Inputs & Cached State
 
-We keep the shared trait but add lb_clmm-specific data structures:
+| Field                                                                   | Source                                                                             | Notes                                                                                               |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Vault balances, bin liquidity deltas, active bin id                     | CoreCast `PoolLiquidityChangeStreamMessage` extras                                 | Ingested via `extensions.lb_clmm` payload, hydrated into `BinSnapshotRing`.                         |
+| `LbPair` parameters (fees, volatility refs, bin step, activation flags) | Cached on-chain account fetched lazily, schema from `idls/pools/lb_clmm.json`      | Provide base/variable fee math mirroring `LbPairExtension`.                                         |
+| `BinArray`/`BinArrayBitmapExtension` PDAs                               | Derived using `extensions/bin_array.rs` + `bin_array_bitmap.rs` helpers            | Needed for swaps that span multiple bin arrays or require bitmap extension (pool width > 512 bins). |
+| Oracle window                                                           | CoreCast extras, fallback to `Oracle` account via RPC                              | Drives volatility accumulator + guardrails for stale data.                                          |
+| Token program flags + host fee ATA                                      | Stored in `LbClmmState.pool_meta` (mint + program IDs + optional host fee account) | Uses `TokenProgramFlagWrapper` conversions to decide SPL vs Token-2022.                             |
 
-```rust
-pub struct LbClmmAdapter {
-    state: DashMap<Pubkey, LbClmmState>,
-    config: LbClmmAdapterConfig,
-    rpc: Arc<RpcClient>,
-}
+`LbClmmState` keeps a snapshot of those items plus timestamps (`last_update_slot`, `last_oracle_slot`). TTL and freshness thresholds come from `LbClmmAdapterConfig` (e.g., `max_state_age_slots`, `max_oracle_lag_slots`, `max_bin_walk`, `price_impact_floor_bps`).
 
-pub struct LbClmmState {
-    lb_pair: Pubkey,
-    token_x_mint: Pubkey,
-    token_y_mint: Pubkey,
-    token_x_program: Pubkey,
-    token_y_program: Pubkey,
-    reserve_x: Pubkey,
-    reserve_y: Pubkey,
-    bin_step: u16,
-    active_bin_id: i32,
-    bin_liquidity: BinSnapshotRing,
-    oracle: OracleWindow,
-    dynamic_fee_bps: u16,
-    protocol_fee_bps: u16,
-    host_fee_enabled: bool,
-    last_update_slot: u64,
-    requires_bitmap_extension: bool,
-}
-```
+## Core On-Chain Extensions
 
-`LbClmmAdapterConfig` will expose:
+- `LbPairExtension` (`extensions/lb_pair.rs`) exposes fee math (`compute_fee`, `compute_protocol_fee`, `compute_variable_fee`), volatility updates (`update_references`, `update_volatility_accumulator`), bitmap navigation (`next_bin_array_index_with_liquidity_internal`), and token-program decoding. The adapter mirrors these methods to avoid drift; any future change in that trait must be ported.
+- `BinExtension` (`extensions/bin.rs`) encapsulates per-bin swap math, including host-fee splitting and safe mul/div operations. Our simulator must call the same flow: cache bin price via `get_or_store_bin_price`, respect `max_amount_out`, then call `Bin::swap` with host-fee basis points pulled from state.
+- `BinArrayExtension` and `BinArrayBitmapExtExtension` provide PDA derivations plus bitmap scans; we rely on them when building template remaining accounts or when the cached ring buffer misses a bin that the swap path requires.
+- `PositionExtension` is primarily used during hydration to backfill bin arrays for new pools or after TTL expiry; it informs how many arrays to fetch given a `(lower_bin_id, upper_bin_id)` range.
 
-- `max_state_age_slots`
-- `max_oracle_lag_slots`
-- `price_impact_floor_bps`
-- `max_bin_walk` (limit to avoid expensive traversals)
-- host fee behavior toggles (`enable_host_fee_accounts`, `host_fee_min_size`)
+## Math Building Blocks (commons/src/math)
 
-## State Management Plan
+- `price_math.rs::get_price_from_id` converts bin ids + bin step into Q64.64 prices. We cache those results per bin to avoid recomputation.
+- `u64x64_math.rs::pow` defines the exponential limits; its `MAX_EXPONENTIAL` guard is why we cap bin traversal ranges and reject quotes when a request spans beyond the supported exponent window.
+- `u128x128_math.rs` plus `utils.rs` provide `mul_div`, `mul_shr`, `shl_div`, and the `safe_*` wrappers used heavily inside `Bin::swap`. Our pricing code sticks to those helpers (or reuses identical Rust equivalents) so rounding/overflow behavior matches on-chain outcomes bit-for-bit.
 
-- **CoreCast ingestion**: Extend the hydration-lane parser to emit lb_clmm-specific payloads (bin deltas, oracle sample, dynamic fee scalars, pool flags). The adapter subscribes via `ingest_pool_update` and merges deltas into `BinSnapshotRing` (ringbuffer keyed by bin id).
-- **Lazy hydration**: On first sight of a pool or whenever bin arrays fall out-of-sync, fetch `LbPair`, `BinArray` (active +- guard range), and `Oracle` accounts via RPC. Cache static PDAs + Token Program IDs so quoting remains lock-free.
-- **Bitmap extension handling**: Track when `bin_array_bitmap_extension` is required (pool spans >512 bins) and cache the PDA to avoid deriving during every template build.
-- **TTL & invalidation**: Evict or mark state as `StaleState` when `slot - last_update_slot > config.max_state_age_slots`, or when `oracle.exponent` drifts beyond `max_oracle_lag_slots`.
-- **Concurrency**: Use `DashMap` for pool-level shards and let pricing functions grab immutable snapshots (Arc clones) to keep fast execution latency low.
+## Pricing Architecture
 
-## Pricing & Bin Walk Logic
-
-1. **Direction resolution** – Determine swap direction via `QuoteRequest.sell_mint == token_x_mint`. Swap direction dictates whether we traverse bins upward or downward from `active_bin_id`.
-2. **Bin traversal** – Walk bins using cached `BinSnapshotRing`, consuming liquidity per bin until `amount_in` exhausted (ExactIn) or target output satisfied (ExactOut). Skip empty bins quickly by checking liquidity bitmaps.
-3. **Fee model** – Combine base fee (from `LbPair.fee_parameters`), dynamic fee derived from oracle volatility, and host fee (20% of taker fee when `host_fee_in` present). Apply per-step rounding consistent with on-chain math.
-4. **Oracle guards** – Provide `max_price_impact_bps` enforcement by comparing price before first bin and after last bin. Emit `QuoteResponse::status = PriceImpactExceeded` when guard violated.
-5. **Slippage** – For `ExactIn`, compute `min_amount_out` suggestion; for `ExactOut`, compute `max_amount_in` along the traversal path. Respect user-provided ceilings in the request.
-6. **Partial-fill** – If liquidity exhausts before target satisfied, emit `QuoteResponse::status = InsufficientLiquidity` plus `filled_amount` so strategy can downsize or skip.
-7. **Edge metrics** – Derive execution price vs oracle mid-point and compute `edge_bps`. Use this for fast execution ranking and to flag quotes that rely on stale volatility inputs.
+1. **Direction resolution** – Compare `QuoteRequest.input_mint` against `token_x_mint` cached in state. This maps directly to the `swap_for_y` boolean used by `Bin::swap` and determines whether we decrement or increment `active_bin_id`.
+2. **Bin discovery** – Start with the `LbPair`’s `bin_array_bitmap` (from CoreCast) to jump to the next non-empty bin. If liquidity is missing or the trade requires bins beyond our cached window, request fresh `BinArray` accounts using the offsets provided by `BinArrayExtension::bin_id_to_bin_array_key`.
+3. **Per-bin execution** – For each bin, call the simulated `Bin::swap` to compute `amount_out`, `fee`, `protocol_fee`, and optional host fee. Respect `max_bin_walk` so we do not traverse unbounded ranges.
+4. **Fees** – Combine `LbPairExtension::get_base_fee()` and `get_variable_fee()` (which depends on `volatility_accumulator`) and apply host-fee overrides when `host_fee_in` is configured. Variable fee clamps must be mirrored from upstream to avoid quoting trades that on-chain would reject via `MAX_FEE_RATE`.
+5. **Guards** – Enforce `max_price_impact_bps` by comparing the execution price after bin walk with the pre-trade price computed via `price_math::get_price_from_id(active_bin_id, bin_step)`. If impact exceeds config, mark status `PriceImpactExceeded`.
+6. **Partial fills & insufficiency** – If the simulator runs out of bins (`next_bin_array_index_with_liquidity_internal` returns empty) before satisfying the request, set `QuoteResponse.status = InsufficientBins` and surface the filled amount. Strategies can downsize or refresh after hydration fetches more arrays.
 
 ## Swap Template Generation
 
-- **Instruction selection**:
-  - Default to `swap_with_price_impact2` when a request supplies `max_price_impact_bps` or when either mint uses Token-2022 hooks.
-  - Downgrade to `swap2` for vanilla exact-in trades without price guards but still requiring hook plumbing.
-- Offer `swap_exact_out` / `swap_exact_out2` for fast execution requests flagged as exact-out; adapter rejects unsupported modes early.
-- **Accounts**: Follow the canonical order from `docs/swaps/lb_clmm_swap.md`:
-  1. `lb_pair`
-  2. Optional `bin_array_bitmap_extension`
-  3. `reserve_x`, `reserve_y`
-  4. `user_token_in`, `user_token_out`
-  5. `token_x_mint`, `token_y_mint`
-  6. `oracle`
-  7. Optional `host_fee_in`
-  8. `user` signer
-  9. `token_x_program`, `token_y_program`
-  10. Optional `memo_program`
-  11. `event_authority`, `program`
-- **Remaining accounts**: Build `RemainingAccountsInfo` slices when Token-2022 transfer hooks or reward hooks are required. The adapter inspects mint metadata (cached) to determine hook types.
-- **Arguments**: Serialize the appropriate struct (`Swap`, `Swap2`, `SwapExactOut`, etc.) and embed computed guardrails (amounts, `active_id`, `max_price_impact_bps`).
-- **Compute budget hints**: Annotate `SwapTemplate` with recommended CU target (e.g., 300k when wide bin walks expected) so the fast execution lane can prepend compute budget instructions.
+- Always target the `swap2` discriminant family (plain, `swap_with_price_impact2`, `swap_exact_out2`) so we align with Meteora’s latest telemetry pipeline.
+- Account ordering follows `docs/swaps/lb_clmm_swap.md` exactly. Include the optional `bin_array_bitmap_extension` PDA when the pair spans >512 bins (check `LbPairExtension::is_overflow_default_bin_array_bitmap`).
+- Token program IDs (`spl_token::ID` vs `spl_token_2022::ID`) come straight from `TokenProgramFlagWrapper`; template builders must use those rather than inferring from mint decimals.
+- Remaining accounts: assemble `BinArray` PDAs covering the highest/lowest bin touched, append oracle account, optional host-fee ATA, memo program, and any Token-2022 transfer-hook accounts that the hydration cache marked as required.
+- Arguments (`SwapParameters`, `SwapExactOutParams`, etc.) should include the `active_id`, `max_price_impact_bps`, and the computed guardrails our simulator derived. We also attach a compute-budget recommendation (300k–500k CU range) when the bin walk crosses many arrays or when Token-2022 hooks are active.
 
-## Validation & Telemetry
+## Validation & Telemetry Hooks
 
-- `QuoteStatus::PreActivation` – pool not yet activated or caller not whitelisted.
-- `QuoteStatus::PoolDisabled` – `LbPair` flagged disabled.
-- `QuoteStatus::StaleState` – state older than TTL or oracle lagging.
-- `QuoteStatus::InsufficientBins` – requested trade exhausts cached bin window; triggers background task to refresh bin arrays.
-- `QuoteStatus::VolatilityClamp` – dynamic fee > configured ceiling; optionally skip quoting.
-- Log metrics:
-  - `lb_clmm.state_refresh_latency`
-  - `lb_clmm.quote.bin_walk_bins`
-  - `lb_clmm.swap_template.hook_account_count`
-  - `lb_clmm.rejection.code` (surface 6003/6042/6077 counts)
+- `PairStatus` / `PairType` / `ActivationType` conversions: reuse the logic in `commons/src/conversions` to decide whether a pool is tradable (`PairStatus::Enabled`) and whether activation is slot- or timestamp-gated. Quotes for disabled or pre-activation pools should immediately return `QuoteStatus::PreActivation`.
+- `TokenProgramFlags` inform whether memo + remaining accounts are required for transfer fees; missing hooks should return `QuoteStatus::MissingAccounts` to avoid on-chain failures.
+- Staleness: mark `QuoteStatus::StaleState` when either `slot - last_update_slot > config.max_state_age_slots` or `slot - last_oracle_slot > max_oracle_lag_slots`.
+- Bin coverage: when bin traversal hits an uncached segment or `BinArrayBitmapExtExtension::next_bin_array_index_with_liquidity` returns `(idx, false)`, emit `InsufficientBins` and trigger a hydration refresh.
+- Telemetry fields: `pool`, `slot`, `swap_mode`, `bin_walk`, `dynamic_fee_bps`, `host_fee_applied`, `bitmap_extension_used`, plus rejection counters grouped by on-chain error (6003 missing accounts, 6042 insufficient liquidity, 6077 stale state).
 
-## Integration Plan
+## Integration / Testing Checklist
 
-1. **Schema extensions (Hydration lane)**
+1. **State plumbing** – Extend CoreCast schema and ingestion to carry `bin_step`, bitmap slices, oracle payload, and volatility parameters. Add fixtures under `tests/fixtures/lb_clmm/` mirroring `LbPairExtension` JSON dumps.
+2. **Adapter coverage** – Unit-test `quote_exact_in`, `quote_exact_out`, and `quote_with_price_impact` against golden swaps produced by running the upstream SDK (call into `BinExtension::swap` with recorded bins).
+3. **Template smoke tests** – Use `solana-test-validator` + real lb_clmm program to execute adapter-generated templates across SPL/SPL, SPL/Token-2022, host-fee enabled, and bitmap-extension pools.
+4. **Bitmap regression** – Add tests that cross the default 512-bin boundary to ensure `bin_array_bitmap_extension` accounts are inserted whenever `LbPairExtension::is_overflow_default_bin_array_bitmap` says so.
+5. **Oracle/fee drift** – Replay captured oracle updates and verify our volatility accumulator outputs match upstream `update_references`/`update_volatility_accumulator` behavior; alert when drift exceeds 1 bps.
 
-   - Update CoreCast proto parsing to include lb_clmm-specific fields (bin deltas, oracle payload, fee params).
-   - Add unit tests covering new prost conversions.
+## Known Gaps / TODOs
 
-2. **Adapter skeleton (Fast execution integration)**
+- Model Meteora’s activation handlers fully (slot vs timestamp) so we can predict activation without trial swaps.
+- Persist `next_bin_refresh_slot` per pool to avoid spamming RPC when we already know a refresh is pending.
+- Explore caching precalculated bin prices for hot pools to reduce Q64.64 math overhead under load.
+- Add automated alerts when `BinArrayBitmapExtExtension` indicates liquidity holes that exceed `max_bin_walk`, since those pools may require manual intervention or config tuning.
+- Document compute budget heuristics in `docs/architecture.md` once we stabilize CU estimates for bitmap-heavy swaps.
 
-   - Introduce `LbClmmAdapter` struct + trait impl stubs returning `None`.
-   - Wire adapter registration in the hydration ingest map and fast execution quote router keyed by program id `LBUZ…Pwxo`.
-
-3. **State cache & hydration**
-
-   - Implement `ingest_pool_update` logic, TTL eviction, and lazy RPC fetches for bin arrays / oracle accounts.
-   - Add integration tests that feed fixture CoreCast updates and assert state snapshots.
-
-4. **Pricing engine**
-
-   - Build `lb_clmm_math.rs` with bin-walk solvers (exact-in/out) + helpers for dynamic fee application.
-   - Cross-validate results against recorded on-chain swaps (fixtures from `docs/swaps/lb_clmm_swap.md` examples or captured txs).
-
-5. **Template builder**
-
-   - Encode all swap instruction variants via Anchor-generated account structs or manual Borsh serialization.
-   - Unit-test account ordering + remaining-accounts slices; run `solana-test-validator` sims to ensure instructions pass.
-
-6. **Lane wiring (fast execution)**
-
-   - Ensure the fast execution lane uses new templates to bundle transactions and respects adapter-provided guardrails (price impact, slippage, host fee address inclusion).
-   - Update notifier paths for adapter telemetry.
-
-7. **Docs & rollout**
-   - Update `docs/architecture.md` and `docs/swaps/lb_clmm_swap.md` references to note adapter availability.
-   - Provide playbook for enabling pools (config toggles, monitoring dashboards).
-
-## Testing & Tooling
-
-- **Unit tests** – Pricing math, fee application, and bin traversal with deterministic fixtures spanning: narrow-bin pools, pools requiring bitmap extension, Token-2022 hooks.
-- **Golden fixtures** – Capture CoreCast payload + expected quotes for at least three pools (SPL/SPL, SPL/Token-2022, host-fee enabled). Use them in CI to guard against regressions.
-- **Simulation harness** – Extend `runtime::simulate_swap` or add a new `tests/lb_clmm_swaps.rs` that executes adapter-generated `SwapTemplate`s on `solana-test-validator`.
-- **Property tests** – Ensure bin traversal preserves invariants (liquidity never negative, price monotonic across bin walk) and that `ExactOut` solver never returns more than `max_in`.
-- **Load tests** – Replay a day of CoreCast data to benchmark cache churn, bin-walk cost, and telemetry volume.
-
-## Risks & Open Questions
-
-1. **Bin array coverage** – CoreCast may not stream every bin touched by a large trade. Need fallback RPC fetch + caching policy; otherwise quotes may underestimate price impact.
-2. **Dynamic fee accuracy** – On-chain fees depend on oracle observations we might not have yet; consider lag compensation or requiring a fresh oracle snapshot before quoting.
-3. **Transfer-hook permutations** – Pools pairing Token-2022 mints with reward hooks increase remaining-account complexity; adapter must gracefully handle missing metadata without panicking.
-4. **Activation windows** – Pools can be pre-activation or temporarily disabled. Decide whether adapter proactively polls `LbPair` flags or waits for error feedback.
-5. **Compute limits** – Wide bin walks and hook-heavy swaps can exceed default CU. Adapter should surface estimated CU + optionally emit compute-budget instructions.
-6. **Telemetry volume** – Bin-level metrics can explode; throttle or aggregate to avoid overwhelming observability sinks.
-
-## Delivery Checklist
-
-- [ ] CoreCast schema + parser updated with lb_clmm fields.
-- [ ] `LbClmmAdapter` scaffolding merged with feature flag off by default.
-- [ ] State cache hydrated via fixtures + RPC fallback.
-- [ ] Exact-in/out pricing validated against on-chain txs.
-- [ ] Swap template builder passes `solana-test-validator` sims for all four instruction variants.
-- [ ] Hydration + fast execution wiring toggled on for canary pools.
-- [ ] Observability dashboards + alerts updated.
-- [ ] Documentation (this file + architecture guide) published.
+Keep this document synchronized with the upstream SDK modules and `docs/swaps/lb_clmm_swap.md`; together they define the lb_clmm adapter contract.

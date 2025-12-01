@@ -12,17 +12,15 @@ use tracing::{debug, warn};
 
 use crate::config::AppConfig;
 use crate::hydration::types::{
-    CpAmmPoolExtras, LbClmmPoolExtras, LifinityPoolExtras, PoolSnapshot, SnapshotFreshness,
-    WhirlpoolPoolExtras, CP_AMM_PROGRAM_ID, LB_CLMM_PROGRAM_ID, LIFINITY_V2_PROGRAM_ID,
-    RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_PROGRAM_ID,
+    CpAmmPoolExtras, LbClmmPoolExtras, PoolSnapshot, SnapshotFreshness, WhirlpoolPoolExtras,
+    CP_AMM_PROGRAM_ID, LB_CLMM_PROGRAM_ID, RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_PROGRAM_ID,
 };
 
 const DEFAULT_RPC_TIMEOUT_MS: u64 = 5_000;
-const PROGRAM_PROTOCOLS: [(&str, &str); 5] = [
+const PROGRAM_PROTOCOLS: [(&str, &str); 4] = [
     (RAYDIUM_V3_PROGRAM_ID, "raydium_v3"),
     (CP_AMM_PROGRAM_ID, "cp_amm"),
     (LB_CLMM_PROGRAM_ID, "lb_clmm"),
-    (LIFINITY_V2_PROGRAM_ID, "lifinity_v2"),
     (WHIRLPOOL_PROGRAM_ID, "whirlpool"),
 ];
 
@@ -31,7 +29,6 @@ enum ProtocolKind {
     RaydiumV3,
     CpAmm,
     LbClmm,
-    Lifinity,
     Whirlpool,
 }
 
@@ -72,7 +69,6 @@ impl RpcRefresher {
             ProtocolKind::RaydiumV3 => refresh_raydium(snapshot, pool),
             ProtocolKind::CpAmm => refresh_cp_amm(snapshot, pool),
             ProtocolKind::LbClmm => refresh_lb_clmm(snapshot, pool),
-            ProtocolKind::Lifinity => refresh_lifinity(snapshot, pool),
             ProtocolKind::Whirlpool => refresh_whirlpool(snapshot, pool),
         }
     }
@@ -83,7 +79,6 @@ fn detect_protocol(program_id: &str) -> Option<ProtocolKind> {
         RAYDIUM_V3_PROGRAM_ID => Some(ProtocolKind::RaydiumV3),
         CP_AMM_PROGRAM_ID => Some(ProtocolKind::CpAmm),
         LB_CLMM_PROGRAM_ID => Some(ProtocolKind::LbClmm),
-        LIFINITY_V2_PROGRAM_ID => Some(ProtocolKind::Lifinity),
         WHIRLPOOL_PROGRAM_ID => Some(ProtocolKind::Whirlpool),
         _ => None,
     }
@@ -171,15 +166,6 @@ fn refresh_lb_clmm(snapshot: &PoolSnapshot, pool: &RpcClientPool) -> Option<Pool
         return None;
     }
 
-    build_snapshot(snapshot, base_amount, quote_amount)
-}
-
-fn refresh_lifinity(snapshot: &PoolSnapshot, pool: &RpcClientPool) -> Option<PoolSnapshot> {
-    let extras: &LifinityPoolExtras = snapshot.extensions.lifinity_v2.as_ref()?;
-    let base_vault = parse_pubkey(extras.token_a_vault.as_deref()?)?;
-    let quote_vault = parse_pubkey(extras.token_b_vault.as_deref()?)?;
-    let base_amount = fetch_token_amount(pool.clients(), &base_vault)?;
-    let quote_amount = fetch_token_amount(pool.clients(), &quote_vault)?;
     build_snapshot(snapshot, base_amount, quote_amount)
 }
 

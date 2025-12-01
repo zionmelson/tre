@@ -53,14 +53,14 @@ sudo mkdir -p /etc/tre-arb-bot /var/lib/tre-arb-bot
 sudo chown -R $USER /etc/tre-arb-bot /var/lib/tre-arb-bot
 ```
 
-- `/etc/tre-arb-bot/config.json` → runtime config (copied from `config.template.json` and left with `$ENV{VAR}` markers)
+- `/etc/tre-arb-bot/config.json` → runtime config (copy the repo's `config.json` and adjust values + `$ENV{VAR}` markers as needed)
 - `/var/lib/tre-arb-bot/alt_registry.json` → persisted ALT cache (initially empty)
 
 ```bash
-cp config.template.json /etc/tre-arb-bot/config.json
+cp config.json /etc/tre-arb-bot/config.json
 ```
 
-Do **not** replace the `$ENV{VAR}` placeholders; the loader will resolve them from environment variables.
+Swap any sensitive literals for `$ENV{VAR}` placeholders so the loader can resolve them from environment variables.
 
 ---
 

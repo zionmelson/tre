@@ -8,9 +8,7 @@ use dashmap::DashMap;
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
 use crate::builder::templates::{AccountSpec, SwapMintRole, SwapTemplateDirection};
-use crate::builder::{
-    CpAmmPoolAccounts, LbClmmPoolAccounts, LifinityPoolAccounts, WhirlpoolPoolAccounts,
-};
+use crate::builder::{CpAmmPoolAccounts, LbClmmPoolAccounts, WhirlpoolPoolAccounts};
 use crate::config::AppConfig;
 
 #[derive(Clone)]
@@ -236,45 +234,6 @@ impl InstructionTemplate {
         }
     }
 
-    pub fn from_lifinity(params: LifinityTemplateParams) -> Self {
-        let LifinityTemplateParams {
-            pool_id,
-            program_id,
-            direction,
-            fee_tier_bps: _fee_tier_bps,
-            discriminator,
-            accounts,
-            data,
-            field_layout,
-            cu_budget,
-            tlv_bytes,
-            template_hash,
-            alt_handle,
-            account_specs,
-            pool_accounts,
-        } = params;
-
-        let patches = field_layout.into_patches();
-
-        Self {
-            key: TemplateCacheKey::new(pool_id, direction),
-            program_id,
-            discriminator,
-            accounts: accounts.into(),
-            data: Arc::new(data),
-            patches: patches.into(),
-            cu_budget,
-            tlv_bytes,
-            template_hash,
-            alt_handle,
-            metadata: TemplateMetadata::Lifinity {
-                account_specs,
-                pool_accounts,
-            },
-            hydrated_at: Instant::now(),
-        }
-    }
-
     pub fn from_whirlpool(params: WhirlpoolTemplateParams) -> Self {
         let WhirlpoolTemplateParams {
             pool_id,
@@ -333,10 +292,6 @@ impl InstructionTemplate {
                 .as_ref()
                 .map(|accounts| accounts.is_populated())
                 .unwrap_or(false),
-            TemplateMetadata::Lifinity { pool_accounts, .. } => pool_accounts
-                .as_ref()
-                .map(|accounts| accounts.is_populated())
-                .unwrap_or(false),
             TemplateMetadata::Whirlpool { pool_accounts, .. } => pool_accounts
                 .as_ref()
                 .map(|accounts| accounts.is_populated())
@@ -359,10 +314,6 @@ pub enum TemplateMetadata {
     LbClmm {
         account_specs: &'static [AccountSpec],
         pool_accounts: Option<LbClmmPoolAccounts>,
-    },
-    Lifinity {
-        account_specs: &'static [AccountSpec],
-        pool_accounts: Option<LifinityPoolAccounts>,
     },
     Whirlpool {
         account_specs: &'static [AccountSpec],
@@ -497,7 +448,6 @@ pub enum TemplateFieldKind {
     AmmV3(AmmV3Field),
     CpAmm(CpAmmField),
     LbClmm(LbClmmField),
-    Lifinity(LifinityField),
     Whirlpool(WhirlpoolField),
     Custom(&'static str),
 }
@@ -521,13 +471,6 @@ pub enum LbClmmField {
     AmountOut,
     LimitPrice,
     PriceImpactLimit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LifinityField {
-    AmountIn,
-    AmountOut,
-    SlotPadding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -645,37 +588,6 @@ impl LbClmmFieldLayout {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct LifinityFieldLayout {
-    pub amount_in: TemplateSlice,
-    pub amount_out: TemplateSlice,
-    pub slot_padding: Option<TemplateSlice>,
-}
-
-impl LifinityFieldLayout {
-    fn into_patches(self) -> Vec<TemplatePatch> {
-        let mut patches = Vec::with_capacity(3);
-        patches.push(TemplatePatch {
-            offset: self.amount_in.offset,
-            length: self.amount_in.length,
-            kind: TemplateFieldKind::Lifinity(LifinityField::AmountIn),
-        });
-        patches.push(TemplatePatch {
-            offset: self.amount_out.offset,
-            length: self.amount_out.length,
-            kind: TemplateFieldKind::Lifinity(LifinityField::AmountOut),
-        });
-        if let Some(slice) = self.slot_padding {
-            patches.push(TemplatePatch {
-                offset: slice.offset,
-                length: slice.length,
-                kind: TemplateFieldKind::Lifinity(LifinityField::SlotPadding),
-            });
-        }
-        patches
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct WhirlpoolFieldLayout {
     pub amount_in: TemplateSlice,
     pub amount_out: TemplateSlice,
@@ -758,24 +670,6 @@ pub struct LbClmmTemplateParams {
     pub alt_handle: Option<AltHandleId>,
     pub account_specs: &'static [AccountSpec],
     pub pool_accounts: Option<LbClmmPoolAccounts>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LifinityTemplateParams {
-    pub pool_id: Pubkey,
-    pub program_id: Pubkey,
-    pub direction: SwapTemplateDirection,
-    pub fee_tier_bps: u16,
-    pub discriminator: [u8; 8],
-    pub accounts: Vec<AccountMeta>,
-    pub data: Vec<u8>,
-    pub field_layout: LifinityFieldLayout,
-    pub cu_budget: u32,
-    pub tlv_bytes: u16,
-    pub template_hash: [u8; 32],
-    pub alt_handle: Option<AltHandleId>,
-    pub account_specs: &'static [AccountSpec],
-    pub pool_accounts: Option<LifinityPoolAccounts>,
 }
 
 #[derive(Debug, Clone)]

@@ -31,9 +31,9 @@ pub use crate::hydration::flash_loan::{
 pub use crate::hydration::template_cache::{
     AltHandleId, AmmV3Field, AmmV3FieldLayout, AmmV3PoolAccounts, AmmV3TemplateParams, CpAmmField,
     CpAmmFieldLayout, CpAmmTemplateParams, InstructionTemplate, LbClmmField, LbClmmFieldLayout,
-    LbClmmTemplateParams, LifinityField, LifinityFieldLayout, LifinityTemplateParams,
-    TemplateCache, TemplateCacheKey, TemplateCacheStats, TemplateFieldKind, TemplateMetadata,
-    TemplatePatch, TemplateSlice, WhirlpoolField, WhirlpoolFieldLayout, WhirlpoolTemplateParams,
+    LbClmmTemplateParams, TemplateCache, TemplateCacheKey, TemplateCacheStats, TemplateFieldKind,
+    TemplateMetadata, TemplatePatch, TemplateSlice, WhirlpoolField, WhirlpoolFieldLayout,
+    WhirlpoolTemplateParams,
 };
 pub use crate::hydration::TemplateReadiness;
 pub use bundle_builder::{BundleBuildContext, BundleInstructionPlan, BundleLookupTablePlan};
@@ -213,18 +213,6 @@ impl BuilderHandle {
         }
     }
 
-    pub fn register_lifinity_pool(&self, mut meta: LifinityPoolMeta) {
-        if meta.alt_handle.is_none() {
-            meta.alt_handle = self
-                .0
-                .alt_manager
-                .ensure_handle(meta.pool_id, &meta.alt_accounts);
-        }
-        if let Err(err) = template_loader::register_lifinity_pool(&self.0.template_cache, &meta) {
-            warn!(error = ?err, pool = %meta.pool_id, fee_bps = meta.fee_tier_bps, "failed to register lifinity templates");
-        }
-    }
-
     pub fn register_whirlpool_pool(&self, mut meta: WhirlpoolPoolMeta) {
         if meta.alt_handle.is_none() {
             meta.alt_handle = self
@@ -399,47 +387,6 @@ pub struct LbClmmPoolMeta {
     pub alt_accounts: Vec<Pubkey>,
     pub alt_handle: Option<AltHandleId>,
     pub accounts: LbClmmPoolAccounts,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LifinityPoolAccounts {
-    pub base_mint: Pubkey,
-    pub quote_mint: Pubkey,
-    pub authority: Option<Pubkey>,
-    pub token_program: Option<Pubkey>,
-    pub token_a_vault: Option<Pubkey>,
-    pub token_b_vault: Option<Pubkey>,
-    pub pool_mint: Option<Pubkey>,
-    pub fee_account: Option<Pubkey>,
-    pub oracle_main: Option<Pubkey>,
-    pub oracle_sub: Option<Pubkey>,
-    pub oracle_pc: Option<Pubkey>,
-}
-
-impl LifinityPoolAccounts {
-    pub fn is_populated(&self) -> bool {
-        const ZERO: Pubkey = Pubkey::new_from_array([0u8; 32]);
-        self.base_mint != ZERO
-            && self.quote_mint != ZERO
-            && self.authority.is_some()
-            && self.token_program.is_some()
-            && self.token_a_vault.is_some()
-            && self.token_b_vault.is_some()
-            && self.pool_mint.is_some()
-            && self.fee_account.is_some()
-            && self.oracle_main.is_some()
-            && self.oracle_sub.is_some()
-            && self.oracle_pc.is_some()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LifinityPoolMeta {
-    pub pool_id: Pubkey,
-    pub fee_tier_bps: u16,
-    pub alt_accounts: Vec<Pubkey>,
-    pub alt_handle: Option<AltHandleId>,
-    pub accounts: LifinityPoolAccounts,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

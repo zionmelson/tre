@@ -32,6 +32,7 @@ const JITO_PROTOS: &[&str] = &[
 ];
 
 const IDL_POOL_DIR: &str = "idls/pools";
+const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=bitquery");
@@ -112,7 +113,6 @@ fn emit_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>>
     emit_amm_v3_swap_templates(out_dir)?;
     emit_cp_amm_swap_templates(out_dir)?;
     emit_lb_clmm_swap_templates(out_dir)?;
-    emit_lifinity_swap_templates(out_dir)?;
     emit_whirlpool_swap_templates(out_dir)?;
     Ok(())
 }
@@ -284,38 +284,9 @@ fn emit_lb_clmm_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn emit_lifinity_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let idl = load_idl("lifinity_amm_v2")?;
-    let program_id = idl
-        .address
-        .as_deref()
-        .ok_or("lifinity idl missing program id")?;
-    let Some(ix) = idl.instructions.iter().find(|ix| ix.name == "swap") else {
-        return Err("missing swap instruction in lifinity idl".into());
-    };
-
-    let accounts = lifinity_accounts_with_pdas(&ix.accounts);
-
-    let mut buffer = String::new();
-    buffer.push_str("pub static LIFINITY_SWAP_TEMPLATES: &[LifinitySwapTemplate] = &[\n");
-
-    for direction in [TemplateDirection::BaseIn, TemplateDirection::BaseOut] {
-        let rendered = render_lifinity_template(ix, &accounts, program_id, direction)?;
-        buffer.push_str(&rendered);
-    }
-
-    buffer.push_str("];\n");
-
-    fs::write(out_dir.join("lifinity_swap_templates.rs"), buffer)?;
-    Ok(())
-}
-
 fn emit_whirlpool_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let idl = load_idl("whirlpool")?;
-    let program_id = idl
-        .address
-        .as_deref()
-        .ok_or("whirlpool idl missing program id")?;
+    let program_id = idl.address.as_deref().unwrap_or(WHIRLPOOL_PROGRAM_ID);
     let Some(ix) = idl.instructions.iter().find(|ix| ix.name == "swap") else {
         return Err("missing swap instruction in whirlpool idl".into());
     };
@@ -334,32 +305,6 @@ fn emit_whirlpool_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::erro
 
     fs::write(out_dir.join("whirlpool_swap_templates.rs"), buffer)?;
     Ok(())
-}
-
-fn lifinity_accounts_with_pdas(accounts: &[IdlAccount]) -> Vec<IdlAccount> {
-    accounts
-        .iter()
-        .map(|account| {
-            let mut cloned = account.clone();
-            if cloned.name == "authority" && cloned.pda.is_none() {
-                cloned.pda = Some(IdlPda {
-                    seeds: vec![
-                        IdlSeed {
-                            kind: "const".to_string(),
-                            value: Some(serde_json::Value::String("authority".to_string())),
-                            path: None,
-                        },
-                        IdlSeed {
-                            kind: "account".to_string(),
-                            path: Some("amm".to_string()),
-                            value: None,
-                        },
-                    ],
-                });
-            }
-            cloned
-        })
-        .collect()
 }
 
 fn whirlpool_accounts_with_pdas(accounts: &[IdlAccount]) -> Vec<IdlAccount> {
@@ -386,42 +331,6 @@ fn whirlpool_accounts_with_pdas(accounts: &[IdlAccount]) -> Vec<IdlAccount> {
             cloned
         })
         .collect()
-}
-
-fn render_lifinity_template(
-    ix: &IdlInstruction,
-    accounts: &[IdlAccount],
-    program_id: &str,
-    direction: TemplateDirection,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut snippet = String::new();
-    writeln!(snippet, "    LifinitySwapTemplate {{")?;
-    writeln!(
-        snippet,
-        "        direction: {},",
-        direction.direction_expr()
-    )?;
-    writeln!(snippet, "        program_id: {},", quote(program_id))?;
-    let discriminator = discriminator_bytes(ix)?;
-    writeln!(
-        snippet,
-        "        discriminator: {disc},",
-        disc = format_bytes(&discriminator)
-    )?;
-    writeln!(snippet, "        accounts: &[")?;
-    for account in accounts {
-        let rendered = render_account(account, direction)?;
-        snippet.push_str(&rendered);
-    }
-    writeln!(snippet, "        ],")?;
-    writeln!(snippet, "        args: &[")?;
-    for arg in &ix.args {
-        let rendered = render_arg(arg, None)?;
-        snippet.push_str(&rendered);
-    }
-    writeln!(snippet, "        ],")?;
-    snippet.push_str("    },\n");
-    Ok(snippet)
 }
 
 fn render_whirlpool_template(

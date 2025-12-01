@@ -15,8 +15,8 @@ use crate::template::TemplateContext;
 
 use super::{
     AmmV3Field, AmmV3PoolAccounts, CpAmmField, CpAmmPoolAccounts, InstructionTemplate, LbClmmField,
-    LbClmmPoolAccounts, LifinityField, LifinityPoolAccounts, TemplateCache, TemplateCacheKey,
-    TemplateFieldKind, TemplateMetadata, TemplatePatch, WhirlpoolField, WhirlpoolPoolAccounts,
+    LbClmmPoolAccounts, TemplateCache, TemplateCacheKey, TemplateFieldKind, TemplateMetadata,
+    TemplatePatch, WhirlpoolField, WhirlpoolPoolAccounts,
 };
 
 static CP_AMM_PROGRAM_ID: Lazy<Pubkey> = Lazy::new(|| {
@@ -229,26 +229,6 @@ fn hydrate_template_accounts(
                 )
             })?;
             hydrate_lb_clmm_accounts(
-                plan,
-                template,
-                payer,
-                token_atas,
-                account_specs,
-                pool_accounts,
-                accounts,
-            )
-        }
-        TemplateMetadata::Lifinity {
-            account_specs,
-            pool_accounts,
-        } => {
-            let pool_accounts = pool_accounts.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "template for pool {} missing Lifinity account metadata",
-                    plan.pool_id
-                )
-            })?;
-            hydrate_lifinity_accounts(
                 plan,
                 template,
                 payer,
@@ -542,112 +522,6 @@ fn hydrate_lb_clmm_accounts(
     Ok(())
 }
 
-fn hydrate_lifinity_accounts(
-    plan: &BundleInstructionPlan,
-    template: &InstructionTemplate,
-    default_payer: Pubkey,
-    token_atas: &HashMap<Pubkey, Pubkey>,
-    specs: &[AccountSpec],
-    pool_accounts: &LifinityPoolAccounts,
-    accounts: &mut [AccountMeta],
-) -> Result<()> {
-    if specs.len() != accounts.len() {
-        bail!(
-            "template account/spec length mismatch ({} != {})",
-            accounts.len(),
-            specs.len()
-        );
-    }
-
-    let user_authority = plan.context.payer.unwrap_or(default_payer);
-    let pool_authority = pool_accounts
-        .authority
-        .ok_or_else(|| anyhow!("template for pool {} missing authority", plan.pool_id))?;
-    let token_program = pool_accounts
-        .token_program
-        .ok_or_else(|| anyhow!("template for pool {} missing token program", plan.pool_id))?;
-    let pool_mint = pool_accounts
-        .pool_mint
-        .ok_or_else(|| anyhow!("template for pool {} missing pool mint", plan.pool_id))?;
-    let fee_account = pool_accounts
-        .fee_account
-        .ok_or_else(|| anyhow!("template for pool {} missing fee account", plan.pool_id))?;
-    let oracle_main = pool_accounts
-        .oracle_main
-        .ok_or_else(|| anyhow!("template for pool {} missing oracle_main", plan.pool_id))?;
-    let oracle_sub = pool_accounts
-        .oracle_sub
-        .ok_or_else(|| anyhow!("template for pool {} missing oracle_sub", plan.pool_id))?;
-    let oracle_pc = pool_accounts
-        .oracle_pc
-        .ok_or_else(|| anyhow!("template for pool {} missing oracle_pc", plan.pool_id))?;
-
-    let (input_mint, output_mint, swap_source, swap_destination) = match plan.direction {
-        SwapTemplateDirection::BaseIn => {
-            let source = pool_accounts.token_a_vault.ok_or_else(|| {
-                anyhow!("template for pool {} missing token_a_vault", plan.pool_id)
-            })?;
-            let dest = pool_accounts.token_b_vault.ok_or_else(|| {
-                anyhow!("template for pool {} missing token_b_vault", plan.pool_id)
-            })?;
-            (
-                pool_accounts.base_mint,
-                pool_accounts.quote_mint,
-                source,
-                dest,
-            )
-        }
-        SwapTemplateDirection::BaseOut => {
-            let source = pool_accounts.token_b_vault.ok_or_else(|| {
-                anyhow!("template for pool {} missing token_b_vault", plan.pool_id)
-            })?;
-            let dest = pool_accounts.token_a_vault.ok_or_else(|| {
-                anyhow!("template for pool {} missing token_a_vault", plan.pool_id)
-            })?;
-            (
-                pool_accounts.quote_mint,
-                pool_accounts.base_mint,
-                source,
-                dest,
-            )
-        }
-    };
-
-    let user_input_account = match plan.context.input_token_account {
-        Some(account) => account,
-        None => config_token_account(token_atas, &input_mint, &plan.pool_id, "lifinity input")?,
-    };
-    let user_output_account = match plan.context.output_token_account {
-        Some(account) => account,
-        None => config_token_account(token_atas, &output_mint, &plan.pool_id, "lifinity output")?,
-    };
-
-    for (meta, spec) in accounts.iter_mut().zip(specs.iter()) {
-        if spec.address.is_some() {
-            continue;
-        }
-
-        match spec.name {
-            "authority" => meta.pubkey = pool_authority,
-            "amm" => meta.pubkey = template.key.pool_id,
-            "userTransferAuthority" => meta.pubkey = user_authority,
-            "sourceInfo" => meta.pubkey = user_input_account,
-            "destinationInfo" => meta.pubkey = user_output_account,
-            "swapSource" => meta.pubkey = swap_source,
-            "swapDestination" => meta.pubkey = swap_destination,
-            "poolMint" => meta.pubkey = pool_mint,
-            "feeAccount" => meta.pubkey = fee_account,
-            "tokenProgram" => meta.pubkey = token_program,
-            "oracleMainAccount" => meta.pubkey = oracle_main,
-            "oracleSubAccount" => meta.pubkey = oracle_sub,
-            "oraclePcAccount" => meta.pubkey = oracle_pc,
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
 fn hydrate_whirlpool_accounts(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
@@ -829,20 +703,7 @@ fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [
                 }
             }
         },
-        TemplateFieldKind::Lifinity(field) => match field {
-            LifinityField::AmountIn => write_u128(plan.amount_in as u128, slice),
-            LifinityField::AmountOut => {
-                let min_out = plan
-                    .min_output_amount
-                    .unwrap_or_else(|| guarded_expected_output(plan));
-                write_u128(min_out as u128, slice)
-            }
-            LifinityField::SlotPadding => {
-                if let Some(slot) = plan.slot_padding {
-                    write_u128(slot as u128, slice);
-                }
-            }
-        },
+
         TemplateFieldKind::Whirlpool(field) => match field {
             WhirlpoolField::AmountIn => write_u128(plan.amount_in as u128, slice),
             WhirlpoolField::AmountOut => {
@@ -999,7 +860,6 @@ fn account_specs_for_template(template: &InstructionTemplate) -> Option<&'static
         TemplateMetadata::AmmV3 { account_specs, .. } => Some(account_specs),
         TemplateMetadata::CpAmm { account_specs, .. } => Some(account_specs),
         TemplateMetadata::LbClmm { account_specs, .. } => Some(account_specs),
-        TemplateMetadata::Lifinity { account_specs, .. } => Some(account_specs),
         TemplateMetadata::Whirlpool { account_specs, .. } => Some(account_specs),
     }
 }

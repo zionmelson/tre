@@ -73,15 +73,6 @@ pub struct LbClmmSwapTemplate {
 }
 
 #[derive(Debug)]
-pub struct LifinitySwapTemplate {
-    pub direction: SwapTemplateDirection,
-    pub program_id: &'static str,
-    pub discriminator: [u8; 8],
-    pub accounts: &'static [AccountSpec],
-    pub args: &'static [ArgSpec],
-}
-
-#[derive(Debug)]
 pub struct WhirlpoolSwapTemplate {
     pub direction: SwapTemplateDirection,
     pub program_id: &'static str,
@@ -99,5 +90,4 @@ pub struct StructSpec {
 include!(concat!(env!("OUT_DIR"), "/amm_v3_swap_templates.rs"));
 include!(concat!(env!("OUT_DIR"), "/cp_amm_swap_templates.rs"));
 include!(concat!(env!("OUT_DIR"), "/lb_clmm_swap_templates.rs"));
-include!(concat!(env!("OUT_DIR"), "/lifinity_swap_templates.rs"));
 include!(concat!(env!("OUT_DIR"), "/whirlpool_swap_templates.rs"));

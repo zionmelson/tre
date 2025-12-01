@@ -558,21 +558,13 @@ pub struct AlertingConfig {
     pub environment: Option<String>,
 }
 
-const KNOWN_PROTOCOLS: &[&str] = &[
-    "raydium_v3",
-    "cp_amm",
-    "lb_clmm",
-    "lifinity_v2",
-    "whirlpool",
-];
+const KNOWN_PROTOCOLS: &[&str] = &["raydium_v3", "cp_amm", "lb_clmm", "whirlpool"];
 
 pub const DEFAULT_PROTOCOL_BORROW_PCT: f64 = 0.35;
 
 fn default_protocol_borrow_pct(protocol: &str) -> f64 {
     match protocol {
-        "raydium_v3" | "cp_amm" | "lb_clmm" | "lifinity_v2" | "whirlpool" => {
-            DEFAULT_PROTOCOL_BORROW_PCT
-        }
+        "raydium_v3" | "cp_amm" | "lb_clmm" | "whirlpool" => DEFAULT_PROTOCOL_BORROW_PCT,
         _ => DEFAULT_PROTOCOL_BORROW_PCT,
     }
 }

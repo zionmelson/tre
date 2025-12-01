@@ -1,134 +1,109 @@
-# cp_amm Protocol Adapter Design
+# Meteora cp_amm Protocol Adapter
 
-## Goals & Scope
+This note documents how our cp_amm adapter mirrors Meteora’s on-chain program. Use it alongside the upstream sources below whenever you touch pricing, templates, or validation logic.
 
-- Ship a purpose-built implementation of the shared `ProtocolAdapter` trait for the `cp_amm` constant-product pools documented in `docs/swaps/cp_amm_swap.md`.
-- Transform CoreCast stream updates + on-chain account fetches into normalized pool state so the fast execution lane’s quoting logic no longer performs protocol-specific math.
-- Generate deterministic `SwapTemplate` payloads targeting the `swap2` instruction (supports `ExactIn`, `PartialFill`, `ExactOut`) inside the hydration lane so the fast execution lane can bundle without re-deriving cp_amm knowledge.
-- Surface adapter-specific validation + telemetry so strategies understand when cp_amm quotes are actionable, stale, or liquidity constrained.
+## Upstream References (GitHub)
 
-## Responsibilities
+| Component              | Purpose                                                                 | Link                                                                                                        |
+| ---------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `swap` module          | Entry points and shared plumbing                                        | <https://github.com/MeteoraAg/damm-v2/tree/main/programs/cp-amm/src/instructions/swap>                      |
+| `ix_swap.rs`           | Account layout, `SwapMode`, referral handling, rate-limiter guard       | <https://github.com/MeteoraAg/damm-v2/blob/main/programs/cp-amm/src/instructions/swap/ix_swap.rs>           |
+| `swap_exact_in.rs`     | Exact-in math and transfer-fee normalization                            | <https://github.com/MeteoraAg/damm-v2/blob/main/programs/cp-amm/src/instructions/swap/swap_exact_in.rs>     |
+| `swap_exact_out.rs`    | Exact-out solver + slippage checks                                      | <https://github.com/MeteoraAg/damm-v2/blob/main/programs/cp-amm/src/instructions/swap/swap_exact_out.rs>    |
+| `swap_partial_fill.rs` | Partial-fill semantics and consumed-amount reporting                    | <https://github.com/MeteoraAg/damm-v2/blob/main/programs/cp-amm/src/instructions/swap/swap_partial_fill.rs> |
+| `swap/mod.rs`          | `ProcessSwapParams`/`ProcessSwapResult` definitions reused by all modes | <https://github.com/MeteoraAg/damm-v2/blob/main/programs/cp-amm/src/instructions/swap/mod.rs>               |
 
-1. **State ingestion** – Parse CoreCast `PoolLiquidityChangeStreamMessage` extras (vault balances, amp/fee config, mint ordering) into a `CpAmmState` cache keyed by `pool_id`, hydrating any missing vault/mint metadata directly from the on-chain `Pool` account via RPC.
-2. **Pool hydration** – Optionally backfill immutable metadata (pool authority, token programs, referral config) from `idls/pools/cp_amm.json` or a lightweight on-chain RPC fetch the first time a pool appears.
-3. **Pricing** – Offer `quote_exact_in` / `quote_exact_out` calculators that run cp_amm XYK math (including amp curve + dual fee schedule) and emit `edge_bps`, `min_out`, `max_in` guidance.
-4. **Instruction templating** – Produce `SwapTemplate` structs for `swap2` with ordered account metas, PDA bumps, serialized `SwapParameters2`, and direction-aware vault wiring.
-5. **Validation & telemetry** – Mark quotes with health enums (`Ok`, `StaleState`, `InsufficientLiquidity`, `RateLimited`) and emit structured metrics when guardrails trigger so we can tune strategy thresholds.
+Any upstream change in those files should be reflected here and in `docs/swaps/cp_amm_swap.md`.
 
-## Inputs & Data Sources
+## Adapter Goals & Scope
 
-- **CoreCast stream** (`bitquery/solana/dex_block_message.proto` + `token_block_message.proto`): supplies per-slot deltas for vault balances, pool amp/fee snapshots, and referral state.
-- **cp_amm IDL** (`idls/pools/cp_amm.json`): authoritative account layouts for `Pool`, `SwapParameters2`, and discriminators.
-- **Swap guide** (`docs/swaps/cp_amm_swap.md`): operational knowledge (account ordering, SwapMode semantics, constant pool authority) used by the template builder.
-- **Config overrides** (`config.json`): optional hints for pools missing CoreCast metadata (mint decimals, referral recipients, token program selection).
+1. Quote Meteora cp*amm pools with the same curve math (`ProcessSwapParams` → `process_swap*\*`) that on-chain `swap2` uses, including transfer-fee adjustments and referral splits.
+2. Produce deterministic `swap2` templates (covering `ExactIn`, `PartialFill`, `ExactOut`) so the fast execution lane never needs to re-derive account order or serialize `SwapParameters2`.
+3. Surface adapter-specific health signals (`RateLimited`, `MissingReferral`, `StaleState`) and structured telemetry so strategies know when to trust cp_amm quotes.
 
-## API Shape
+## Data Inputs & Cached State
 
-We continue to implement the shared trait:
+| Field                                 | Source                                               | Notes                                                           |
+| ------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------- |
+| Vault balances, mints, slot           | CoreCast `PoolLiquidityChangeStreamMessage`          | Parsed via `PoolUpdate::extensions.cp_amm`.                     |
+| Amp curve + dynamic fee data          | CoreCast extras, fallback to on-chain `Pool` account | `CpAmmPoolExtras` in `src/hydration/types/protocols.rs`.        |
+| Token program IDs (SPL vs Token-2022) | RPC fetch per mint                                   | Matches Anchor `InterfaceAccount` requirements in `ix_swap.rs`. |
+| Referral ATA                          | CoreCast metadata or config override                 | Optional account in `SwapCtx`.                                  |
 
-```rust
-pub trait ProtocolAdapter {
-    fn program_id(&self) -> Pubkey;
-    fn supports(&self, program_id: &Pubkey) -> bool;
-    fn ingest_pool_update(&self, update: &PoolUpdate);
-    fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse>;
-    fn quote_exact_out(&self, req: QuoteRequest) -> Option<QuoteResponse>;
-    fn build_swap_template(&self, quote: &QuoteResponse) -> Option<SwapTemplate>;
-}
-```
+`CpAmmState` stores mutable balances + fee params along with a static `PoolMeta` bundle (pool authority `HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC`, vault/mint pubkeys, referral ATA). The cache is backed by a `DashMap<Pubkey, CpAmmState>`; eviction is based on `config.stale_slot_threshold` and `config.stale_after_ms`.
 
-Adapter-specific structs:
+## Instruction Semantics (`swap2`)
 
-```rust
-pub struct CpAmmAdapter {
-    state: DashMap<PoolId, CpAmmState>,
-    config: CpAmmAdapterConfig,
-}
+- `SwapParameters2` encodes two amounts plus a `swap_mode` byte. `amount_0` is `amount_in` for `ExactIn`/`PartialFill`, `amount_out` for `ExactOut`. `amount_1` is `min_out` or `max_in` respectively.
+- `SwapMode` ordering: `ExactIn` = 0, `PartialFill` = 1, `ExactOut` = 2 (see `SwapMode` enum in `ix_swap.rs`).
+- `handle_swap_wrapper` enforces:
+  - Pool access validator (can disable swap per pool).
+  - Single-swap-per-transaction via `validate_single_swap_instruction` (instructions sysvar + sibling inspection). Our templates must include the instructions sysvar when rate limiter is active.
+  - Rate limiter guard derived from `pool.pool_fees.base_fee`. When triggered, the instruction requires `validate_single_swap_instruction` to ensure no batching; our adapter should surface `RateLimited` status if we detect previous failures for the same pool.
+- Referral payouts: if `referral_token_account` is present, `transfer_from_pool` pays `referral_fee` in whichever token the fee mode indicates. Missing referral ATA will cause `requires` failures, so quotes must mark status `MissingAccounts` when the state lacks a referral target for referral-enabled pools.
 
-pub struct CpAmmState {
-    pool: Pubkey,
-    pool_authority: Pubkey,
-    token_a_vault: Pubkey,
-    token_b_vault: Pubkey,
-    token_a_mint: Pubkey,
-    token_b_mint: Pubkey,
-    token_a_program: Pubkey,
-    token_b_program: Pubkey,
-    amp: u64,
-    lp_fee_bps: u16,
-    protocol_fee_bps: u16,
-    referral_bps: u16,
-    vault_a_balance: u128,
-    vault_b_balance: u128,
-    last_update_slot: u64,
-    referral_token_account: Option<Pubkey>,
-}
-```
+## Pricing Architecture
 
-`CpAmmAdapterConfig` will hold TTL parameters, fallback decimals, and referral behavior toggles.
+1. **Direction resolution** – `SwapCtx::get_trade_direction` compares input ATA mint vs `token_a_mint`. The adapter mirrors this by inspecting `QuoteRequest.input_mint` and ordering vaults accordingly.
+2. **Transfer-fee normalization** – All swap modes call `calculate_transfer_fee_excluded_amount`/`included_amount` before/after curve math. Our simulator must do the same for Token-2022 pools so quotes match on-chain behavior.
+3. **Exact-in** (`swap_exact_in.rs`):
 
-## State Management Plan
+- Convert user amount to “fee-excluded” basis, run `Pool::get_swap_result_from_exact_input`, then re-apply token-program transfer fees on the output vault.
+- Enforce `minimum_amount_out` on the fee-excluded output.
 
-- Extend `PoolUpdate` to expose cp_amm-specific extensions (amp curve params, fee schedule, referral account). These fields originate from CoreCast metadata; when absent we lazily fetch the on-chain `Pool` account using the runtime RPC client.
-- Maintain a `DashMap` cache keyed by pool `Pubkey` so fast execution read paths are lock-free.
-- Add TTL eviction (`slot` drift and `Instant` age) plus per-pool dirty flags to avoid quoting from state that predates the latest hydration ingest cycle.
-- Record an `Arc<PoolStaticMeta>` alongside mutable balances so serialization (account metas, token program IDs) is O(1).
+4. **Partial-fill** (`swap_partial_fill.rs`):
 
-## Pricing & Simulation
+- Similar to exact-in but uses `Pool::get_swap_result_from_partial_input` and may consume less than the requested `amount_in`.
+- Report the actually consumed input (`transfer_fee_included_consumed_in_amount`) so the caller can retry with the remainder. Our `QuoteResponse.context.partial_fill_remaining` should expose that delta.
 
-1. **Direction resolution** – Determine whether the strategy is selling `token_a` or `token_b` using mint equality checks against the request. cp_amm does not store canonical direction; we must mirror the caller’s choice.
-2. **Normalize decimals** – Convert user inputs to 128-bit fixed-point amounts to avoid overflow when amp > 1.
-3. **Exact-in solver**:
-   - Start from cached vault balances (adjusted for protocol + referral fees).
-   - Apply cp_amm invariant `xy = const` (or `xy = const + amp` depending on pool config) to solve for output after fees.
-   - Subtract protocol + referral fees, then enforce `minimum_amount_out` guard.
-4. **Exact-out solver** – Rearrange the invariant to solve required input for a target output; bail if exceeding request max or if vault lacks liquidity (`InsufficientLiquidity`).
-5. **Partial-fill heuristic** – For `SwapMode::PartialFill`, cap input by `amount_0`, recompute leftover, and emit `amount_left` inside the quote context so the fast execution lane can decide to retry.
-6. **Edge computation** – Compare quoted execution price vs mid-price derived from vault balances to produce `edge_bps` for prioritization.
-7. **Risk flags** – Track rate-limiter hints (errors 6048/6049) from recent logs and mark quotes as `RateLimited` when we expect rejections.
+5. **Exact-out** (`swap_exact_out.rs`):
 
-## Swap Template Generation
+- Convert desired output to “fee-included” units, run `Pool::get_swap_result_from_exact_output`, then ensure the required input (after adding token-program transfer fees) is ≤ `maximum_amount_in`.
 
-- Default to `swap2` so all SwapMode cases are supported; downgrade to `swap` only when the request is `ExactIn` and the target cluster rejects `SwapMode` (unlikely).
-- Required accounts (in order) follow the table in `docs/swaps/cp_amm_swap.md`:
-  1. `pool_authority` (constant `HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC`).
-  2. `pool`, `input_token_account`, `output_token_account`.
-  3. `token_a_vault`, `token_b_vault`, `token_a_mint`, `token_b_mint` (matching direction).
-  4. `payer`, respective token programs (Token-2022 aware), optional `referral_token_account`, Anchor `event_authority`, cp_amm program ID.
-- `SwapParameters2` serialization uses Borsh; we reuse the generated Anchor struct or encode manually via our codec helpers.
-- Embed instruction context (payer signer, compute budget suggestions, expected fee) in `SwapTemplate::context` so the fast execution planner knows how to bundle.
+6. **Fees** – `FeeMode::get_fee_mode` selects protocol/LP/referral fee configuration per direction. `Pool::apply_swap_result` mutates reserves; our adapter mirrors this in simulation so `vault_a/b_balance` stay aligned.
+7. **Edge calculation** – Mid-price = `vault_b / vault_a` (direction-aware). Compare to execution price to populate `edge_bps`.
+
+## Template Generation
+
+1. Always target `swap2` (discriminator from Anchor IDL) because it covers all swap modes and emits `EvtSwap2` telemetry.
+2. Required accounts (exact order from `SwapCtx`):
+
+- `pool_authority` (constant PDA), `pool` (writable), user `input_token_account`, user `output_token_account`.
+- `token_a_vault`, `token_b_vault`, `token_a_mint`, `token_b_mint` (Anchor constraints tie vault ↔ mint ↔ token program).
+- `payer` signer, `token_a_program`, `token_b_program`, optional `referral_token_account` (writable), plus event authority + cp_amm program ID appended by Anchor.
+
+3. Include `instructions` sysvar and `access_validator` PDA only when the on-chain accounts expect them (rate limiter or activation states). Verify via `docs/swaps/cp_amm_swap.md`.
+4. Serialize `SwapParameters2` via Anchor’s struct or manual Borsh, ensuring `swap_mode` matches the requested direction.
+5. Template context should include:
+
+- Suggested compute budget (cp_amm swaps with high amp often need > 50k CU).
+- `expected_fee_tokens` (protocol/referral sum) for downstream accounting.
+- `partial_fill_expected_remaining` for `SwapMode::PartialFill`.
 
 ## Validation & Telemetry
 
-- `QuoteResponse::status` enumerations:
-  - `Ok` – fresh state and solvable trade.
-  - `StaleState` – last update slot older than threshold.
-  - `InsufficientLiquidity` – vault cannot satisfy request.
-  - `RateLimited` – last attempt failed with limiter error, wait for cooldown.
-  - `MissingAccounts` – we lack referral ATA or token program hints.
-- Attach structured fields: `slots_stale`, `vault_balance_diff`, `fee_bps_applied`, `amount_left`, `expected_compute_units`.
-- Emit metrics via `notifier` when we drop CoreCast updates or when quoting falls back to generic XYK math without amp data.
+- `QuoteResponse::status` values:
+  - `Ok` – simulation succeeded and template assembled.
+  - `StaleState` – state older than TTL.
+  - `InsufficientLiquidity` – simulator detected vault shortfall or amp math failure.
+  - `MissingReferral` – referral ATA required but absent.
+  - `RateLimited` – recent swap failure logged with `PoolError::FailToValidateSingleSwapInstruction` or limiter triggered.
+- Emit tracing fields: `pool`, `slot`, `swap_mode`, `amount_in/out`, `fee_mode`, `referral_fee`, `rate_limiter_applied`.
+- Count XYK fallback events separately (should never happen if hydration is healthy since cp_amm math is simple enough to keep in-process).
 
-## Integration Plan
+## Integration / Testing Checklist
 
-1. **Schema updates** – Augment `PoolUpdate` + CoreCast parser with cp_amm metadata fields; add quick unit tests in `src/proto.rs`.
-2. **Adapter skeleton** – Introduce `CpAmmAdapter` in `src/strategy.rs` (or dedicated module) with trait stubs returning `None`.
-3. **State cache & hydration** – Implement `ingest_pool_update` + lazy RPC fetch for missing metadata; write tests using fixture `cp_amm_pool.json`.
-4. **Pricing engine** – Port invariant math into a dedicated `cp_amm_math.rs`; cover `ExactIn`, `ExactOut`, and `PartialFill` via proptests fed by IDL-based fixtures.
-5. **Template builder** – Encode `swap2` instruction using our `proto::accounts::Swap2` helper; integration-test against a local validator or RPC simulation harness.
-6. **Lane wiring** – Register the adapter inside the hydration lane ingestion map, feed its normalized quotes to the fast execution aggregator, and ensure submission policies consume the emitted templates end-to-end.
-7. **Observability** – Add tracing spans + metrics counters; update `docs/architecture.md` with adapter references.
+1. **State plumbing** – Ensure `PoolUpdate.extensions.cp_amm` includes amp + fee data; add fixtures under `tests/fixtures/cp_amm/`.
+2. **Adapter coverage** – Unit-test `CpAmmAdapter::quote_exact_in/out/partial` against recorded swap logs pulled from Meteora pools.
+3. **Template smoke tests** – Use `solana-test-validator` to invoke `swap2` with our generated account metas (cover SPL/SPL and SPL/Token-2022 pairs, plus referral vs non-referral cases).
+4. **Rate limiter regression** – Simulate rapid swaps to trigger `validate_single_swap_instruction` and confirm our templates include the instructions sysvar + sibling guard only when necessary.
+5. **Router compatibility** – If/when we stitch cp_amm pools into multi-leg strategies, ensure template metadata clearly marks input/output ATAs for reuse.
 
-## Testing & Tooling
+## Known Gaps / TODOs
 
-- **Unit tests** – Math module tests comparing against recorded on-chain swaps (see `tests/corecast_connect.rs` harness for fetching logs).
-- **Golden fixtures** – Capture CoreCast payloads + expected quotes for at least three pools (legacy SPL/SPL, SPL/Token-2022, referral-enabled) and run them in CI.
-- **Simulation harness** – Extend existing `runtime::simulate_swap` helper to execute cp_amm `swap2` instructions via `solana-test-validator` for regression coverage.
-- **Property tests** – Validate invariant preservation (post-swap reserves satisfy XYK within rounding tolerance) and that `PartialFill` never exceeds max input.
+- Model Meteora’s “activation point” behavior (see `ActivationHandler::get_current_point`) to avoid quoting pools before they are live.
+- Persist rate-limiter cooldown timing in state so strategies can skip pools for a few slots after a limiter trip.
+- Improve referral ATA discovery (maybe query Meteora’s registry) to avoid repetitive `MissingReferral` statuses.
+- Add end-to-end tests that run `swap_partial_fill` to verify `amount_left` arithmetic under real Token-2022 fee schedules.
 
-## Risks & Open Questions
-
-- **Referral routing** – Not all pools expose referral ATAs via CoreCast; do we maintain a static map or skip referral payouts (risking rejection)?
-- **Token program mismatches** – Pools pairing Token-2022 with legacy SPL require dual program IDs; need deterministic selection logic per mint.
-- **Rate limiter feedback** – Lack of direct limiter state may cause repeated failures; consider parsing recent transaction logs (fast execution lane) to back off.
-- **Compute budget** – cp_amm `swap2` occasionally exceeds default CU when amp is high; decide whether the adapter emits compute-budget instructions inside templates or leaves it to fast execution policy.
+Keep this document synchronized with the GitHub references above and with `docs/swaps/cp_amm_swap.md`; they collectively define the cp_amm adapter contract.

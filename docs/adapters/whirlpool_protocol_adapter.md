@@ -1,133 +1,172 @@
 # Whirlpool Protocol Adapter Design
 
+## Upstream References
+
+| Scope              | File / Artifact                                                        | Notes                                                                                                          |
+| ------------------ | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| IDL (v0.7.0)       | `idls/pools/whirlpool.json` (sourced from `@orca-so/whirlpools@0.7.0`) | Includes `swap_v2`, `two_hop_swap_v2`, `RemainingAccountsInfo`, and Token-2022 flags.                          |
+| Swap math          | `programs/whirlpool/src/math/swap_math.rs`                             | Defines the exact Q64.64 math, fee assessment, and tick traversal logic we must mirror.                        |
+| Swap manager       | `programs/whirlpool/src/manager/swap_manager.rs`                       | Orchestrates `SwapTickSequence`, `FeeRateManager`, adaptive fee updates, and tick-array sequencing.            |
+| Instruction wiring | `programs/whirlpool/src/instructions/v2/swap.rs` & `two_hop_swap.rs`   | Authoritative account order (three tick arrays + oracle + optional remaining accounts) and argument semantics. |
+| Internal docs      | `docs/swaps/whirlpool-swaps.md`                                        | Our execution playbook for required accounts and error-handling expectations.                                  |
+
+These sources drive both the adapter specification and the regression test vectors we capture locally.
+
 ## Goals & Scope
 
-- Implement a production-ready `ProtocolAdapter` for Whirlpool concentrated-liquidity pools as defined in `idls/pools/whirlpool.json`.
-- Normalize CoreCast Whirlpool state into an internal cache so the fast execution lane can request quotes without bespoke CLMM math.
-- Generate deterministic `SwapTemplate` payloads for the Whirlpool `swap` instruction (and `twoHopSwap` later) inside the hydration lane so bundling requires no recomputing of ticks or PDAs.
-- Expose adapter-level health/telemetry signals that describe when Whirlpool liquidity is actionable, stale, rate-limited, or missing tick coverage.
+- Ship a production-ready `ProtocolAdapter` for Whirlpool pools that matches the on-chain v0.7.0 interface (including Token-2022 vaults and adaptive-fee pools).
+- Normalize CoreCast Whirlpool deltas into an internal cache so the fast lane can request quotes without replaying swap math.
+- Generate deterministic `SwapTemplate` payloads for both `swap_v2` and staged `two_hop_swap_v2`, ensuring account ordering, signer sets, and remaining accounts align with the IDL.
+- Emit fine-grained health signals tracking tick coverage, oracle freshness, adaptive-fee state, and rate limits so strategies can respond before submission failures occur.
 
-## Responsibilities
+## Adapter Responsibilities
 
-1. **State ingestion** – Parse CoreCast `PoolLiquidityChangeStreamMessage` + `DexBlockMessage` extras for Whirlpool pools (sqrt price, liquidity, fee growth, reward data, tick array summaries) and hydrate a `WhirlpoolState` cache.
-2. **Metadata hydration** – On first sight of a pool, pull immutable data (token mints, vaults, tick spacing, reward infos, oracle PDA) from the on-chain `Whirlpool` account using the runtime RPC client and store alongside stream-driven deltas.
-3. **Tick coverage management** – Track which `TickArray` PDAs are currently cached/loaded so quotes know whether they can traverse the requested price range without fetching additional accounts.
-4. **Pricing & quoting** – Provide `quote_exact_in`/`quote_exact_out` implementations that simulate Whirlpool swaps (Q64.64 math, fee tiers, tick crossing) and report slippage, min/max bounds, and remaining liquidity.
-5. **Instruction templating** – Produce `SwapTemplate` objects that serialize Whirlpool `Swap` args, order account metas exactly as in `docs/swaps/whirlpool-swaps.md`, and attach any `remaining_accounts` (extra tick arrays, oracle as writable, transfer-hook accounts).
-6. **Validation & telemetry** – Emit guardrail statuses (`Ok`, `StaleState`, `MissingTickArrays`, `InsufficientLiquidity`, `RateLimited`) plus structured metrics so strategies can triage failures.
+1. **State ingestion** – Parse CoreCast `PoolLiquidityChangeStreamMessage` and `DexBlockMessage` extras for Whirlpool pools (sqrt price, liquidity, fee growth globals, reward info snapshots, tick-array cursors) and hydrate a `WhirlpoolState` cache keyed by pool address.
+2. **Immutable metadata hydration** – Fetch once per pool via RPC: token mints, vaults, token_program IDs (Token-2022 requires distinct programs), tick spacing, reward infos, oracle PDA, and `whirlpool_bump`. Store under `StaticPoolMeta` to avoid re-decoding.
+3. **Tick-array coverage management** – Track cached `TickArray` accounts with `{start_tick, last_slot, bytes}` so the quote path can confirm coverage for three consecutive arrays in the trade direction. Missing arrays trigger either async RPC hydration or a `MissingTickArrays` quote status.
+4. **Adaptive-fee tracking** – Mirror `AdaptiveFeeInfo` from `swap_manager.rs` (constants + variables) so quotes can project `fee_rate` adjustments. Defer to on-chain logic when variables are stale or missing.
+5. **Pricing & quoting** – Provide `quote_exact_in` / `quote_exact_out` methods that replay `swap_math::compute_swap_step` tick-by-tick, respecting `sqrt_price_limit`, fee tiers, protocol fee, rewards, and liquidity exhaustion semantics defined in `swap_manager.rs`.
+6. **Instruction templating** – Emit `SwapTemplate` (and later `TwoHopSwapTemplate`) objects that serialize args exactly as Anchor would (`amount`, `other_amount_threshold`, `sqrt_price_limit`, `amount_specified_is_input`, `a_to_b`), and attach account metas/remaining accounts in the order expected by `swap_v2`.
+7. **Validation & telemetry** – Surface guardrail statuses, annotate quotes with tick coverage and adaptive-fee context, and emit structured metrics for slot lag, RPC fallback count, and oracle divergence.
 
 ## Inputs & Data Sources
 
-- **CoreCast pipeline** (`bitquery/solana/dex_block_message.proto`, `token_block_message.proto`): Supplies per-slot liquidity, swap fees, reward growth, and tick array summaries for Whirlpool pools.
-- **Whirlpool IDL** (`idls/pools/whirlpool.json`): Authoritative account layouts, discriminator bytes, and instruction schemas for `swap`, `twoHopSwap`, `updateFeesAndRewards`, etc.
-- **Swap playbook** (`docs/swaps/whirlpool-swaps.md`): Operational checklist for required accounts, error codes, and tick-array semantics the adapter must honor.
-- **Config overrides** (`config.json`): Optional hints for mint decimals, custom oracle programs, or fallback tick-array prefetch parameters per pool.
+- **CoreCast pipeline** – `bitquery/solana/dex_block_message.proto` and `token_block_message.proto` provide rolling liquidity, fee growth, reward emissions, and tick-array summaries per slot.
+- **Whirlpool IDL** – `idls/pools/whirlpool.json` is treated as the single source for account layouts and instruction schemas; codegen (via `anchor-client` or `idl-codegen`) should be refreshed whenever the upstream npm tag changes.
+- **Orca program sources** – `swap_math.rs`, `swap_manager.rs`, and the v2 instruction modules govern math correctness and account ordering; the adapter must cite these for parity tests.
+- **Internal swap guide** – `docs/swaps/whirlpool-swaps.md` documents runner expectations (ATA ownership, CPI stack, compute budgeting) and remains the consumer-facing contract for template outputs.
+- **Config overrides** – `config.json` supplies mint decimal overrides, tick-array prefetch counts, or pool-specific toggles (e.g., ignoring Token-2022 pools on early rollouts).
 
 ## API Shape
-
-The adapter conforms to the shared trait used by the hydration + fast execution lanes:
 
 ```rust
 pub struct WhirlpoolAdapter {
     state: DashMap<PoolId, WhirlpoolState>,
-    config: WhirlpoolAdapterConfig,
     rpc: Arc<dyn ChainReader>,
+    config: WhirlpoolAdapterConfig,
+    metrics: Arc<dyn Notifier>,
 }
 
 pub struct WhirlpoolState {
+    static_meta: StaticPoolMeta,
+    dynamic: DynamicPoolState,
+    tick_arrays: BTreeMap<TickRange, TickArrayCache>,
+    adaptive_fee: Option<AdaptiveFeeSnapshot>,
+}
+
+pub struct StaticPoolMeta {
     whirlpool: Pubkey,
     token_mint_a: Pubkey,
     token_mint_b: Pubkey,
+    token_program_a: Pubkey,
+    token_program_b: Pubkey,
     token_vault_a: Pubkey,
     token_vault_b: Pubkey,
     tick_spacing: i32,
+    oracle: Pubkey,
+    reward_infos: [RewardInfo; NUM_REWARDS],
+}
+
+pub struct DynamicPoolState {
     liquidity: u128,
     sqrt_price_x64: u128,
     fee_rate: u16,
     protocol_fee_rate: u16,
-    reward_infos: [RewardInfo; 3],
+    tick_current_index: i32,
     last_update_slot: u64,
-    tick_arrays: TickArraySet,
-    oracle: Pubkey,
 }
 ```
 
-`WhirlpoolAdapterConfig` will capture state TTLs, max tick-array prefetch, fallback fee tiers, and rate-limiter backoff windows.
+`WhirlpoolAdapterConfig` captures TTLs, tick-array fetch budgets, adaptive-fee grace periods, rate-limit backoffs, and whether Token-2022 or transfer-hook pools are allowed.
 
-## State Management Plan
+## State & Cache Management
 
-- **Cache layering** – Maintain immutable pool metadata (`StaticPoolMeta`) and mutable liquidity snapshot (`DynamicPoolState`) so hot paths avoid re-parsing large accounts.
-- **Tick array tracking** – Model tick coverage as `BTreeMap<TickRange, TickArrayMeta>` storing start tick, last touched slot, and whether the raw on-chain account bytes are cached. This lets quotes verify coverage and request RPC hydration when missing.
-- **TTL enforcement** – Reject quotes when `current_slot - last_update_slot` exceeds `config.state_stale_slots` or when required tick arrays have not been refreshed within `config.tick_array_stale_slots`.
-- **Oracle readiness** – Record adaptive-fee oracle timestamps; degrade to `StaleState` if `trade_enable_timestamp` is in the future or missing.
+- **Immutable vs mutable layers** – Static metadata is fetched once (or when IDL hash changes) while dynamic state is refreshed per CoreCast message. This separation keeps quote hot-paths free of lock contention on large account blobs.
+- **Tick-array cache** – Represented as `TickArrayCache { start_tick: i32, slot: u64, account: Arc<[u8; TICK_ARRAY_SIZE]> }`. A `BTreeMap` keyed by range enables O(log n) lookups for contiguous arrays and quick detection of gaps relative to the requested sqrt price span.
+- **Prefetch policy** – On ingestion, proactively fetch ±N arrays around `tick_current_index / TICK_SPACING` so the fast lane rarely blocks on RPC. Arrays older than `config.tick_array_stale_slots` are re-queued for refresh.
+- **Oracle readiness** – The IDL exposes `oracle` as writable when adaptive fee state needs updates. Track the latest oracle timestamp; degrade quotes to `StaleState` when `slot_now - oracle_slot > config.oracle_max_lag`.
+- **Concurrency** – Use sharded locks or `RwLock` per pool to avoid blocking unrelated quotes. Tick-array updates should swap in immutable `Arc` blobs to keep readers wait-free.
 
 ## Pricing & Simulation
 
-1. **Direction resolution** – Determine trade direction (`a_to_b`) by matching the request’s input mint with `token_mint_a/b`. Align with the IDL convention (`token A` vs `token B`).
-2. **Slot-aligned liquidity** – Combine CoreCast vault deltas with last known on-chain vault balances to derive accurate reserves before simulation. If deltas are missing, perform a lazy RPC fetch.
-3. **Tick-walk engine** – Implement a deterministic tick traversal routine mirroring on-chain logic:
-   - Start from `tick_current_index` and `sqrt_price_x64`.
-   - Load the current `TickArray` slice; iterate ticks in direction (`a_to_b`), consuming liquidity net as we cross initialized ticks.
-   - For each step, simulate swap segment using Q64.64 math, subtracting fees and moving price until either `amount` is satisfied or `sqrt_price_limit` is reached.
-4. **Exact-in solver** – Treat `amount` as input, deduct trading fees upfront, and iteratively consume liquidity segments until exhausted or tick coverage ends. Return actual output, fee breakdown, next `sqrt_price`, and `edge_bps` relative to mid price.
-5. **Exact-out solver** – Reverse the solver by computing the input required to achieve the desired output, rejecting requests that exceed `other_amount_threshold` or run out of liquidity prior to completion.
-6. **Slippage & guardrails** – Respect caller-provided `sqrt_price_limit` (set to `0`/`u128::MAX` for open) and short-circuit with `InvalidSqrtPriceLimitDirection` equivalent when incompatible.
-7. **Reward & fee accounting** – Update fee growth / reward trackers (if provided) so the fast execution lane can expose net APR or reward accrual insights without re-reading on-chain state.
+The adapter must match `swap_manager::swap` semantics exactly:
 
-## Instruction Templating
+1. **Direction resolution** – Determine `a_to_b` by matching the request input mint against `token_mint_a/b`. Reject if neither matches to avoid silent mint mismatches.
+2. **Input normalization** – Convert external token amounts into raw atoms using mint decimals (sourced from `StaticPoolMeta` + config overrides). Align with on-chain math operating in integer atoms.
+3. **Tick traversal** – Reimplement the loop from `swap_manager.rs`:
+   - Instantiate a `SwapTickSequence` equivalent that iterates cached tick arrays in order.
+   - For each initialized tick, adjust `liquidity_net` and recompute the `sqrt_price_next_tick` boundary using `tick_math` utilities.
+   - Call into a ported `swap_math::compute_swap_step` to move price/liquidity, capturing `amount_in`, `amount_out`, `fee_amount`, and the next sqrt price.
+4. **Adaptive fee** – Feed an internal `FeeRateManager` clone when adaptive pools are enabled. The manager consumes `AdaptiveFeeVariables` and returns the current fee rate and the next variable snapshot (see `swap_manager.rs` for update order). Quotes must include both the fee rate applied and the projected state so telemetry can detect drifts.
+5. **Exact-in/out flows** – Mirror the on-chain `amount_specified_is_input` boolean:
+   - _Exact-in_: iterate until `amount_remaining == 0` or `sqrt_price_limit` is hit. Report actual output and leftover input if partial fills occur.
+   - _Exact-out_: iterate until `amount_calculated >= requested_output`, computing the required input and rejecting when `other_amount_threshold` is exceeded.
+6. **Limits & errors** – Match IDL error codes: `InvalidSqrtPriceLimitDirection`, `ZeroTradableAmount`, `PartialFillError`, etc. The adapter should map them into quote statuses but keep raw codes for debugging.
+7. **Reward & fee bookkeeping** – Update `fee_growth_global_{a,b}` and reward accumulators if CoreCast streams include deltas; otherwise, rely on RPC snapshots to ensure `next_reward_infos` in templates remain consistent.
 
-- **Instruction choice** – Default to the single-hop `swap` instruction; keep scaffolding ready for `twoHopSwap` once routing is enabled.
-- **Args serialization** – Use our Anchor-generated bindings or manual Borsh to encode:
-  - `amount`, `other_amount_threshold`, `sqrt_price_limit`, `amount_specified_is_input`, `a_to_b`.
-- **Account metas** – Follow the order documented in `docs/swaps/whirlpool-swaps.md`:
-  1. `token_program`
-  2. `token_authority`
-  3. `whirlpool`
-  4. `token_owner_account_a`
-  5. `token_vault_a`
-  6. `token_owner_account_b`
-  7. `token_vault_b`
-  8. `tick_array0`
-  9. `tick_array1`
-  10. `tick_array2`
-  11. `oracle`
-- **Remaining accounts** – Append adaptive-fee oracle (writable), supplemental tick arrays, transfer-hook programs, or memo program entries exactly as described in the IDL `RemainingAccountsInfo` hints.
-- **Template metadata** – Embed signer expectations, compute budget recommendations, and tick-array coverage summary inside `SwapTemplate::context` so the fast execution planner can react when coverage changes mid-bundle.
+## Instruction & Template Generation
+
+- **Instruction selection** – Default to `swap_v2` (single hop). Provide a feature-flagged path for `two_hop_swap_v2` that stitches two pools and six tick arrays once routing is available.
+- **Argument encoding** – Use Anchor-discriminated structs from the refreshed IDL to serialize:
+  - `amount: u64`
+  - `other_amount_threshold: u64`
+  - `sqrt_price_limit: u128`
+  - `amount_specified_is_input: bool`
+  - `a_to_b: bool`
+- **Account metas** – Mirror the order in `instructions/v2/swap.rs`:
+  1. `token_program_a`
+  2. `token_program_b`
+  3. `token_authority`
+  4. `whirlpool`
+  5. `token_owner_account_a`
+  6. `token_vault_a`
+  7. `token_owner_account_b`
+  8. `token_vault_b`
+  9. `tick_array_0`
+  10. `tick_array_1`
+  11. `tick_array_2`
+  12. `oracle`
+      (Two-hop adds intermediate tick arrays, intermediate whirlpool, and shared token accounts as per the IDL.)
+- **Remaining accounts** – Honor `RemainingAccountsInfo`:
+  - Adaptive-fee oracle must be writable when fee variables update.
+  - Token-2022 transfer hooks require `extra_accounts` before vault metas.
+  - Optional compute-unit price hints or CU limit instructions ride ahead of the swap template via `SwapTemplate::prologue`.
+- **Template metadata** – Attach `{tick_arrays_used, sqrt_price_before, sqrt_price_after, adaptive_fee_applied, cache_slot}` inside `SwapTemplate::context`. This is consumed by the fast lane to detect mismatched coverage at submission time.
 
 ## Validation & Telemetry
 
-- Quote statuses:
-  - `Ok` – State fresh, sufficient liquidity, template built.
-  - `StaleState` – Pool/tick data older than configured slot threshold.
-  - `MissingTickArrays` – Required arrays absent or stale.
-  - `InsufficientLiquidity` – Simulation exhausted liquidity before satisfying request.
-  - `RateLimited` – Recent on-chain errors (`6011`, `6035`, `6034`, `6064`) observed; adapter imposes cooldown.
-  - `MissingAccounts` – Token owner ATAs, transfer-hook deps, or oracle data unavailable.
-- Emit structured metrics (`whirlpool.quote_latency_ms`, `whirlpool.tick_fetch_count`, `whirlpool.rate_limit_hits`) via the notifier module.
-- Attach debug context (current sqrt price, tick index, coverage ranges) to log spans for faster incident triage.
+- Quote status taxonomy:
+  - `Ok`
+  - `StaleState` – `slot_now - last_update_slot > config.state_stale_slots`.
+  - `MissingTickArrays` – Cache lacks any of the three arrays in the trade path or arrays are older than `tick_array_stale_slots`.
+  - `InsufficientLiquidity` – Simulation hit zero liquidity or min/max sqrt price before satisfying the request.
+  - `RateLimited` – Prior submissions returned Orca errors (`6011`, `6035`, `6034`, `6064`); adapter backs off for `config.rate_limit_cooldown_slots`.
+  - `MissingAccounts` – Token owner ATA, transfer-hook extra accounts, or oracle is absent.
+- Metrics to emit per quote: `quote_latency_ms`, `tick_arrays_read`, `rpc_fallback_count`, `adaptive_fee_applied_bps`, `oracle_lag_slots`.
+- Telemetry spans should include `pool`, `tick_current_index`, `sqrt_price_x64`, `liquidity`, and `tick_coverage` to accelerate debugging.
 
 ## Integration Plan
 
-1. **Proto/schema updates** – Extend `PoolUpdate` and CoreCast parsers to expose Whirlpool-specific fields (sqrt price, liquidity, fee growth, tick array metadata). Update `src/proto.rs` tests.
-2. **Adapter scaffolding** – Add `WhirlpoolAdapter` module under `src/strategy.rs` (or `src/core/adapters/whirlpool.rs`) implementing the trait with `todo!()` bodies initially.
-3. **State cache + hydration** – Wire `ingest_pool_update` to merge stream deltas, fetch on-chain accounts as needed, and maintain tick-array coverage. Unit-test using fixture accounts extracted from mainnet RPC.
-4. **Pricing engine** – Implement `quote_exact_in/out` using a reusable `whirlpool_math` module; validate via proptests comparing against recorded on-chain swaps (`docs/swaps/whirlpool-swaps.md` examples).
-5. **Template builder** – Encode account metas and args via the generated IDL bindings; integration-test by simulating swaps on `solana-test-validator` with known pools.
-6. **Lane plumbing** – Register the adapter in the hydration ingestion loop (pool detection), feed it into the fast execution quote aggregator, and wire submission policies accordingly, ensuring config toggles exist in `config.json`.
-7. **Observability** – Add tracing spans + metrics; document adapter in `docs/architecture.md` and add runbooks for tick-array cache misses.
+1. **Proto/schema work** – Extend CoreCast protos + deserializers with Whirlpool-specific fields (sqrt price, fee growth, adaptive fee, tick-array metadata). Update fixtures in `src/proto.rs`.
+2. **Adapter scaffolding** – Implement `WhirlpoolAdapter` under `src/hydration/adapters/whirlpool.rs` (or similar), registering it in the hydration dispatcher and fast-lane quote aggregator with feature flags.
+3. **Cache hydration** – Build ingestion pipelines that merge CoreCast deltas, backfill missing arrays via RPC, and reconcile state against on-chain accounts during startup (using the refreshed IDL layouts).
+4. **Math parity** – Port `swap_math.rs` and supporting helpers (tick math, liquidity math) into `src/strategy/whirlpool_math.rs`. Add proptests comparing adapter quotes to upstream Rust program outputs using recorded account states.
+5. **Template builder** – Generate Anchor bindings from `idls/pools/whirlpool.json` so serialization stays in lockstep with upstream. Integration-test by executing adapter-generated swaps on `solana-test-validator` fixtures.
+6. **Observability** – Wire adapter metrics into `notifier.rs`, add structured logs, and document runbooks in `docs/architecture.md` for common failure states (stale arrays, oracle lag, rate limit).
+7. **Two-hop readiness** – Stash helper utilities for bridging two whirlpools (shared intermediate mint, sequential tick arrays) even if routing is disabled initially, so enabling it later is mostly plumbing.
 
 ## Testing & Tooling
 
-- **Unit tests** – Cover tick traversal, fee calculation, sqrt math, and guard rails using deterministic fixtures.
-- **Golden fixtures** – Store raw `Whirlpool` + `TickArray` accounts and expected quote outputs for multiple pools (different tick spacing, Token-2022 vaults, adaptive-fee pools) to guard against regressions.
-- **Simulation harness** – Extend existing `runtime::simulate_swap` (or create `tests/whirlpool_swap.rs`) to execute adapter-generated templates against a local validator using idempotent whirlpool accounts.
-- **Property tests** – Ensure liquidity conservation (post-swap sqrt price + liquidity match expectations) and that partial coverage errors surface as `MissingTickArrays` rather than panics.
-- **Load testing** – Replay historical CoreCast streams to evaluate cache churn, tick-array fetch volume, and quote throughput under mainnet-scale load.
+- **Unit tests** – Validate tick traversal, fee math, and adaptive-fee transitions using golden values copied from `swap_math.rs` tests.
+- **Golden fixtures** – Persist raw `Whirlpool` + `TickArray` accounts plus expected swap outputs for diverse pools (1bps, 5bps, full-range, Token-2022) to guard against math regressions.
+- **Simulation harness** – Extend `tests/whirlpool_swap.rs` (new) to replay adapter templates against a local validator seeded with Orca fixture accounts; fail tests if on-chain behavior diverges from adapter simulation.
+- **Property tests** – Check liquidity conservation and monotonic tick traversal (never skipping beyond cached coverage) across randomized trades.
+- **Load testing** – Replay historical CoreCast logs to measure cache churn, RPC fetch rate, and quote throughput under realistic slot cadence.
 
 ## Risks & Open Questions
 
-- **Tick-array availability** – CoreCast may not stream all arrays needed for a swap path; we need a policy for on-demand RPC fetch vs. prefetch vs. quote rejection.
-- **Adaptive-fee oracle writes** – Some pools require writable oracle accounts; determine whether the fast execution lane supplies them via `remaining_accounts` or the adapter marks them writable by default.
-- **Transfer-hook pools** – Token-2022 mints with hooks demand extra accounts; we must standardize how config/IDL hints inject those dependencies.
-- **Slot lag** – Delayed CoreCast messages could cause stale sqrt price vs. on-chain reality; consider cross-checking `recent_blockhash` slot before publishing quotes.
-- **Two-hop routing** – Future multi-hop support needs a canonical API for passing intermediate whirlpools and tick arrays; design should leave room without breaking trait signatures.
+- **Tick-array availability** – CoreCast streams may omit arrays far from current price. Decide between on-demand RPC fetch (with latency hit), background prefetch, or rejecting quotes with `MissingTickArrays`.
+- **Adaptive-fee drift** – If CoreCast omits adaptive variables, we must either re-fetch whirlpool accounts or treat pools as fixed-fee. Need policy per pool tier.
+- **Token-2022 hooks** – Pools using transfer hooks require extra accounts; we need config-driven manifests so templates include them without human intervention.
+- **Slot lag** – Significant lag between CoreCast slot and latest blockhash can cause stale quotes. Consider sampling on-chain `recent_blockhash` slot before publishing quotes.
+- **Two-hop routing** – Defining a stable API for multi-hop swaps (two whirlpools, six tick arrays, shared intermediate ATA) remains open. Leave trait signatures future-proof by allowing multi-instruction templates.

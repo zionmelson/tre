@@ -69,7 +69,7 @@
 - **PoolState** – Canonical runtime struct containing slot, monotonic timestamp, current price/liquidity summary, adapter id, and health flags.
 - **PoolUpdate** – Compact struct sent over the channel: `{ pool_id, slot, mid_price, bid_depth, ask_depth, health_flags, gen }`.
 - **Borrow config** – `config.json` exposes `protocols.*.borrow_pct` (default 0.35) so StrategyEngine can clamp trade size deterministically.
-- **Protocol RPC endpoints** – Each entry in `protocols.<name>.rpc_endpoints` must list the Solana RPC URLs the hydrator can use for one-off refreshes when CoreCast stalls. Provide at least two prioritized endpoints per protocol (Raydium, cp_amm, lb_clmm, Lifinity, Whirlpool) so the refresher can fetch vault balances and mark snapshots `RpcRefresh` instead of `Stale`. The template exposes env vars such as `$ENV{TRE_RPC_RAYDIUM_PRIMARY}` to keep credentials out of source; production configs should populate concrete HTTPS URLs.
+- **Protocol RPC endpoints** – Each entry in `protocols.<name>.rpc_endpoints` must list the Solana RPC URLs the hydrator can use for one-off refreshes when CoreCast stalls. Provide at least two prioritized endpoints per supported protocol (Raydium, cp_amm, lb_clmm, Whirlpool) so the refresher can fetch vault balances and mark snapshots `RpcRefresh` instead of `Stale`. The template exposes env vars such as `$ENV{TRE_RPC_RAYDIUM_PRIMARY}` to keep credentials out of source; production configs should populate concrete HTTPS URLs.
 - **Freshness** – `PoolState` and template/flash artifacts track `last_update_ms`; watcher refuses to trade if `now - last_update_ms > hydrator.max_staleness_ms` or if hydrator flagged the pool as stale.
 
 ## Telemetry & Alerting

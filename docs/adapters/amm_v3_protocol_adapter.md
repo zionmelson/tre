@@ -1,114 +1,96 @@
 # Raydium AMM v3 Protocol Adapter Design
 
-## Goals & Scope
+This document is the single source of truth for our Raydium CLMM adapter. It ties local components to the exact Solana programs they mirror, cites the upstream GitHub sources, and lists every assumption the pricing engine makes.
 
-- Provide a protocol-specific implementation of the upcoming `ProtocolAdapter` trait for Raydium AMM v3 (CLMM) pools.
-- Surface precise pricing data (mid, bounds, liquidity-aware slippage) derived from CoreCast pool updates and protocol math documented in `docs/swaps/amm_v3_swaps.md`.
-- Generate deterministic swap instruction templates inside the hydration lane so the fast execution planner can serialize them without re-deriving protocol knowledge.
-- Deliver confidence scores + validation hooks so downstream strategy code knows whether an arbitrage quote is executable.
+## Upstream References (GitHub)
 
-## Responsibilities
+- `swap.rs`: full on-chain CLMM math (`swap_internal`) and fee accounting – <https://github.com/raydium-io/raydium-clmm/blob/master/programs/amm/src/instructions/swap.rs>
+- `swap_v2.rs`: user-facing instruction, Token-2022 fee handling, memo requirement – <https://github.com/raydium-io/raydium-clmm/blob/master/programs/amm/src/instructions/swap_v2.rs>
+- `swap_router_base_in.rs`: multi-hop router semantics (how outputs from hop _n_ become inputs for hop _n + 1_) – <https://github.com/raydium-io/raydium-clmm/blob/master/programs/amm/src/instructions/swap_router_base_in.rs>
+- React to updates in those files first; every adapter invariant below is derived directly from them.
 
-1. **State ingestion** – Parse `PoolLiquidityChangeStreamMessage` extras (tick index, sqrt price, vault balances, fee growth) into a `RaydiumV3State` cache keyed by `pool_id`.
-2. **Pricing** – Convert cached state + incoming trade amounts into quote functions: `quote_exact_in`, `quote_exact_out`, `edge_bps`, `sqrt_price_limit` suggestions.
-3. **Instruction templating** – Produce `SwapTemplate` structs containing: Raydium program id, discriminator (`swap_v2`), ordered account metas, PDA bumps, and argument payloads for a given direction.
-4. **Validation** – Simulate pool math (tick traversal, liquidity net checks) to ensure the predicted fill stays within slippage + liquidity bounds.
-5. **Telemetry** – Emit structured logs / metrics when adapter falls back (missing metadata, stale state) to aid observability.
+## Adapter Goals & Scope
 
-## Inputs
+1. Quote Raydium CLMM pools with the same tick-by-tick math that `swap_internal` uses, including liquidity-net transitions, protocol/fund fee debits, and sqrt-price limits.
+2. Generate deterministic `swap_v2` instruction templates so the fast execution lane never needs to re-derive PDAs or account order.
+3. Provide validation + telemetry so strategies can see when a quote was simulated vs. when we fell back to XYK reserves.
+4. Remain router-compatible: our context must satisfy both single-hop `swap_v2` and chained `swap_router_base_in` executions.
 
-- **CoreCast Stream**: `bitquery/solana/dex_block_message.proto` + `parsed_idl_block_message.proto` provide the raw liquidity change and metadata fields (pool config index, tick spacing, sqrt_price_x64, vault balances). We will extend `PoolUpdate::from_corecast` to capture these adapter-specific fields.
-- **Swap Playbook**: `docs/swaps/amm_v3_swaps.md` outlines PDA derivations and instruction arguments.
-- **Config Overrides**: Optional static hints (fee tiers, mint decimals) from config or IDL for pools where CoreCast lacks data.
+## Data Inputs & State Enrichment
 
-## API Shape
+| Source                                      | Purpose                                                                    | Implementation Notes                                                          |
+| ------------------------------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| CoreCast `PoolLiquidityChangeStreamMessage` | Vault balances, mint pairs, slot, fee deltas                               | Parsed in `PoolUpdate::from_corecast` (`src/hydration/types.rs`).             |
+| Protocol extras (`RaydiumV3PoolExtras`)     | Tick spacing, sqrt_price_x64, liquidity, PDA bumps                         | Populated via `parse_raydium_v3_extras` (`src/hydration/types/protocols.rs`). |
+| On-chain hydration (`RaydiumPoolHydrator`)  | Ground-truth pool accounts, AMM config fees, tick arrays, mint program IDs | See `src/hydration/adapters/raydium_v3.rs`, section `RaydiumPoolHydrator`.    |
 
-```rust
-pub trait ProtocolAdapter {
-    fn program_id(&self) -> Pubkey;
-    fn supports(&self, program_id: &Pubkey) -> bool;
-    fn ingest_pool_update(&self, update: &PoolUpdate);
-    fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse>;
-    fn build_swap_template(&self, quote: &QuoteResponse) -> Option<SwapTemplate>;
-}
-```
+`RaydiumV3State` caches:
 
-Adapter-specific structs:
+- Pool + mint pubkeys, associated token program IDs (needed for Token-2022 transfers copied from `swap_v2.rs`).
+- Vault balances (`vault_base`, `vault_quote`) for snapshot pricing and XYK fallback.
+- Tick metadata (`tick_spacing`, `current_tick`, `sqrt_price_x64`, `liquidity`).
+- Fee tiers (`trade_fee_bps`, and soon `protocol_fee_rate` / `fund_fee_rate`).
+- Hydrated tick-array cache (3 accounts per direction) plus TTL, matching router expectations.
 
-```rust
-pub struct RaydiumV3Adapter {
-    state: DashMap<String, RaydiumV3State>,
-    config: RaydiumAdapterConfig,
-}
+Eviction happens whenever `slot` drift exceeds `config.stale_slot_threshold` or wall-clock age exceeds `config.stale_after_ms`.
 
-pub struct RaydiumV3State {
-    pool_id: String,
-    amm_config: Pubkey,
-    tick_spacing: i32,
-    sqrt_price_x64: u128,
-    current_tick: i32,
-    liquidity: u128,
-    vault_base: u64,
-    vault_quote: u64,
-    last_update_slot: u64,
-    observation_bump: u8,
-    pool_bump: u8,
-    vault_bumps: [u8; 2],
-    mint_base: Pubkey,
-    mint_quote: Pubkey,
-}
-```
+## Pricing Architecture
 
-## State Management
+### Simulation Path (preferred)
 
-- Extend `PoolUpdate` to carry adapter-specific extensions (from CoreCast metadata fields) and feed them into `RaydiumV3State::apply_update`.
-- `DashMap` (or lock-free slab) keyed by pool ensures thread-safe reads in the fast execution lane planner.
-- Implement TTL eviction to avoid quoting from stale pools (e.g., `slot` drift or `Instant` age > N ms).
+1. Clamp request size via `clamp_request_amount` (max `RAYDIUM_V3_INPUT_UTILIZATION_BPS`, currently 40% of the input-side vault).
+2. Determine direction with `classify_swap_direction` (mirrors mint ordering logic from `swap_v2.rs`).
+3. Fetch tick arrays through `RaydiumPoolHydrator::preferred_tick_arrays_for_swap`, ensuring the same 3-array window `swap_internal` expects.
+4. Run `simulate_clmm_exact_in`, our Rust port of `swap_internal` + `swap_math::compute_swap_step`:
+   - Iterates up to 512 steps, same guard as upstream.
+   - Applies `liquidity_net` when crossing initialized ticks.
+   - Computes `sqrt_price_after` so we can set `QuoteResponse.sqrt_price_limit`.
+5. Return `QuoteOutcome` with `amount_out` + post-trade sqrt price. This is the only path that sets `sqrt_price_limit`.
 
-## Pricing Logic
+### Fallback Path (XYK)
 
-1. **Normalize direction** – Determine whether the trade is base→quote or quote→base based on mint ordering vs trade intent.
-2. **Exact-in simulation** – Starting from `sqrt_price_x64` and `current_tick`, iterate Raydium CLMM math:
-   - For each tick boundary, compute max available liquidity, fees, and new sqrt price using formulas from Raydium open-source or IDL.
-   - Accumulate output until input exhausted or liquidity depleted.
-3. **Exact-out** – Reverse the solver to compute required input, respecting tick spacing and `sqrt_price_limit`.
-4. **Edge calculation** – Compare quoted price vs observed trade price (fast execution heuristics) or vs other adapters to produce `edge_bps`.
-5. **Slippage guard** – Emit recommended `sqrt_price_limit_x64` derived from price bounds encountered during the simulation.
+If hydration is missing (no tick arrays, liquidity zero, or math fails), we compute `xyk_amount_out` using current vault balances and fee tier. This mirrors Raydium’s pool reserve invariant but ignores ticks, so mark quotes with reduced confidence.
 
-## Swap Template Generation
+### Fees & Limits
 
-- **Account seeds**: use `amm_config`, `pool_state`, `pool_vault_*`, `observation` seeds as documented.
-- **Template struct**:
+- Trade fee tier comes from AMM config (`trade_fee_rate` / `fee_bps`).
+- Protocol/fund fees are available on-chain (see `swap.rs`), but we currently ignore them in simulation. TODO: copy the proportional deductions so `amount_out` matches on-chain reality even when those knobs are non-zero.
+- `sqrt_price_limit` defaults to 0 (meaning “best effort”) unless simulation provides a bound. This behavior matches `swap_v2.rs`’s clamp to MIN/MAX tick when 0 is supplied.
 
-```rust
-pub struct SwapTemplate {
-    pub program_id: Pubkey,
-    pub discriminator: [u8; 8], // swap_v2
-    pub accounts: Vec<AccountMeta>,
-    pub data: Vec<u8>,
-    pub context: TemplateContext, // hints for the fast execution lane (payer, signer reqs)
-}
-```
+## Instruction Templates & Routing
 
-- Fill `amount`, `other_amount_threshold`, `sqrt_price_limit_x64`, `is_base_input` from the `QuoteResponse`.
-- Include derived bumps to let the fast execution lane re-derive addresses if needed.
+- Accounts and arguments must match the `SwapSingleV2` struct exactly; `docs/swaps/amm_v3_swaps.md` stays in sync with upstream.
+- Template context includes:
+  - Program IDs: Raydium v3, SPL Token, Token-2022, Memo (see `SWAP_MEMO_MSG`).
+  - User ATAs resolved via `BuilderHandle::token_account_for_mint`.
+  - Tick-array accounts in the order produced by hydrator (current + two lookahead/behind depending on direction).
+  - PDA bumps for `pool`, `vault_0/1`, `observation`.
+- Templates are registered with the builder (`register_amm_v3_pool`) once fee tier + PDA data exist. The builder also seeds ALT entries so the fast lane discovers the same account layout the router expects.
+- For router-style multi-hop flows, the outgoing token account from hop _n_ becomes the input ATA for hop _n + 1_. Because our context stores both mint + ATA for every leg, we can chain templates without recomputation.
 
-## Validation Hooks
+## Validation, Telemetry, and Error Modes
 
-- `QuoteResponse::status` with enums: `Ok`, `StaleState`, `InsufficientLiquidity`, `MissingAccounts`.
-- Attach audit info (ticks crossed, fee paid, estimated compute budget) to help the fast execution lane decide bundling priority.
+- `QuoteResponse.status` enumerations:
+  - `Ok` – simulation succeeded.
+  - `MissingTickArrays` – hydrator could not fetch 3 arrays (quote will be XYK-based).
+  - `StaleState` – TTL eviction flagged the pool before quoting.
+  - `InsufficientLiquidity` – `simulate_clmm_exact_in` exhausted liquidity before finishing.
+- Metrics/logs (tracing target `adapter::raydium_v3`): hydration retries, cache hits, XYK fallback rate, ALT registration failures.
+- When hydrator repeatedly fails to fetch AMM configs/mints, `missing_*` maps enforce an exponential backoff so we do not DOS RPC.
 
-## Integration Plan
+## Integration & Testing Checklist
 
-1. **State Enrichment** – add Raydium-specific metadata extraction to `PoolUpdate` and confirm via logging.
-2. **Adapter Skeleton** – implement trait with stubbed quote/template methods returning `None` until math filled in.
-3. **Pricing Engine** – port the sqrt-price/tick math from Raydium reference or our existing tooling; unit-test with fixtures.
-4. **Template Builder** – encode swap instructions using `raydium_amm_v3` IDL or manual Borsh layout; validate against known-good swaps.
-5. **Fast execution wiring** – instantiate the adapter, feed pool updates from the hydration lane, and replace generic `Opportunity::from_trade` with adapter-derived quotes when `program_id` matches.
-6. **Testing** – add regression tests with recorded CoreCast updates + expected quotes; optionally run against a forknet harness to ensure instruction templates execute.
+1. **State plumbing** – Confirm CoreCast messages include Raydium extras, and hydration RPC endpoints are configured (`RaydiumV3AdapterConfig.rpc_endpoints`).
+2. **Simulation parity** – Unit tests in `src/hydration/adapters/raydium_v3.rs` already assert PDA parsing and math helpers. Add fixtures comparing `simulate_clmm_exact_in` outputs to a recorded on-chain swap (use https://github.com/raydium-io/raydium-clmm test vectors).
+3. **Template smoke test** – Build a `SwapTemplate`, send via `swap_v2`, and verify Memo + Token-2022 accounts are accepted.
+4. **Router coverage** – Feed multiple quotes into `swap_router_base_in`, ensuring our context orders remain valid when multiple pools share accounts.
+5. **Regression harness** – Replay CoreCast deltas + trades to confirm `bidirectional_quotes` align with actual fills (edge BPS > 0 triggers strategy alerts).
 
-## Open Questions
+## Known Gaps / TODOs
 
-- Do we house adapter configs (tick spacing overrides, memo requirements) in `config.json` or derive entirely from CoreCast metadata?
-- How do we prioritize between multiple adapters producing quotes for the same trade (e.g., fallback to reserve ratio when adapter unavailable)?
-- Should swap template generation live in the hydration lane (attach to bundle candidate) or the fast execution lane (lazy evaluation when we decide to submit)?
+- Model protocol + fund fees exactly as `swap.rs` does (they currently reduce pool-level fee growth but not our quote output).
+- Add `sqrt_price_limit` clamping for strategies that want partial-fill protection instead of best-effort.
+- Improve visibility when hydrator re-registers templates because builder ALTs missed a pool.
+- Consider caching router-ready account lists (input/output mint order) to reduce per-quote decoration time.
+
+Keep this document updated whenever upstream Raydium commits touch `swap.rs`, `swap_v2.rs`, or router semantics; those files are the canonical spec.

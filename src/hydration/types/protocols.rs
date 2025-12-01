@@ -13,9 +13,7 @@ pub use self::lb_clmm::{
     LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras, LbClmmPoolExtras,
     LB_CLMM_INPUT_UTILIZATION_BPS, LB_CLMM_PROGRAM_ID,
 };
-pub use self::lifinity_v2::{
-    LifinityPoolExtras, LIFINITY_V2_INPUT_UTILIZATION_BPS, LIFINITY_V2_PROGRAM_ID,
-};
+
 pub use self::raydium_v3::{
     RaydiumV3PoolExtras, RAYDIUM_V3_INPUT_UTILIZATION_BPS, RAYDIUM_V3_PROGRAM_ID,
 };
@@ -25,7 +23,6 @@ pub use self::whirlpool::{
 
 pub(crate) use self::cp_amm::parse_extras as parse_cp_amm_extras;
 pub(crate) use self::lb_clmm::parse_extras as parse_lb_clmm_extras;
-pub(crate) use self::lifinity_v2::parse_extras as parse_lifinity_extras;
 pub(crate) use self::raydium_v3::parse_extras as parse_raydium_v3_extras;
 pub(crate) use self::whirlpool::parse_extras as parse_whirlpool_extras;
 
@@ -851,199 +848,6 @@ mod lb_clmm {
     }
 }
 
-mod lifinity_v2 {
-    use super::shared::{lookup_account_string, pubkey_from_bytes, InstructionAccountLookup};
-    use super::*;
-
-    pub const LIFINITY_V2_PROGRAM_ID: &str = "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c";
-    pub const LIFINITY_V2_INPUT_UTILIZATION_BPS: u64 = 4_000;
-    static LIFINITY_V2_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
-        Pubkey::from_str(LIFINITY_V2_PROGRAM_ID).expect("static Lifinity AMM v2 program id")
-    });
-
-    #[derive(Debug, Clone, Default)]
-    pub struct LifinityPoolExtras {
-        pub authority: Option<String>,
-        pub token_a_vault: Option<String>,
-        pub token_b_vault: Option<String>,
-        pub pool_mint: Option<String>,
-        pub fee_account: Option<String>,
-        pub token_program: Option<String>,
-        pub oracle_main: Option<String>,
-        pub oracle_sub: Option<String>,
-        pub oracle_pc: Option<String>,
-        pub fees_bps: Option<u16>,
-        pub owner_fee_bps: Option<u16>,
-        pub host_fee_bps: Option<u16>,
-        pub std_spread_bps: Option<u16>,
-        pub spread_buffer_bps: Option<u16>,
-        pub spread_coefficient_bps: Option<u32>,
-        pub price_buffer_coin_bps: Option<i32>,
-        pub price_buffer_pc_bps: Option<i32>,
-        pub fee_trade_bps: Option<u16>,
-        pub fee_platform_bps: Option<u16>,
-        pub oracle_main_slot_limit: Option<u64>,
-        pub oracle_sub_confidence_limit: Option<u64>,
-        pub oracle_sub_slot_limit: Option<u64>,
-        pub oracle_pc_confidence_limit: Option<u64>,
-        pub oracle_pc_slot_limit: Option<u64>,
-        pub vault_a_balance: Option<u128>,
-        pub vault_b_balance: Option<u128>,
-        pub freeze_trade: Option<u8>,
-    }
-
-    pub(crate) fn parse_extras(event: &PoolLiquidityChangeEvent) -> Option<LifinityPoolExtras> {
-        let dex = event.dex.as_ref()?;
-        let program_key = pubkey_from_bytes(&dex.program_address)?;
-        if program_key != *LIFINITY_V2_PROGRAM_PUBKEY {
-            return None;
-        }
-
-        let instruction = event.instruction.as_ref()?;
-        let program = instruction.program.as_ref()?;
-        let lookup = InstructionAccountLookup::new(program, &instruction.accounts);
-
-        let mut extras = LifinityPoolExtras {
-            authority: lookup_account_string(&lookup, &["authority", "Authority"]),
-            token_program: lookup_account_string(&lookup, &["tokenProgram", "token_program"]),
-            token_a_vault: lookup_account_string(
-                &lookup,
-                &["swapSource", "tokenA", "token_a_vault", "tokenAAccount"],
-            ),
-            token_b_vault: lookup_account_string(
-                &lookup,
-                &[
-                    "swapDestination",
-                    "tokenB",
-                    "token_b_vault",
-                    "tokenBAccount",
-                ],
-            ),
-            pool_mint: lookup_account_string(&lookup, &["poolMint", "pool_mint"]),
-            fee_account: lookup_account_string(&lookup, &["feeAccount", "fee_account"]),
-            oracle_main: lookup_account_string(
-                &lookup,
-                &["oracleMainAccount", "oracle_main_account", "oracleMain"],
-            ),
-            oracle_sub: lookup_account_string(
-                &lookup,
-                &["oracleSubAccount", "oracle_sub_account", "oracleSub"],
-            ),
-            oracle_pc: lookup_account_string(
-                &lookup,
-                &["oraclePcAccount", "oracle_pc_account", "oraclePc"],
-            ),
-            ..Default::default()
-        };
-
-        if let Some(base_side) = event.base_currency.as_ref() {
-            extras.vault_a_balance = Some(base_side.post_amount as u128);
-        }
-        if let Some(quote_side) = event.quote_currency.as_ref() {
-            extras.vault_b_balance = Some(quote_side.post_amount as u128);
-        }
-
-        extras_if_any(extras)
-    }
-
-    fn extras_if_any(extras: LifinityPoolExtras) -> Option<LifinityPoolExtras> {
-        if extras.authority.is_none()
-            && extras.token_a_vault.is_none()
-            && extras.token_b_vault.is_none()
-            && extras.pool_mint.is_none()
-            && extras.fee_account.is_none()
-            && extras.token_program.is_none()
-            && extras.oracle_main.is_none()
-            && extras.oracle_sub.is_none()
-            && extras.oracle_pc.is_none()
-            && extras.vault_a_balance.is_none()
-            && extras.vault_b_balance.is_none()
-        {
-            None
-        } else {
-            Some(extras)
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::super::test_utils::*;
-        use super::*;
-
-        #[test]
-        fn lifinity_extras_parse_accounts() {
-            let pool = Pubkey::new_unique();
-            let base_mint = Pubkey::new_unique();
-            let quote_mint = Pubkey::new_unique();
-            let authority = Pubkey::new_unique();
-            let token_a_vault = Pubkey::new_unique();
-            let token_b_vault = Pubkey::new_unique();
-            let pool_mint = Pubkey::new_unique();
-            let fee_account = Pubkey::new_unique();
-            let token_program = Pubkey::new_unique();
-            let oracle_main = Pubkey::new_unique();
-            let oracle_sub = Pubkey::new_unique();
-            let oracle_pc = Pubkey::new_unique();
-
-            let account_names = vec![
-                "authority",
-                "amm",
-                "userTransferAuthority",
-                "sourceInfo",
-                "destinationInfo",
-                "swapSource",
-                "swapDestination",
-                "poolMint",
-                "feeAccount",
-                "tokenProgram",
-                "oracleMainAccount",
-                "oracleSubAccount",
-                "oraclePcAccount",
-            ];
-
-            let accounts = vec![
-                proto_account(&authority),
-                proto_account(&pool),
-                proto_account(&Pubkey::new_unique()),
-                proto_account(&Pubkey::new_unique()),
-                proto_account(&Pubkey::new_unique()),
-                proto_account(&token_a_vault),
-                proto_account(&token_b_vault),
-                proto_account(&pool_mint),
-                proto_account(&fee_account),
-                proto_account(&token_program),
-                proto_account(&oracle_main),
-                proto_account(&oracle_sub),
-                proto_account(&oracle_pc),
-            ];
-
-            let instruction = parsed_instruction(account_names, accounts);
-
-            let event = PoolLiquidityChangeEvent {
-                instruction_index: 0,
-                dex: Some(lifinity_dex_info()),
-                market: Some(raydium_market(&pool, &base_mint, &quote_mint)),
-                base_currency: Some(pool_side(42)),
-                quote_currency: Some(pool_side(84)),
-                instruction: Some(instruction),
-            };
-
-            let extras = parse_extras(&event).expect("extras must parse");
-            assert_eq!(extras.authority, Some(authority.to_string()));
-            assert_eq!(extras.token_a_vault, Some(token_a_vault.to_string()));
-            assert_eq!(extras.token_b_vault, Some(token_b_vault.to_string()));
-            assert_eq!(extras.pool_mint, Some(pool_mint.to_string()));
-            assert_eq!(extras.fee_account, Some(fee_account.to_string()));
-            assert_eq!(extras.token_program, Some(token_program.to_string()));
-            assert_eq!(extras.oracle_main, Some(oracle_main.to_string()));
-            assert_eq!(extras.oracle_sub, Some(oracle_sub.to_string()));
-            assert_eq!(extras.oracle_pc, Some(oracle_pc.to_string()));
-            assert_eq!(extras.vault_a_balance, Some(42));
-            assert_eq!(extras.vault_b_balance, Some(84));
-        }
-    }
-}
-
 mod whirlpool {
     use super::shared::{lookup_account_string, pubkey_from_bytes, InstructionAccountLookup};
     use super::*;
@@ -1227,17 +1031,6 @@ pub(crate) mod test_utils {
             market_address: pool_id.to_bytes().to_vec(),
             base_currency: Some(proto_currency(base)),
             quote_currency: Some(proto_currency(quote)),
-        }
-    }
-
-    pub fn lifinity_dex_info() -> DexInfo {
-        DexInfo {
-            program_address: Pubkey::from_str(super::lifinity_v2::LIFINITY_V2_PROGRAM_ID)
-                .expect("lifinity program id")
-                .to_bytes()
-                .to_vec(),
-            protocol_name: String::from("Lifinity v2"),
-            protocol_family: String::from("Lifinity"),
         }
     }
 

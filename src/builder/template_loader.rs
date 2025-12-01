@@ -7,22 +7,20 @@ use tracing::{info, warn};
 
 use crate::builder::templates::{
     AccountSpec, AmmV3SwapTemplate, ArgSpec, CpAmmSwapTemplate, LbClmmSwapTemplate,
-    LifinitySwapTemplate, SwapTemplateDirection, WhirlpoolSwapTemplate, AMM_V3_SWAP_TEMPLATES,
-    CP_AMM_SWAP_TEMPLATES, LB_CLMM_SWAP_TEMPLATES, LIFINITY_SWAP_TEMPLATES,
-    WHIRLPOOL_SWAP_TEMPLATES,
+    SwapTemplateDirection, WhirlpoolSwapTemplate, AMM_V3_SWAP_TEMPLATES, CP_AMM_SWAP_TEMPLATES,
+    LB_CLMM_SWAP_TEMPLATES, WHIRLPOOL_SWAP_TEMPLATES,
 };
 use crate::builder::{
     AmmV3FieldLayout, AmmV3PoolAccounts, AmmV3PoolMeta, AmmV3TemplateParams, CpAmmFieldLayout,
     CpAmmPoolMeta, CpAmmTemplateParams, InstructionTemplate, LbClmmFieldLayout, LbClmmPoolMeta,
-    LbClmmTemplateParams, LifinityFieldLayout, LifinityPoolMeta, LifinityTemplateParams,
-    TemplateCache, TemplateSlice, WhirlpoolFieldLayout, WhirlpoolPoolMeta, WhirlpoolTemplateParams,
+    LbClmmTemplateParams, TemplateCache, TemplateSlice, WhirlpoolFieldLayout, WhirlpoolPoolMeta,
+    WhirlpoolTemplateParams,
 };
 use crate::config::AppConfig;
 
 const DEFAULT_AMM_V3_CU_BUDGET: u32 = 350_000;
 const DEFAULT_CP_AMM_CU_BUDGET: u32 = 400_000;
 const DEFAULT_LB_CLMM_CU_BUDGET: u32 = 420_000;
-const DEFAULT_LIFINITY_CU_BUDGET: u32 = 320_000;
 const DEFAULT_WHIRLPOOL_CU_BUDGET: u32 = 380_000;
 const AMM_V3_POOL_VAULT_SEED: &[u8] = b"pool_vault";
 const SPL_TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -36,9 +34,6 @@ pub fn populate_static_templates(cache: &TemplateCache, config: &AppConfig) {
     }
     if let Err(err) = load_lb_clmm_templates(cache, config) {
         warn!(error = ?err, "failed to load lb_clmm templates into cache");
-    }
-    if let Err(err) = load_lifinity_templates(cache, config) {
-        warn!(error = ?err, "failed to load lifinity templates into cache");
     }
     if let Err(err) = load_whirlpool_templates(cache, config) {
         warn!(error = ?err, "failed to load whirlpool templates into cache");
@@ -144,40 +139,6 @@ pub(super) fn register_lb_clmm_pool(cache: &TemplateCache, meta: &LbClmmPoolMeta
     }
 
     info!(pool = %meta.pool_id, fee_bps = meta.fee_tier_bps, count = inserted, "registered lb_clmm instruction templates");
-    Ok(())
-}
-
-fn load_lifinity_templates(cache: &TemplateCache, _config: &AppConfig) -> Result<()> {
-    let mut inserted = 0usize;
-    for template in LIFINITY_SWAP_TEMPLATES {
-        let params = build_lifinity_params(template, None).with_context(|| {
-            format!(
-                "failed to build lifinity template for direction {:?}",
-                template.direction
-            )
-        })?;
-        cache.insert(InstructionTemplate::from_lifinity(params));
-        inserted += 1;
-    }
-
-    info!(count = inserted, "loaded lifinity instruction templates");
-    Ok(())
-}
-
-pub(super) fn register_lifinity_pool(cache: &TemplateCache, meta: &LifinityPoolMeta) -> Result<()> {
-    let mut inserted = 0usize;
-    for template in LIFINITY_SWAP_TEMPLATES {
-        let params = build_lifinity_params(template, Some(meta)).with_context(|| {
-            format!(
-                "failed to build lifinity template for pool {} direction {:?}",
-                meta.pool_id, template.direction
-            )
-        })?;
-        cache.insert(InstructionTemplate::from_lifinity(params));
-        inserted += 1;
-    }
-
-    info!(pool = %meta.pool_id, fee_bps = meta.fee_tier_bps, count = inserted, "registered lifinity instruction templates");
     Ok(())
 }
 
@@ -591,104 +552,6 @@ fn resolve_cp_amm_account(pool_id: Pubkey, name: &str, value: Option<Pubkey>) ->
     value.ok_or_else(|| anyhow!("cp_amm pool {} missing {name} account", pool_id))
 }
 
-fn apply_lifinity_pool_accounts(
-    template: &LifinitySwapTemplate,
-    accounts: &mut [AccountMeta],
-    pool_meta: &LifinityPoolMeta,
-) -> Result<()> {
-    let specs = template.accounts;
-    if specs.len() != accounts.len() {
-        anyhow::bail!(
-            "template account/spec length mismatch ({} != {})",
-            accounts.len(),
-            specs.len()
-        );
-    }
-
-    let pool_id = pool_meta.pool_id;
-    let pool_accounts = &pool_meta.accounts;
-    let authority = resolve_required_account(pool_id, "authority", pool_accounts.authority)?;
-    let token_program =
-        resolve_required_account(pool_id, "token_program", pool_accounts.token_program)?;
-    let token_a_vault =
-        resolve_required_account(pool_id, "token_a_vault", pool_accounts.token_a_vault)?;
-    let token_b_vault =
-        resolve_required_account(pool_id, "token_b_vault", pool_accounts.token_b_vault)?;
-    let pool_mint = resolve_required_account(pool_id, "pool_mint", pool_accounts.pool_mint)?;
-    let fee_account = resolve_required_account(pool_id, "fee_account", pool_accounts.fee_account)?;
-    let oracle_main = resolve_required_account(pool_id, "oracle_main", pool_accounts.oracle_main)?;
-    let oracle_sub = resolve_required_account(pool_id, "oracle_sub", pool_accounts.oracle_sub)?;
-    let oracle_pc = resolve_required_account(pool_id, "oracle_pc", pool_accounts.oracle_pc)?;
-
-    let (swap_source, swap_destination) = match template.direction {
-        SwapTemplateDirection::BaseIn => (token_a_vault, token_b_vault),
-        SwapTemplateDirection::BaseOut => (token_b_vault, token_a_vault),
-    };
-
-    for (spec, meta) in specs.iter().zip(accounts.iter_mut()) {
-        if spec.address.is_some() {
-            continue;
-        }
-
-        match spec.name {
-            "authority" => meta.pubkey = authority,
-            "amm" => meta.pubkey = pool_id,
-            "swapSource" => meta.pubkey = swap_source,
-            "swapDestination" => meta.pubkey = swap_destination,
-            "poolMint" => meta.pubkey = pool_mint,
-            "feeAccount" => meta.pubkey = fee_account,
-            "tokenProgram" => meta.pubkey = token_program,
-            "oracleMainAccount" => meta.pubkey = oracle_main,
-            "oracleSubAccount" => meta.pubkey = oracle_sub,
-            "oraclePcAccount" => meta.pubkey = oracle_pc,
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-fn build_lifinity_params(
-    template: &LifinitySwapTemplate,
-    pool_meta: Option<&LifinityPoolMeta>,
-) -> Result<LifinityTemplateParams> {
-    let program_id = Pubkey::from_str(template.program_id)
-        .with_context(|| format!("invalid program id {}", template.program_id))?;
-    let mut accounts = convert_accounts(template.accounts)?;
-
-    let mut data = Vec::with_capacity(64);
-    data.extend_from_slice(&template.discriminator);
-    let field_layout = encode_lifinity_args(template, &mut data)?;
-    let pool_accounts = if let Some(meta) = pool_meta {
-        apply_lifinity_pool_accounts(template, &mut accounts, meta)?;
-        Some(meta.accounts.clone())
-    } else {
-        None
-    };
-    let template_hash = compute_template_hash(&program_id, &accounts, &data);
-
-    let (pool_id, fee_tier_bps, alt_handle) = pool_meta
-        .map(|meta| (meta.pool_id, meta.fee_tier_bps, meta.alt_handle))
-        .unwrap_or_else(|| (synth_pool_id(&program_id, template.direction), 0, None));
-
-    Ok(LifinityTemplateParams {
-        pool_id,
-        program_id,
-        direction: template.direction,
-        fee_tier_bps,
-        discriminator: template.discriminator,
-        accounts,
-        data,
-        field_layout,
-        cu_budget: DEFAULT_LIFINITY_CU_BUDGET,
-        tlv_bytes: 0,
-        template_hash,
-        alt_handle,
-        account_specs: template.accounts,
-        pool_accounts,
-    })
-}
-
 fn build_whirlpool_params(
     template: &WhirlpoolSwapTemplate,
     pool_meta: Option<&WhirlpoolPoolMeta>,
@@ -873,40 +736,6 @@ fn encode_lb_clmm_args(
         amount_out,
         limit_price,
         price_impact_bps: price_impact_limit,
-    })
-}
-
-fn encode_lifinity_args(
-    template: &LifinitySwapTemplate,
-    buffer: &mut Vec<u8>,
-) -> Result<LifinityFieldLayout> {
-    let mut amount_in = None;
-    let mut min_out = None;
-
-    for arg in template.args {
-        match arg.name {
-            "amountIn" => {
-                amount_in = Some(write_u64(buffer, 0)?);
-            }
-            "minimumAmountOut" => {
-                min_out = Some(write_u64(buffer, 0)?);
-            }
-            _ if arg.ty == "u64" => {
-                let _ = write_u64(buffer, 0)?;
-            }
-            other => {
-                return Err(anyhow!("unsupported lifinity arg {}", other));
-            }
-        }
-    }
-
-    let amount_in = amount_in.ok_or_else(|| anyhow!("lifinity template missing amountIn"))?;
-    let min_out = min_out.ok_or_else(|| anyhow!("lifinity template missing minimumAmountOut"))?;
-
-    Ok(LifinityFieldLayout {
-        amount_in,
-        amount_out: min_out,
-        slot_padding: None,
     })
 }
 

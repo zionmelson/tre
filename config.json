@@ -254,7 +254,7 @@
     "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
     "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
     "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
-    "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN"
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
   ],
   "flash_loans": {
     "WSOL": {
@@ -273,8 +273,9 @@
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
         "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
-        "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN"
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
       ]
     },
     "USDC": {
@@ -293,8 +294,9 @@
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
         "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
-        "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN"
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
       ]
     },
     "USDT": {
@@ -313,8 +315,9 @@
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
         "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
-        "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN"
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
       ]
     },
     "mSOL": {
@@ -333,8 +336,9 @@
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
         "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
-        "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN"
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
       ]
     },
     "WETH": {
@@ -353,8 +357,9 @@
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
         "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
-        "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN"
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
       ]
     },
     "JTO": {
@@ -373,8 +378,9 @@
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
         "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
-        "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN"
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
       ]
     },
     "JUP": {
@@ -393,8 +399,9 @@
       "receiver_program_allowlist": [
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
         "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
-        "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN"
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
       ]
     }
   },

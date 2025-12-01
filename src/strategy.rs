@@ -18,8 +18,7 @@ use tracing::{debug, info, warn};
 use crate::builder::compute_flash_loan_fee;
 use crate::config::{AppConfig, DEFAULT_PROTOCOL_BORROW_PCT};
 use crate::hydration::types::{
-    CP_AMM_PROGRAM_ID, LB_CLMM_PROGRAM_ID, LIFINITY_V2_PROGRAM_ID, RAYDIUM_V3_PROGRAM_ID,
-    WHIRLPOOL_PROGRAM_ID,
+    CP_AMM_PROGRAM_ID, LB_CLMM_PROGRAM_ID, RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_PROGRAM_ID,
 };
 use crate::planner::graph_manager::ArbitrageOpportunity;
 use crate::planner::types::{BundleCandidate, Opportunity, RoutePlan};
@@ -113,16 +112,10 @@ impl Default for StrategyConfig {
 }
 
 fn default_protocol_borrow_map() -> HashMap<String, f64> {
-    [
-        "raydium_v3",
-        "cp_amm",
-        "lb_clmm",
-        "lifinity_v2",
-        "whirlpool",
-    ]
-    .into_iter()
-    .map(|protocol| (protocol.to_string(), DEFAULT_PROTOCOL_BORROW_PCT))
-    .collect()
+    ["raydium_v3", "cp_amm", "lb_clmm", "whirlpool"]
+        .into_iter()
+        .map(|protocol| (protocol.to_string(), DEFAULT_PROTOCOL_BORROW_PCT))
+        .collect()
 }
 
 impl StrategyConfig {
@@ -694,7 +687,6 @@ fn protocol_for_program(program_id: &str) -> Option<&'static str> {
         RAYDIUM_V3_PROGRAM_ID => Some("raydium_v3"),
         CP_AMM_PROGRAM_ID => Some("cp_amm"),
         LB_CLMM_PROGRAM_ID => Some("lb_clmm"),
-        LIFINITY_V2_PROGRAM_ID => Some("lifinity_v2"),
         WHIRLPOOL_PROGRAM_ID => Some("whirlpool"),
         _ => None,
     }

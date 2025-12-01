@@ -8,16 +8,14 @@ mod protocols;
 
 pub use protocols::{
     CpAmmPoolExtras, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras,
-    LbClmmPoolExtras, LifinityPoolExtras, RaydiumV3PoolExtras, WhirlpoolPoolExtras,
-    CP_AMM_INPUT_UTILIZATION_BPS, CP_AMM_PROGRAM_ID, LB_CLMM_INPUT_UTILIZATION_BPS,
-    LB_CLMM_PROGRAM_ID, LIFINITY_V2_INPUT_UTILIZATION_BPS, LIFINITY_V2_PROGRAM_ID,
+    LbClmmPoolExtras, RaydiumV3PoolExtras, WhirlpoolPoolExtras, CP_AMM_INPUT_UTILIZATION_BPS,
+    CP_AMM_PROGRAM_ID, LB_CLMM_INPUT_UTILIZATION_BPS, LB_CLMM_PROGRAM_ID,
     RAYDIUM_V3_INPUT_UTILIZATION_BPS, RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_INPUT_UTILIZATION_BPS,
     WHIRLPOOL_PROGRAM_ID,
 };
 
 use protocols::{
-    parse_cp_amm_extras, parse_lb_clmm_extras, parse_lifinity_extras, parse_raydium_v3_extras,
-    parse_whirlpool_extras,
+    parse_cp_amm_extras, parse_lb_clmm_extras, parse_raydium_v3_extras, parse_whirlpool_extras,
 };
 
 #[derive(Debug, Clone)]
@@ -101,7 +99,6 @@ pub struct PoolUpdateExtensions {
     pub raydium_v3: Option<RaydiumV3PoolExtras>,
     pub cp_amm: Option<CpAmmPoolExtras>,
     pub lb_clmm: Option<LbClmmPoolExtras>,
-    pub lifinity_v2: Option<LifinityPoolExtras>,
     pub whirlpool: Option<WhirlpoolPoolExtras>,
 }
 
@@ -110,14 +107,12 @@ impl PoolUpdateExtensions {
         let raydium_v3 = parse_raydium_v3_extras(event);
         let cp_amm = parse_cp_amm_extras(event);
         let lb_clmm = parse_lb_clmm_extras(event);
-        let lifinity_v2 = parse_lifinity_extras(event);
         let whirlpool = parse_whirlpool_extras(event);
         Self {
             instruction: event.instruction.clone(),
             raydium_v3,
             cp_amm,
             lb_clmm,
-            lifinity_v2,
             whirlpool,
         }
     }
