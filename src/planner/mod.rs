@@ -39,6 +39,7 @@ const CYCLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CYCLE_ALERT_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_CYCLE_ALERTS_PER_BATCH: usize = 5;
 const DEFAULT_CYCLE_NOTIONAL_LAMPORTS: u64 = 1_000_000;
+const BUFFER_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
     pub detection_budget: Duration,
@@ -74,6 +75,7 @@ pub struct FastLanePlanner {
     pool_store: Arc<PoolStore>,
     readiness_timeout: Duration,
     min_ready_pools: usize,
+    next_buffer_sample: Instant,
 }
 
 impl FastLanePlanner {
@@ -108,6 +110,7 @@ impl FastLanePlanner {
             pool_store,
             readiness_timeout,
             min_ready_pools,
+            next_buffer_sample: Instant::now(),
         }
     }
 
@@ -168,6 +171,7 @@ impl FastLanePlanner {
                 self.pending_cycle_scan = false;
             }
             self.emit_watcher_metrics();
+            self.maybe_emit_buffer_metrics(false);
             if !made_progress {
                 thread::yield_now();
                 thread::sleep(Duration::from_millis(2));
@@ -260,6 +264,18 @@ impl FastLanePlanner {
     fn emit_watcher_metrics(&self) {
         telemetry::record_watcher_cache_depth(self.pool_cache.len());
         telemetry::record_watcher_cycle_pending(self.pending_cycle_scan);
+    }
+
+    fn maybe_emit_buffer_metrics(&mut self, force: bool) {
+        let now = Instant::now();
+        if !force && now < self.next_buffer_sample {
+            return;
+        }
+        self.next_buffer_sample = now + BUFFER_SAMPLE_INTERVAL;
+        let ring_len = self.bundle_producer.len();
+        telemetry::record_fastlane_ring_depth(ring_len, self.bundle_producer.capacity());
+        let slab_free = self.bundle_pool.available();
+        telemetry::record_fastlane_slab_capacity(slab_free, self.bundle_pool.capacity());
     }
 
     fn drain_pool_updates(&mut self) -> bool {
@@ -458,6 +474,8 @@ impl FastLanePlanner {
         match self.bundle_pool.try_acquire(candidate) {
             Some(lease) => {
                 if let Err(lease) = self.bundle_producer.push(lease) {
+                    telemetry::record_fastlane_ring_drop();
+                    self.maybe_emit_buffer_metrics(true);
                     warn!(
                         target = "fastlane",
                         seq,
@@ -469,6 +487,8 @@ impl FastLanePlanner {
                 }
             }
             None => {
+                telemetry::record_fastlane_slab_exhaustion();
+                self.maybe_emit_buffer_metrics(true);
                 warn!(
                     target = "fastlane",
                     seq,

@@ -50,6 +50,8 @@ sha2 = "0.10"
 prometheus-client = "0.22"
 csv = "1"
 solend = { path = "solend" }
+ratatui = "0.26"
+crossterm = "0.27"
 
 [build-dependencies]
 prost-build = "0.13"

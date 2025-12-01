@@ -32,6 +32,14 @@ impl<T> RingProducer<T> {
     pub fn push(&self, item: T) -> Result<(), T> {
         self.inner.push(item)
     }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
 }
 
 pub struct RingConsumer<T> {
@@ -105,6 +113,16 @@ impl<T> RingInner<T> {
 
     fn is_empty(&self) -> bool {
         self.tail.load(Ordering::Acquire) == self.head.load(Ordering::Acquire)
+    }
+
+    fn len(&self) -> usize {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        head.saturating_sub(tail)
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
     }
 }
 

@@ -22,7 +22,7 @@ use tokio::{runtime::Handle, task::JoinHandle};
 use tracing::{info, warn};
 
 const PROMETHEUS_ENV: &str = "PROMETHEUS_METRICS_ADDR";
-const PROMETHEUS_METRIC_PREFIX_ALLOWLIST: &[&str] = &["hydration_", "watcher_"];
+const PROMETHEUS_METRIC_PREFIX_ALLOWLIST: &[&str] = &["hydration_", "watcher_", "fastlane_"];
 
 static TELEMETRY: OnceCell<TelemetryState> = OnceCell::new();
 static HTTP_SERVER: OnceCell<Option<JoinHandle<()>>> = OnceCell::new();
@@ -60,6 +60,12 @@ struct TelemetryState {
     watcher_cache_size: Gauge,
     watcher_cycle_pending: Gauge,
     watcher_update_backlog: Gauge,
+    fastlane_ring_depth_pct: Gauge,
+    fastlane_ring_depth_items: Gauge,
+    fastlane_ring_drop_events: Counter,
+    fastlane_slab_free_pct: Gauge,
+    fastlane_slab_free_slots: Gauge,
+    fastlane_slab_exhaustion_events: Counter,
 }
 
 impl TelemetryState {
@@ -283,6 +289,48 @@ impl TelemetryState {
             watcher_update_backlog.clone(),
         );
 
+        let fastlane_ring_depth_pct = Gauge::default();
+        registry.register(
+            "fastlane_ring_depth_pct",
+            "Percentage (0-100) of the fast-lane bundle ring currently occupied",
+            fastlane_ring_depth_pct.clone(),
+        );
+
+        let fastlane_ring_depth_items = Gauge::default();
+        registry.register(
+            "fastlane_ring_depth_items",
+            "Number of bundle candidates currently buffered in the fast-lane ring",
+            fastlane_ring_depth_items.clone(),
+        );
+
+        let fastlane_ring_drop_events = Counter::default();
+        registry.register(
+            "fastlane_ring_drop_events_total",
+            "Total bundle candidates dropped because the fast-lane ring was saturated",
+            fastlane_ring_drop_events.clone(),
+        );
+
+        let fastlane_slab_free_pct = Gauge::default();
+        registry.register(
+            "fastlane_slab_free_pct",
+            "Percentage (0-100) of the fast-lane bundle slab slots currently available",
+            fastlane_slab_free_pct.clone(),
+        );
+
+        let fastlane_slab_free_slots = Gauge::default();
+        registry.register(
+            "fastlane_slab_free_slots",
+            "Number of free bundle slots remaining in the fast-lane slab pool",
+            fastlane_slab_free_slots.clone(),
+        );
+
+        let fastlane_slab_exhaustion_events = Counter::default();
+        registry.register(
+            "fastlane_slab_exhaustion_events_total",
+            "Total bundle candidates dropped because the fast-lane slab pool was exhausted",
+            fastlane_slab_exhaustion_events.clone(),
+        );
+
         Self {
             registry: Arc::new(registry),
             detection_latency,
@@ -316,6 +364,12 @@ impl TelemetryState {
             watcher_cache_size,
             watcher_cycle_pending,
             watcher_update_backlog,
+            fastlane_ring_depth_pct,
+            fastlane_ring_depth_items,
+            fastlane_ring_drop_events,
+            fastlane_slab_free_pct,
+            fastlane_slab_free_slots,
+            fastlane_slab_exhaustion_events,
         }
     }
 }
@@ -789,6 +843,46 @@ pub fn record_watcher_update_backlog(len: usize, capacity: usize) {
             (len as f64 / capacity as f64 * 100.0).clamp(0.0, 100.0)
         };
         state.watcher_update_backlog.set(pct.round() as i64);
+    }
+}
+
+pub fn record_fastlane_ring_depth(len: usize, capacity: usize) {
+    if let Some(state) = TELEMETRY.get() {
+        let pct = if capacity == 0 {
+            0.0
+        } else {
+            (len as f64 / capacity as f64 * 100.0).clamp(0.0, 100.0)
+        };
+        state.fastlane_ring_depth_pct.set(pct.round() as i64);
+        state
+            .fastlane_ring_depth_items
+            .set(clamp_u64_to_i64(len as u64));
+    }
+}
+
+pub fn record_fastlane_ring_drop() {
+    if let Some(state) = TELEMETRY.get() {
+        state.fastlane_ring_drop_events.inc();
+    }
+}
+
+pub fn record_fastlane_slab_capacity(free_slots: usize, capacity: usize) {
+    if let Some(state) = TELEMETRY.get() {
+        let pct = if capacity == 0 {
+            0.0
+        } else {
+            (free_slots as f64 / capacity as f64 * 100.0).clamp(0.0, 100.0)
+        };
+        state.fastlane_slab_free_pct.set(pct.round() as i64);
+        state
+            .fastlane_slab_free_slots
+            .set(clamp_u64_to_i64(free_slots as u64));
+    }
+}
+
+pub fn record_fastlane_slab_exhaustion() {
+    if let Some(state) = TELEMETRY.get() {
+        state.fastlane_slab_exhaustion_events.inc();
     }
 }
 

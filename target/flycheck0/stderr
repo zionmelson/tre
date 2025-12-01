@@ -1,7 +1,44 @@
-   0.575877042s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint: stale: changed "/Users/ye/tre/src/hydration/types.rs"
-   0.575895375s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint:           (vs) "/Users/ye/tre/target/debug/.fingerprint/tre-arb-bot-bfe16bcc0b0101b4/dep-test-lib-tre_arb_bot"
-   0.575897750s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1764578795, nanos: 219496516 } < FileTime { seconds: 1764580439, nanos: 147201995 }
-   0.576097042s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("tre_arb_bot", ["lib"], "/Users/ye/tre/src/lib.rs", Edition2021) }
-   0.576136000s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/ye/tre/target/debug/.fingerprint/tre-arb-bot-bfe16bcc0b0101b4/dep-test-lib-tre_arb_bot", reference_mtime: FileTime { seconds: 1764578795, nanos: 219496516 }, stale: "/Users/ye/tre/src/hydration/types.rs", stale_mtime: FileTime { seconds: 1764580439, nanos: 147201995 } }))
+   0.856092250s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint: stale: changed "/Users/ye/tre/src/hydration/types.rs"
+   0.856135458s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint:           (vs) "/Users/ye/tre/target/debug/.fingerprint/tre-arb-bot-a156f4ceaa692d66/dep-lib-tre_arb_bot"
+   0.856137958s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1764597573, nanos: 430384305 } < FileTime { seconds: 1764597686, nanos: 301819766 }
+   0.856938167s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("tre_arb_bot", ["lib"], "/Users/ye/tre/src/lib.rs", Edition2021) }
+   0.856987000s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/ye/tre/target/debug/.fingerprint/tre-arb-bot-a156f4ceaa692d66/dep-lib-tre_arb_bot", reference_mtime: FileTime { seconds: 1764597573, nanos: 430384305 }, stale: "/Users/ye/tre/src/hydration/types.rs", stale_mtime: FileTime { seconds: 1764597686, nanos: 301819766 } }))
+   0.953365792s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint: fingerprint error for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("tre_arb_bot", ["lib"], "/Users/ye/tre/src/lib.rs", Edition2021) }
+   0.953380292s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre_arb_bot"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/ye/tre/target/debug/.fingerprint/tre-arb-bot-5d949ff539b0a82f/test-lib-tre_arb_bot`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.970219417s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: false }/TargetInner { name: "tre-arb-bot", doc: true, ..: with_path("/Users/ye/tre/src/main.rs", Edition2021) }
+   0.970230625s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tre_arb_bot" })
+   0.972239875s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { name: "tre-arb-bot", doc: true, ..: with_path("/Users/ye/tre/src/main.rs", Edition2021) }
+   0.972247792s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-arb-bot"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tre_arb_bot" })
+   0.974397875s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-dashboard"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: false }/TargetInner { name: "tre-dashboard", doc: true, ..: with_path("/Users/ye/tre/src/bin/tre-dashboard.rs", Edition2021) }
+   0.974403708s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-dashboard"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tre_arb_bot" })
+   0.976712542s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-dashboard"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { name: "tre-dashboard", doc: true, ..: with_path("/Users/ye/tre/src/bin/tre-dashboard.rs", Edition2021) }
+   0.976722833s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="tre-dashboard"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tre_arb_bot" })
+   0.978778000s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="corecast_connect"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { kind: "test", name: "corecast_connect", benched: false, ..: with_path("/Users/ye/tre/tests/corecast_connect.rs", Edition2021) }
+   0.978786083s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="corecast_connect"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tre_arb_bot" })
+   0.980665583s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="solend_flash_loan"}: cargo::core::compiler::fingerprint: fingerprint dirty for tre-arb-bot v0.1.0 (/Users/ye/tre)/Check { test: true }/TargetInner { kind: "test", name: "solend_flash_loan", benched: false, ..: with_path("/Users/ye/tre/tests/solend_flash_loan.rs", Edition2021) }
+   0.980671542s  INFO prepare_target{force=false package_id=tre-arb-bot v0.1.0 (/Users/ye/tre) target="solend_flash_loan"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tre_arb_bot" })
     Checking tre-arb-bot v0.1.0 (/Users/ye/tre)
-error: could not compile `tre-arb-bot` (lib test) due to 4 previous errors; 1 warning emitted
+error: could not compile `tre-arb-bot` (lib test) due to 4 previous errors; 2 warnings emitted
