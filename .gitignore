@@ -3,3 +3,4 @@ certs/
 target/
 tests/
 config.json
+output.txt
