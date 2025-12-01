@@ -22,6 +22,7 @@ const ENV_JITO_AUCTION_STREAM_URL: &str = "TRE_JITO_AUCTION_STREAM_URL";
 const ENV_JITO_CA_PEM: &str = "TRE_JITO_CA_PEM";
 const ENV_QUICKNODE_RPCS: &str = "TRE_QUICKNODE_RPCS";
 const ENV_HYDRATION_ONLY_MODE: &str = "TRE_HYDRATION_ONLY_MODE";
+const ENV_DRY_RUN_MODE: &str = "TRE_DRY_RUN_MODE";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -52,6 +53,8 @@ pub struct AppConfig {
     pub submission: SubmissionTrackingConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    #[serde(default)]
+    pub watcher: WatcherConfig,
     #[serde(default, deserialize_with = "deserialize_optional_path")]
     pub bam_validator_csv: Option<PathBuf>,
     #[serde(skip)]
@@ -102,10 +105,17 @@ impl AppConfig {
             self.protocols.entry((*protocol).to_string()).or_default();
         }
 
-        for entry in self.protocols.values_mut() {
+        for (name, entry) in self.protocols.iter_mut() {
             if entry.rpc_endpoints.is_empty() {
                 entry.rpc_endpoints = self.quicknode_rpcs.clone();
             }
+
+            let fallback_pct = default_protocol_borrow_pct(name);
+            let pct = entry
+                .borrow_pct
+                .map(|value| normalize_borrow_pct(value, fallback_pct))
+                .unwrap_or(fallback_pct);
+            entry.borrow_pct = Some(pct);
         }
     }
 
@@ -127,6 +137,13 @@ impl AppConfig {
         self.protocols
             .get(protocol)
             .and_then(|entry| entry.max_utilization_bps)
+    }
+
+    pub fn protocol_borrow_pct(&self, protocol: &str) -> f64 {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.borrow_pct)
+            .unwrap_or_else(|| default_protocol_borrow_pct(protocol))
     }
 
     pub fn bam_validator_csv_path(&self) -> PathBuf {
@@ -345,6 +362,9 @@ impl AppConfig {
         if let Some(enabled) = env_bool(ENV_HYDRATION_ONLY_MODE) {
             self.pipeline.hydration_only_mode = enabled;
         }
+        if let Some(enabled) = env_bool(ENV_DRY_RUN_MODE) {
+            self.pipeline.dry_run_mode = enabled;
+        }
     }
 }
 
@@ -436,13 +456,54 @@ pub struct PerfTuning {
 #[serde(default)]
 pub struct PipelineConfig {
     pub hydration_only_mode: bool,
+    pub dry_run_mode: bool,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             hydration_only_mode: false,
+            dry_run_mode: false,
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WatcherConfig {
+    pub max_tracked_pools: usize,
+    pub min_ready_pools: usize,
+    pub initial_ready_timeout_ms: u64,
+    pub pool_stale_ttl_ms: u64,
+    pub pool_stale_sweep_ms: u64,
+    pub queue_capacity: usize,
+    pub queue_drop_policy: QueueDropPolicy,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            max_tracked_pools: 256,
+            min_ready_pools: 32,
+            initial_ready_timeout_ms: 5_000,
+            pool_stale_ttl_ms: 250,
+            pool_stale_sweep_ms: 250,
+            queue_capacity: 1_024,
+            queue_drop_policy: QueueDropPolicy::DropNewest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueDropPolicy {
+    DropNewest,
+    DropSubscriber,
+}
+
+impl Default for QueueDropPolicy {
+    fn default() -> Self {
+        QueueDropPolicy::DropNewest
     }
 }
 
@@ -466,6 +527,8 @@ pub struct ProtocolConfig {
     pub hydration_retry_ms: Option<u64>,
     #[serde(default)]
     pub max_utilization_bps: Option<u64>,
+    #[serde(default)]
+    pub borrow_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -502,6 +565,25 @@ const KNOWN_PROTOCOLS: &[&str] = &[
     "lifinity_v2",
     "whirlpool",
 ];
+
+pub const DEFAULT_PROTOCOL_BORROW_PCT: f64 = 0.35;
+
+fn default_protocol_borrow_pct(protocol: &str) -> f64 {
+    match protocol {
+        "raydium_v3" | "cp_amm" | "lb_clmm" | "lifinity_v2" | "whirlpool" => {
+            DEFAULT_PROTOCOL_BORROW_PCT
+        }
+        _ => DEFAULT_PROTOCOL_BORROW_PCT,
+    }
+}
+
+fn normalize_borrow_pct(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        fallback
+    }
+}
 
 impl Default for PerfTuning {
     fn default() -> Self {

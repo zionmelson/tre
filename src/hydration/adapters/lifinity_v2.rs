@@ -680,6 +680,47 @@ impl ProtocolAdapter for LifinityAdapter {
         self.upsert_state(update, extras);
     }
 
+    fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
+        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
+            return;
+        };
+        let Some(state) = self.get_state(&pool_pubkey) else {
+            return;
+        };
+        let extras = snapshot
+            .extensions
+            .lifinity_v2
+            .get_or_insert_with(LifinityPoolExtras::default);
+
+        if extras.token_a_vault.is_none() {
+            extras.token_a_vault = state.token_a_vault.map(|pk| pk.to_string());
+        }
+        if extras.token_b_vault.is_none() {
+            extras.token_b_vault = state.token_b_vault.map(|pk| pk.to_string());
+        }
+        if extras.authority.is_none() {
+            extras.authority = state.authority.map(|pk| pk.to_string());
+        }
+        if extras.token_program.is_none() {
+            extras.token_program = state.token_program.map(|pk| pk.to_string());
+        }
+        if extras.pool_mint.is_none() {
+            extras.pool_mint = state.pool_mint.map(|pk| pk.to_string());
+        }
+        if extras.fee_account.is_none() {
+            extras.fee_account = state.fee_account.map(|pk| pk.to_string());
+        }
+        if extras.oracle_main.is_none() {
+            extras.oracle_main = state.oracle_main.map(|pk| pk.to_string());
+        }
+        if extras.oracle_sub.is_none() {
+            extras.oracle_sub = state.oracle_sub.map(|pk| pk.to_string());
+        }
+        if extras.oracle_pc.is_none() {
+            extras.oracle_pc = state.oracle_pc.map(|pk| pk.to_string());
+        }
+    }
+
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
@@ -1733,6 +1774,8 @@ mod tests {
             pool_id: pool.to_string(),
             program_id: LIFINITY_PROGRAM_ID.to_string(),
             slot: 123,
+            block_hash: None,
+            block_time_unix: None,
             base_mint: base_mint.to_string(),
             quote_mint: quote_mint.to_string(),
             base_post_amount: state.vault_a_balance.unwrap(),

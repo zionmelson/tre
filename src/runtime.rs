@@ -7,13 +7,12 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::{signal, task};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::builder::BuilderHandle;
 use crate::bundle::{BundleClient, BundleTracker};
 use crate::config::AppConfig;
 use crate::core::{Lease, RingConsumer, SlabPool, SpscRing};
-use crate::hydration::types::PoolSnapshot;
 use crate::hydration::{HydrationService, HydrationSnapshot};
 use crate::notifier::Notifier;
 use crate::planner::types::BundleCandidate;
@@ -33,24 +32,58 @@ impl ExecutorRuntime {
     pub fn spawn(config: Arc<AppConfig>) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let hydration_only = config.pipeline.hydration_only_mode;
+        let dry_run = config.pipeline.dry_run_mode;
         if hydration_only {
             info!("hydration-only mode enabled; execution lanes disabled");
+        }
+        if dry_run {
+            info!("dry-run mode enabled; submission lanes disabled");
         }
 
         let mut handles = Vec::new();
         let builder = BuilderHandle::new(config.clone())?;
         let hydration_service = HydrationService::new(builder.clone(), config.clone());
+        let pool_store = hydration_service.pool_store();
+        let pool_store_view = hydration_service.pool_store_view();
         let strategy = Arc::new(StrategyEngine::new(config.clone())?);
         let notifier = Arc::new(Notifier::new(strategy.clone(), config.clone()));
         let (hydration_tx, hydration_rx) =
             SpscRing::<HydrationSnapshot>::with_capacity(config.perf.ring_capacity).into_split();
-        let (pool_tx, pool_rx) =
-            SpscRing::<PoolSnapshot>::with_capacity(config.perf.ring_capacity).into_split();
-        handles.push(hydration_service.spawn_adapter_ingest(stop.clone(), pool_tx)?);
+        handles.push(hydration_service.spawn_adapter_ingest(stop.clone())?);
         handles.push(hydration_service.spawn_snapshot_worker(stop.clone(), hydration_tx)?);
+        handles.push(hydration_service.spawn_watcher_metrics(stop.clone())?);
+        handles.push(hydration_service.spawn_pool_maintenance(stop.clone())?);
 
-        let (graph_handle, graph_thread) = spawn_graph_service(stop.clone(), None, pool_rx)?;
+        let queue_capacity = config.watcher.queue_capacity.max(1);
+        let graph_updates = pool_store.subscribe(queue_capacity);
+        let planner_updates = pool_store.subscribe(queue_capacity);
+        let planner_config = PlannerConfig::default();
+        let (graph_handle, graph_thread) = spawn_graph_service(
+            stop.clone(),
+            None,
+            graph_updates,
+            pool_store_view.clone(),
+            builder.clone(),
+            planner_config.clone(),
+        )?;
         handles.push(graph_thread);
+
+        let ready_timeout = Duration::from_millis(config.watcher.initial_ready_timeout_ms.max(1));
+        if pool_store.wait_until_ready(ready_timeout) {
+            info!(
+                target = "hydration",
+                pools = pool_store.len(),
+                "pool store ready; planner lanes may begin"
+            );
+        } else {
+            warn!(
+                target = "hydration",
+                timeout_ms = config.watcher.initial_ready_timeout_ms,
+                ready_pools = pool_store.len(),
+                min_ready = config.watcher.min_ready_pools,
+                "timed out waiting for initial pool hydration"
+            );
+        }
 
         if hydration_only {
             handles.push(spawn_snapshot_drain(stop.clone(), hydration_rx)?);
@@ -79,29 +112,38 @@ impl ExecutorRuntime {
             notifier.clone(),
             planner_tx,
             builder.clone(),
-            PlannerConfig::default(),
+            planner_config.clone(),
             bundle_pool,
             trade_rx,
+            planner_updates,
+            pool_store.clone(),
+            ready_timeout,
+            config.watcher.min_ready_pools,
         )?);
 
-        let bundle_client = Arc::new(BundleClient::new(config.clone(), builder.auth_signer())?);
-        let (tracker, mut tracker_handles) = BundleTracker::spawn(
-            stop.clone(),
-            config.clone(),
-            notifier.clone(),
-            builder.auth_signer(),
-        )?;
-        handles.append(&mut tracker_handles);
-        handles.push(submission::spawn_fast_lane_submitter(
-            stop.clone(),
-            Some(config.perf.submit_core),
-            planner_rx,
-            builder.clone(),
-            bundle_client,
-            notifier.clone(),
-            tracker,
-            SubmissionConfig::default(),
-        )?);
+        if dry_run {
+            handles.push(spawn_planner_drain(stop.clone(), planner_rx)?);
+            info!("dry-run sink active; planner outputs discarded");
+        } else {
+            let bundle_client = Arc::new(BundleClient::new(config.clone(), builder.auth_signer())?);
+            let (tracker, mut tracker_handles) = BundleTracker::spawn(
+                stop.clone(),
+                config.clone(),
+                notifier.clone(),
+                builder.auth_signer(),
+            )?;
+            handles.append(&mut tracker_handles);
+            handles.push(submission::spawn_fast_lane_submitter(
+                stop.clone(),
+                Some(config.perf.submit_core),
+                planner_rx,
+                builder.clone(),
+                bundle_client,
+                notifier.clone(),
+                tracker,
+                SubmissionConfig::default(),
+            )?);
+        }
 
         Ok(Self {
             stop,
@@ -143,6 +185,22 @@ fn spawn_snapshot_drain(
 ) -> Result<thread::JoinHandle<Result<()>>> {
     thread::Builder::new()
         .name("hydration_drain".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                while consumer.pop().is_some() {}
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        })
+        .map_err(Into::into)
+}
+
+fn spawn_planner_drain(
+    stop: Arc<AtomicBool>,
+    consumer: RingConsumer<Lease<BundleCandidate>>,
+) -> Result<thread::JoinHandle<Result<()>>> {
+    thread::Builder::new()
+        .name("planner_drain".into())
         .spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 while consumer.pop().is_some() {}

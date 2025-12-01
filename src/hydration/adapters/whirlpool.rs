@@ -641,6 +641,44 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         self.upsert_state(update, extras);
     }
 
+    fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
+        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
+            return;
+        };
+        let Some(state) = self.get_state(&pool_pubkey) else {
+            return;
+        };
+        let extras = snapshot
+            .extensions
+            .whirlpool
+            .get_or_insert_with(WhirlpoolPoolExtras::default);
+
+        if extras.token_vault_a.is_none() {
+            extras.token_vault_a = state.token_vault_a.map(|pk| pk.to_string());
+        }
+        if extras.token_vault_b.is_none() {
+            extras.token_vault_b = state.token_vault_b.map(|pk| pk.to_string());
+        }
+        if extras.oracle.is_none() {
+            extras.oracle = state.oracle.map(|pk| pk.to_string());
+        }
+        if extras.tick_array0.is_none() {
+            extras.tick_array0 = state.tick_array0.map(|pk| pk.to_string());
+        }
+        if extras.tick_array1.is_none() {
+            extras.tick_array1 = state.tick_array1.map(|pk| pk.to_string());
+        }
+        if extras.tick_array2.is_none() {
+            extras.tick_array2 = state.tick_array2.map(|pk| pk.to_string());
+        }
+        extras
+            .token_mint_a
+            .get_or_insert_with(|| state.token_mint_a.to_string());
+        extras
+            .token_mint_b
+            .get_or_insert_with(|| state.token_mint_b.to_string());
+    }
+
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
@@ -2299,6 +2337,8 @@ mod tests {
             pool_id: pool.to_string(),
             program_id: adapter.program_id.to_string(),
             slot: 1,
+            block_hash: None,
+            block_time_unix: None,
             base_mint: base_mint.to_string(),
             quote_mint: quote_mint.to_string(),
             base_post_amount: 2_000_000u128,

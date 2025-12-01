@@ -482,6 +482,44 @@ impl ProtocolAdapter for CpAmmAdapter {
         self.upsert_state(update, extras);
     }
 
+    fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
+        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
+            return;
+        };
+        let Some(state) = self.get_state(&pool_pubkey) else {
+            return;
+        };
+        let extras = snapshot
+            .extensions
+            .cp_amm
+            .get_or_insert_with(CpAmmPoolExtras::default);
+
+        if extras.token_a_vault.is_none() {
+            extras.token_a_vault = state.token_a_vault.map(|pk| pk.to_string());
+        }
+        if extras.token_b_vault.is_none() {
+            extras.token_b_vault = state.token_b_vault.map(|pk| pk.to_string());
+        }
+        if extras.pool_authority.is_none() {
+            extras.pool_authority = state.pool_authority.map(|pk| pk.to_string());
+        }
+        if extras.token_a_program.is_none() {
+            extras.token_a_program = state.token_a_program.map(|pk| pk.to_string());
+        }
+        if extras.token_b_program.is_none() {
+            extras.token_b_program = state.token_b_program.map(|pk| pk.to_string());
+        }
+        if extras.referral_token_account.is_none() {
+            extras.referral_token_account = state.referral_token_account.map(|pk| pk.to_string());
+        }
+        extras
+            .token_a_mint
+            .get_or_insert_with(|| state.token_a_mint.to_string());
+        extras
+            .token_b_mint
+            .get_or_insert_with(|| state.token_b_mint.to_string());
+    }
+
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
@@ -1413,6 +1451,8 @@ mod tests {
             pool_id: pool.to_string(),
             program_id: CP_AMM_PROGRAM_ID.to_string(),
             slot: 42,
+            block_hash: None,
+            block_time_unix: None,
             base_mint: mint_a.to_string(),
             quote_mint: mint_b.to_string(),
             base_post_amount: state.vault_a_balance,

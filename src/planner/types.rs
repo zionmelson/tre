@@ -11,6 +11,7 @@ pub struct Opportunity {
     pub seq: u64,
     pub trade: TradeUpdate,
     pub pool_snapshot: Option<PoolSnapshot>,
+    pub snapshot_generation: Option<u64>,
     pub estimated_edge_bps: f64,
     pub created_at: Instant,
     pub route_plan: Option<RoutePlan>,
@@ -21,6 +22,7 @@ impl Opportunity {
         seq: u64,
         trade: TradeUpdate,
         snapshot: Option<PoolSnapshot>,
+        snapshot_generation: Option<u64>,
         override_edge_bps: Option<f64>,
     ) -> Self {
         let estimated_edge_bps = override_edge_bps
@@ -35,6 +37,7 @@ impl Opportunity {
             seq,
             trade,
             pool_snapshot: snapshot,
+            snapshot_generation,
             estimated_edge_bps,
             created_at: Instant::now(),
             route_plan: None,
@@ -85,7 +88,7 @@ impl BundleCandidate {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RoutePlan {
     pub start_mint: String,
     pub end_mint: String,
@@ -94,13 +97,14 @@ pub struct RoutePlan {
     pub flash_loan_permitted: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouteLegPlan {
     pub pool_id: String,
     pub program_id: String,
     pub input_mint: String,
     pub output_mint: String,
     pub input_amount: u64,
+    pub available_input_liquidity: u64,
     pub estimated_output_amount: u64,
     pub effective_price: f64,
     pub fee_bps: u64,

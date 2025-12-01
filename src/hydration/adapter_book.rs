@@ -76,6 +76,12 @@ impl AdapterBook {
         adapter.bidirectional_quotes(snapshot)
     }
 
+    pub fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
+        if let Some(adapter) = self.adapters.get(&snapshot.program_id) {
+            adapter.enrich_snapshot(snapshot);
+        }
+    }
+
     pub fn quote_trade(&self, trade: &TradeUpdate) -> Option<QuoteResponse> {
         let adapter = self.adapters.get(&trade.program_id)?;
         let pool_id = Pubkey::from_str(&trade.pool_id).ok()?;

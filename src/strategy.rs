@@ -16,9 +16,13 @@ use solana_sdk::signature::{read_keypair_file, Signer};
 use tracing::{debug, info, warn};
 
 use crate::builder::compute_flash_loan_fee;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, DEFAULT_PROTOCOL_BORROW_PCT};
+use crate::hydration::types::{
+    CP_AMM_PROGRAM_ID, LB_CLMM_PROGRAM_ID, LIFINITY_V2_PROGRAM_ID, RAYDIUM_V3_PROGRAM_ID,
+    WHIRLPOOL_PROGRAM_ID,
+};
 use crate::planner::graph_manager::ArbitrageOpportunity;
-use crate::planner::types::{BundleCandidate, Opportunity};
+use crate::planner::types::{BundleCandidate, Opportunity, RoutePlan};
 use crate::telemetry;
 use crate::tip_pressure;
 
@@ -41,6 +45,7 @@ const TIP_FETCH_TIMEOUT_SECS: u64 = 3;
 const WALLET_BALANCE_POLL_INTERVAL_SECS: u64 = 5;
 const WALLET_BALANCE_RPC_TIMEOUT_SECS: u64 = 6;
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const MAX_SNAPSHOT_GENERATION_LAG: u64 = 1_024;
 
 static TIP_RECIPIENTS: Lazy<Vec<Pubkey>> = Lazy::new(|| {
     [
@@ -75,6 +80,7 @@ pub struct StrategyConfig {
     pub tip_congestion_target_latency_ms: u64,
     pub tip_congestion_max_multiplier: f64,
     pub tip_congestion_expired_weight_bps: u64,
+    pub protocol_borrow_pcts: HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,8 +107,22 @@ impl Default for StrategyConfig {
             tip_congestion_target_latency_ms: DEFAULT_TIP_TARGET_STAGE3_LATENCY_MS,
             tip_congestion_max_multiplier: DEFAULT_TIP_CONGESTION_MAX_MULTIPLIER,
             tip_congestion_expired_weight_bps: DEFAULT_TIP_CONGESTION_EXPIRED_WEIGHT_BPS,
+            protocol_borrow_pcts: default_protocol_borrow_map(),
         }
     }
+}
+
+fn default_protocol_borrow_map() -> HashMap<String, f64> {
+    [
+        "raydium_v3",
+        "cp_amm",
+        "lb_clmm",
+        "lifinity_v2",
+        "whirlpool",
+    ]
+    .into_iter()
+    .map(|protocol| (protocol.to_string(), DEFAULT_PROTOCOL_BORROW_PCT))
+    .collect()
 }
 
 impl StrategyConfig {
@@ -154,7 +174,18 @@ impl StrategyConfig {
         if let Some(value) = overrides.tip_congestion_expired_weight_bps {
             cfg.tip_congestion_expired_weight_bps = value;
         }
+        for (protocol, _) in &config.protocols {
+            let pct = config.protocol_borrow_pct(protocol);
+            cfg.protocol_borrow_pcts.insert(protocol.clone(), pct);
+        }
         cfg
+    }
+
+    pub fn protocol_borrow_pct(&self, protocol: &str) -> f64 {
+        self.protocol_borrow_pcts
+            .get(protocol)
+            .copied()
+            .unwrap_or(DEFAULT_PROTOCOL_BORROW_PCT)
     }
 }
 
@@ -179,6 +210,7 @@ pub struct StrategyEngine {
     dedup: Mutex<DedupState>,
     accepted_count: AtomicU64,
     rejected_count: AtomicU64,
+    latest_snapshot_generation: AtomicU64,
 }
 
 impl StrategyEngine {
@@ -232,6 +264,7 @@ impl StrategyEngine {
             dedup: Mutex::new(DedupState::default()),
             accepted_count: AtomicU64::new(0),
             rejected_count: AtomicU64::new(0),
+            latest_snapshot_generation: AtomicU64::new(0),
         }
     }
 
@@ -313,23 +346,55 @@ impl StrategyEngine {
             return None;
         }
 
+        if let Some(generation) = opportunity.snapshot_generation {
+            if !self.snapshot_generation_fresh(opportunity.seq, generation) {
+                return None;
+            }
+        }
+
         let first_leg = route.legs.first().expect("validated non-empty route");
-        let estimated_final = route.estimated_final_output_amount.unwrap_or(0);
-        if estimated_final <= first_leg.input_amount {
+        let requested_input_amount = first_leg.input_amount;
+        let mut input_amount = requested_input_amount;
+        let mut estimated_final = route.estimated_final_output_amount.unwrap_or(0);
+
+        if let Some(cap) = self.route_input_cap(&route) {
+            if cap == 0 {
+                self.rejected_count.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    seq = opportunity.seq,
+                    requested_input_amount, "opportunity rejected: no borrowable liquidity"
+                );
+                return None;
+            }
+
+            if cap < input_amount {
+                debug!(
+                    seq = opportunity.seq,
+                    requested_input_amount,
+                    capped_input_amount = cap,
+                    "route input clamped by borrow_pct"
+                );
+                input_amount = cap;
+                if estimated_final > 0 {
+                    estimated_final =
+                        scale_amount(estimated_final, input_amount, requested_input_amount);
+                }
+            }
+        }
+
+        if estimated_final <= input_amount {
             self.rejected_count.fetch_add(1, Ordering::Relaxed);
             debug!(
                 seq = opportunity.seq,
-                input_amount = first_leg.input_amount,
-                estimated_final,
-                "opportunity rejected: non-positive profit"
+                input_amount, estimated_final, "opportunity rejected: non-positive profit"
             );
             return None;
         }
 
-        let profit_native = estimated_final - first_leg.input_amount;
+        let profit_native = estimated_final - input_amount;
         let mut profit_lamports = lamports_if_wsol(&route.start_mint, profit_native);
         let flash_loan_fee_lamports = if route.start_mint == WSOL_MINT {
-            compute_flash_loan_fee(first_leg.input_amount)
+            compute_flash_loan_fee(input_amount)
         } else {
             0
         };
@@ -384,6 +449,25 @@ impl StrategyEngine {
         Some(candidate)
     }
 
+    fn route_input_cap(&self, route: &RoutePlan) -> Option<u64> {
+        let mut cap: Option<u64> = None;
+        for leg in &route.legs {
+            let Some(protocol) = protocol_for_program(&leg.program_id) else {
+                continue;
+            };
+            let pct = self.config.protocol_borrow_pct(protocol);
+            let leg_cap = scaled_liquidity_limit(leg.available_input_liquidity, pct);
+            if leg_cap == 0 {
+                return Some(0);
+            }
+            cap = Some(match cap {
+                Some(current) => current.min(leg_cap),
+                None => leg_cap,
+            });
+        }
+        cap
+    }
+
     pub fn flash_trade_budget(&self, mint: &str) -> Option<FlashLoanTradeBudget> {
         if mint != WSOL_MINT {
             return None;
@@ -419,7 +503,7 @@ impl StrategyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::{PoolQuoteDirection, TradeUpdate};
+    use crate::hydration::types::{PoolQuoteDirection, TradeUpdate, RAYDIUM_V3_PROGRAM_ID};
     use crate::planner::types::{RouteLegPlan, RoutePlan};
     use crate::template::TemplateContext;
 
@@ -441,6 +525,7 @@ mod tests {
                 sell_amount: TEST_INPUT_LAMPORTS,
             },
             pool_snapshot: None,
+            snapshot_generation: Some(1),
             estimated_edge_bps: edge_bps,
             created_at: Instant::now() - age,
             route_plan: Some(sample_route_plan()),
@@ -453,10 +538,11 @@ mod tests {
             end_mint: WSOL_MINT.into(),
             legs: vec![RouteLegPlan {
                 pool_id: "pool".into(),
-                program_id: "program".into(),
+                program_id: RAYDIUM_V3_PROGRAM_ID.into(),
                 input_mint: WSOL_MINT.into(),
                 output_mint: WSOL_MINT.into(),
                 input_amount: TEST_INPUT_LAMPORTS,
+                available_input_liquidity: TEST_INPUT_LAMPORTS,
                 estimated_output_amount: TEST_INPUT_LAMPORTS + TEST_PROFIT_LAMPORTS,
                 effective_price: 1.0,
                 fee_bps: 30,
@@ -474,6 +560,20 @@ mod tests {
             estimated_final_output_amount: Some(TEST_INPUT_LAMPORTS + TEST_PROFIT_LAMPORTS),
             flash_loan_permitted: true,
         }
+    }
+
+    fn low_profit_opportunity(signature: &str) -> Opportunity {
+        let mut opportunity = opportunity_with(10.0, signature, Duration::from_millis(10));
+        let mut route = sample_route_plan();
+        let first_leg = route
+            .legs
+            .first_mut()
+            .expect("sample route should include at least one leg");
+        first_leg.input_amount = 10_000_000;
+        first_leg.available_input_liquidity = 10_000_000;
+        route.estimated_final_output_amount = Some(first_leg.input_amount + 60_000);
+        opportunity.route_plan = Some(route);
+        opportunity
     }
 
     #[test]
@@ -513,6 +613,29 @@ mod tests {
             .evaluate(&opportunity_with(10.0, "dup", fresh))
             .is_none());
     }
+
+    #[test]
+    fn clamps_route_input_before_profit_checks() {
+        let engine = StrategyEngine::with_config(StrategyConfig::default());
+        assert!(engine
+            .evaluate(&low_profit_opportunity("sig-small-profit"))
+            .is_none());
+    }
+
+    #[test]
+    fn honors_protocol_borrow_override() {
+        let mut config = StrategyConfig::default();
+        config.protocol_borrow_pcts.insert("raydium_v3".into(), 1.0);
+        config.min_profit_lamports = 10_000;
+        config.min_tip_lamports = 0;
+        config.tip_floor_fallback_lamports = 0;
+        config.tip_floor_min_lamports = 0;
+        config.tip_profit_share_bps = 0;
+        let engine = StrategyEngine::with_config(config);
+        assert!(engine
+            .evaluate(&low_profit_opportunity("sig-small-profit-override"))
+            .is_some());
+    }
 }
 
 impl StrategyEngine {
@@ -527,6 +650,24 @@ impl StrategyEngine {
             return false;
         }
         *count += 1;
+        true
+    }
+
+    fn snapshot_generation_fresh(&self, seq: u64, generation: u64) -> bool {
+        let latest = self.latest_snapshot_generation.load(Ordering::Relaxed);
+        if latest > generation && latest - generation > MAX_SNAPSHOT_GENERATION_LAG {
+            self.rejected_count.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                seq,
+                generation,
+                latest_generation = latest,
+                lag = latest - generation,
+                "opportunity rejected: pool snapshot generation stale"
+            );
+            return false;
+        }
+        self.latest_snapshot_generation
+            .fetch_max(generation, Ordering::Relaxed);
         true
     }
 
@@ -546,6 +687,41 @@ fn lamports_if_wsol(mint: &str, amount: u64) -> Option<u64> {
     } else {
         None
     }
+}
+
+fn protocol_for_program(program_id: &str) -> Option<&'static str> {
+    match program_id {
+        RAYDIUM_V3_PROGRAM_ID => Some("raydium_v3"),
+        CP_AMM_PROGRAM_ID => Some("cp_amm"),
+        LB_CLMM_PROGRAM_ID => Some("lb_clmm"),
+        LIFINITY_V2_PROGRAM_ID => Some("lifinity_v2"),
+        WHIRLPOOL_PROGRAM_ID => Some("whirlpool"),
+        _ => None,
+    }
+}
+
+fn scaled_liquidity_limit(liquidity: u64, pct: f64) -> u64 {
+    if liquidity == 0 {
+        return 0;
+    }
+    if !pct.is_finite() || pct <= 0.0 {
+        return 0;
+    }
+    let capped_pct = pct.min(1.0);
+    let scaled = (liquidity as f64) * capped_pct;
+    if !scaled.is_finite() {
+        return liquidity;
+    }
+    let limit = scaled.floor() as u64;
+    limit.min(liquidity)
+}
+
+fn scale_amount(value: u64, numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    let scaled = (value as u128).saturating_mul(numerator as u128) / (denominator as u128);
+    scaled.min(u64::MAX as u128) as u64
 }
 
 fn tip_carry_fee(start_mint: &str, tip_lamports: u64) -> u64 {

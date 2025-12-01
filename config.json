@@ -405,19 +405,44 @@
   ],
   "protocols": {
     "raydium_v3": {
+      "rpc_endpoints": [
+        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
+        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
+        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
+      ],
       "hydration_retry_ms": 500
     },
     "cp_amm": {
+      "rpc_endpoints": [
+        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
+        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
+        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
+      ],
       "hydration_retry_ms": 500
     },
     "lb_clmm": {
+      "rpc_endpoints": [
+        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
+        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
+        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
+      ],
       "hydration_retry_ms": 500
     },
     "lifinity_v2": {
+      "rpc_endpoints": [
+        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
+        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
+        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
+      ],
       "hydration_retry_ms": 500
     },
     "whirlpool": {
-      "hydration_retry_ms": 500
+      "rpc_endpoints": [
+        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
+        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
+        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
+      ],
+      "hydration_retry_ms": 50
     }
   },
   "corecast": {
@@ -435,6 +460,9 @@
     "ring_capacity": 2048,
     "opportunity_slab": 4096,
     "bundle_slab": 1024
+  },
+  "watcher": {
+    "max_tracked_pools": 256
   },
   "strategy": {
     "min_edge_bps": 1.0,

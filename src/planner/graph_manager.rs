@@ -4,6 +4,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 const NEGATIVE_CYCLE_EPSILON: f64 = 1e-12;
 
 use crate::hydration::types::PoolSnapshot;
+use crate::planner::types::RoutePlan;
 use crate::token_pair::TokenPair;
 
 /// Represents a concrete swap leg along a path through the liquidity graph.
@@ -66,6 +67,9 @@ impl Ord for RankedPath {
 pub struct ArbitrageOpportunity {
     pub path: PoolPath,
     pub gain: f64,
+    pub route_plan: Option<RoutePlan>,
+    pub snapshot_generation: Option<u64>,
+    pub latest_slot: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -543,6 +547,9 @@ impl GraphManager {
                 opportunities.push(ArbitrageOpportunity {
                     path: candidate_path,
                     gain,
+                    route_plan: None,
+                    snapshot_generation: None,
+                    latest_slot: None,
                 });
             }
         }
@@ -735,6 +742,8 @@ mod tests {
             pool_id: pool_id.to_string(),
             program_id: program_id.to_string(),
             slot: 0,
+            block_hash: None,
+            block_time_unix: None,
             base_mint: base.to_string(),
             quote_mint: quote.to_string(),
             base_post_amount: base_liquidity,

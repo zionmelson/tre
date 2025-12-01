@@ -3,6 +3,8 @@ pub mod adapters;
 pub mod alt_manager;
 pub mod flash_loan;
 pub mod ingest;
+pub mod pool_state;
+pub mod rpc_refresh;
 pub mod service;
 pub mod template_cache;
 pub mod types;
@@ -14,6 +16,8 @@ pub use flash_loan::{
     SOLEND_FLASH_LOAN_FEE_BPS,
 };
 pub use ingest::spawn_ingest_stage;
+pub use pool_state::{PoolState, PoolStateEvent, PoolStateUpdate, PoolStore, PoolStoreView};
+pub use rpc_refresh::RpcRefresher;
 pub use service::{HydrationService, HydrationSnapshot, TemplateReadiness};
 pub use template_cache::{
     AltHandleId, AmmV3Field, AmmV3FieldLayout, AmmV3PoolAccounts, AmmV3TemplateParams, CpAmmField,

@@ -276,23 +276,48 @@
   "quicknode_rpcs": ["$ENV{TRE_QUICKNODE_RPC_PRIMARY}"],
   "protocols": {
     "raydium_v3": {
-      "hydration_retry_ms": 500
+      "rpc_endpoints": [
+        "$ENV{TRE_RPC_RAYDIUM_PRIMARY}",
+        "$ENV{TRE_RPC_RAYDIUM_SECONDARY}"
+      ],
+      "hydration_retry_ms": 500,
+      "borrow_pct": 0.35
     },
     "cp_amm": {
+      "rpc_endpoints": [
+        "$ENV{TRE_RPC_CP_AMM_PRIMARY}",
+        "$ENV{TRE_RPC_CP_AMM_SECONDARY}"
+      ],
       "hydration_retry_ms": 500,
-      "max_utilization_bps": 4000
+      "max_utilization_bps": 4000,
+      "borrow_pct": 0.35
     },
     "lb_clmm": {
+      "rpc_endpoints": [
+        "$ENV{TRE_RPC_LB_CLMM_PRIMARY}",
+        "$ENV{TRE_RPC_LB_CLMM_SECONDARY}"
+      ],
       "hydration_retry_ms": 500,
-      "max_utilization_bps": 4000
+      "max_utilization_bps": 4000,
+      "borrow_pct": 0.35
     },
     "lifinity_v2": {
+      "rpc_endpoints": [
+        "$ENV{TRE_RPC_LIFINITY_PRIMARY}",
+        "$ENV{TRE_RPC_LIFINITY_SECONDARY}"
+      ],
       "hydration_retry_ms": 500,
-      "max_utilization_bps": 4000
+      "max_utilization_bps": 4000,
+      "borrow_pct": 0.35
     },
     "whirlpool": {
+      "rpc_endpoints": [
+        "$ENV{TRE_RPC_WHIRLPOOL_PRIMARY}",
+        "$ENV{TRE_RPC_WHIRLPOOL_SECONDARY}"
+      ],
       "hydration_retry_ms": 500,
-      "max_utilization_bps": 4000
+      "max_utilization_bps": 4000,
+      "borrow_pct": 0.35
     }
   },
   "corecast": {
@@ -310,6 +335,19 @@
     "ring_capacity": 2048,
     "opportunity_slab": 4096,
     "bundle_slab": 1024
+  },
+  "pipeline": {
+    "hydration_only_mode": false,
+    "dry_run_mode": false
+  },
+  "watcher": {
+    "max_tracked_pools": 256,
+    "min_ready_pools": 32,
+    "initial_ready_timeout_ms": 5000,
+    "pool_stale_ttl_ms": 250,
+    "pool_stale_sweep_ms": 250,
+    "queue_capacity": 1024,
+    "queue_drop_policy": "drop_newest"
   },
   "strategy": {
     "min_edge_bps": 1.0,

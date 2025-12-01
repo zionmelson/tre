@@ -31,6 +31,9 @@ cargo build --release --target x86_64-unknown-linux-gnu
 # Run locally with debug logging + Prometheus metrics
 ./scripts/run-bot.sh
 
+# Non-submitting dry run (planner runs, submissions disabled)
+./scripts/run-bot.sh --dry-run
+
 # Use Docker (requires config volume mounted at /config)
 docker build -t tre-arb-bot .
 docker run --rm \
@@ -52,6 +55,8 @@ Environment variables:
 - `TRE_JITO_API_TOKEN`, `TRE_JITO_TIP_FLOOR_URL`, `TRE_JITO_TIP_STREAM_URL`, `TRE_JITO_CA_PEM`: override sensitive Jito parameters without storing them on disk.
 - `TRE_BAM_VALIDATOR_CSV`: override the BAM validator CSV path.
 - `TRE_QUICKNODE_RPCS`: override the Quicknode RPC list.
+- `TRE_HYDRATION_ONLY_MODE`: set to `true` to disable planner/submission lanes entirely (hydrator soak tests).
+- `TRE_DRY_RUN_MODE`: set to `true` to keep the planner hot while discarding bundle submissions (the `--dry-run` script flag toggles this automatically).
 - `alerts.webhook_url`: optional HTTPS endpoint that receives JSON bundle/arbitrage lifecycle events; pair with `alerts.environment` to tag messages by deployment.
 
 Submission tracking knobs live under the `submission` section of `config.json` (or `config.template.json`). You can safely check in the template that only contains `$ENV{VAR}` placeholders for secrets while keeping the real `config.json` ignored (see `.gitignore`). Use the template as the canonical reference in docs and CI.

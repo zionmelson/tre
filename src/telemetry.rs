@@ -22,6 +22,7 @@ use tokio::{runtime::Handle, task::JoinHandle};
 use tracing::{info, warn};
 
 const PROMETHEUS_ENV: &str = "PROMETHEUS_METRICS_ADDR";
+const PROMETHEUS_METRIC_PREFIX_ALLOWLIST: &[&str] = &["hydration_", "watcher_"];
 
 static TELEMETRY: OnceCell<TelemetryState> = OnceCell::new();
 static HTTP_SERVER: OnceCell<Option<JoinHandle<()>>> = OnceCell::new();
@@ -46,9 +47,19 @@ struct TelemetryState {
     hydration_alt_ready_tables: Gauge,
     hydration_flash_routes_prepared: Gauge,
     hydration_adapter_ingest: Family<HydrationAdapterLabels, Counter>,
+    hydration_rpc_refresh_success: Family<HydrationAdapterLabels, Counter>,
+    hydration_rpc_refresh_failure: Family<HydrationAdapterLabels, Counter>,
+    hydration_stale_pools: Counter,
+    hydration_queue_depth_pct: Gauge,
+    hydration_queue_depth_items: Gauge,
+    hydration_queue_drop_events: Counter,
     graph_pool_count: Gauge,
     graph_cycle_count: Gauge,
     graph_snapshot_latency: Histogram,
+    watcher_update_age: Family<WatcherUpdateLabels, Histogram>,
+    watcher_cache_size: Gauge,
+    watcher_cycle_pending: Gauge,
+    watcher_update_backlog: Gauge,
 }
 
 impl TelemetryState {
@@ -180,6 +191,48 @@ impl TelemetryState {
             hydration_adapter_ingest.clone(),
         );
 
+        let hydration_rpc_refresh_success = Family::default();
+        registry.register(
+            "hydration_rpc_refresh_total",
+            "Successful RPC-based pool refresh events grouped by protocol",
+            hydration_rpc_refresh_success.clone(),
+        );
+
+        let hydration_rpc_refresh_failure = Family::default();
+        registry.register(
+            "hydration_rpc_refresh_failure_total",
+            "Failed RPC-based pool refresh events grouped by protocol",
+            hydration_rpc_refresh_failure.clone(),
+        );
+
+        let hydration_stale_pools = Counter::default();
+        registry.register(
+            "hydration_stale_pool_events_total",
+            "Pool cache entries evicted due to exceeding the freshness budget",
+            hydration_stale_pools.clone(),
+        );
+
+        let hydration_queue_depth_pct = Gauge::default();
+        registry.register(
+            "hydration_queue_depth_pct",
+            "Percentage (0-100) of the hydrator broadcast queue currently occupied",
+            hydration_queue_depth_pct.clone(),
+        );
+
+        let hydration_queue_depth_items = Gauge::default();
+        registry.register(
+            "hydration_queue_depth_items",
+            "Approximate count of pool updates buffered in the hydrator broadcast queue",
+            hydration_queue_depth_items.clone(),
+        );
+
+        let hydration_queue_drop_events = Counter::default();
+        registry.register(
+            "hydration_queue_drop_events_total",
+            "Number of hydrator broadcast updates dropped due to backpressure",
+            hydration_queue_drop_events.clone(),
+        );
+
         let graph_pool_count = Gauge::default();
         registry.register(
             "graph_pool_count",
@@ -199,6 +252,35 @@ impl TelemetryState {
             "graph_snapshot_latency_ms",
             "Milliseconds between pool snapshot creation and graph ingestion",
             graph_snapshot_latency.clone(),
+        );
+
+        let watcher_update_age =
+            Family::new_with_constructor(watcher_update_histogram_constructor as fn() -> Histogram);
+        registry.register(
+            "watcher_update_age_ms",
+            "Milliseconds between hydrator publish and watcher consumption grouped by adapter",
+            watcher_update_age.clone(),
+        );
+
+        let watcher_cache_size = Gauge::default();
+        registry.register(
+            "watcher_cache_entries",
+            "Number of pool snapshots cached by the watcher lane",
+            watcher_cache_size.clone(),
+        );
+
+        let watcher_cycle_pending = Gauge::default();
+        registry.register(
+            "watcher_cycle_scan_pending",
+            "Boolean gauge indicating whether a cycle scan is queued (1 = pending)",
+            watcher_cycle_pending.clone(),
+        );
+
+        let watcher_update_backlog = Gauge::default();
+        registry.register(
+            "watcher_pool_update_backlog_pct",
+            "Percentage (0-100) of the watcher pool-update channel currently filled",
+            watcher_update_backlog.clone(),
         );
 
         Self {
@@ -221,9 +303,19 @@ impl TelemetryState {
             hydration_alt_ready_tables,
             hydration_flash_routes_prepared,
             hydration_adapter_ingest,
+            hydration_rpc_refresh_success,
+            hydration_rpc_refresh_failure,
+            hydration_stale_pools,
+            hydration_queue_depth_pct,
+            hydration_queue_depth_items,
+            hydration_queue_drop_events,
             graph_pool_count,
             graph_cycle_count,
             graph_snapshot_latency,
+            watcher_update_age,
+            watcher_cache_size,
+            watcher_cycle_pending,
+            watcher_update_backlog,
         }
     }
 }
@@ -273,27 +365,84 @@ fn spawn_http_server(registry: Arc<Registry>, addr: SocketAddr, handle: Handle) 
 }
 
 fn metrics_response(registry: Arc<Registry>) -> Response<Body> {
-    let mut buffer = String::new();
-    if let Err(err) = encode(&mut buffer, registry.as_ref()) {
-        warn!(error = %err, "failed to encode metrics response");
-        return Response::builder()
-            .status(500)
-            .body(Body::from("encoding error"))
-            .unwrap_or_else(|builder_err| Response::new(Body::from(builder_err.to_string())));
+    match encode_filtered_metrics(registry.as_ref()) {
+        Ok(buffer) => Response::builder()
+            .status(200)
+            .header("Content-Type", "text/plain; version=0.0.4")
+            .body(Body::from(buffer))
+            .unwrap_or_else(|builder_err| Response::new(Body::from(builder_err.to_string()))),
+        Err(err) => {
+            warn!(error = %err, "failed to encode metrics response");
+            Response::builder()
+                .status(500)
+                .body(Body::from("encoding error"))
+                .unwrap_or_else(|builder_err| Response::new(Body::from(builder_err.to_string())))
+        }
     }
-    Response::builder()
-        .status(200)
-        .header("Content-Type", "text/plain; version=0.0.4")
-        .body(Body::from(buffer))
-        .unwrap_or_else(|builder_err| Response::new(Body::from(builder_err.to_string())))
+}
+
+fn encode_filtered_metrics(registry: &Registry) -> Result<String, std::fmt::Error> {
+    let mut buffer = String::new();
+    encode(&mut buffer, registry)?;
+    Ok(filter_metrics_by_prefix(&buffer))
+}
+
+// Trims the encoded output down to hydration/watcher metrics so Prometheus stays uncluttered.
+fn filter_metrics_by_prefix(input: &str) -> String {
+    let mut filtered = String::new();
+    let mut keep_current_block = false;
+
+    for line in input.lines() {
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            let metric_name = rest.split_whitespace().next().unwrap_or("");
+            keep_current_block = should_export_metric(metric_name);
+            if keep_current_block {
+                filtered.push_str(line);
+                filtered.push('\n');
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let metric_name = rest.split_whitespace().next().unwrap_or("");
+            keep_current_block = should_export_metric(metric_name);
+            if keep_current_block {
+                filtered.push_str(line);
+                filtered.push('\n');
+            }
+            continue;
+        }
+
+        if line.is_empty() {
+            if keep_current_block {
+                filtered.push('\n');
+            }
+            continue;
+        }
+
+        if keep_current_block {
+            filtered.push_str(line);
+            filtered.push('\n');
+        }
+    }
+
+    filtered
+}
+
+fn should_export_metric(metric_name: &str) -> bool {
+    PROMETHEUS_METRIC_PREFIX_ALLOWLIST
+        .iter()
+        .any(|prefix| metric_name.starts_with(prefix))
+}
+
+fn watcher_update_histogram_constructor() -> Histogram {
+    Histogram::new(exponential_buckets(0.1, 2.0, 20))
 }
 
 pub fn snapshot_metrics() -> Option<String> {
-    TELEMETRY.get().and_then(|state| {
-        let mut buffer = String::new();
-        encode(&mut buffer, state.registry.as_ref()).ok()?;
-        Some(buffer)
-    })
+    TELEMETRY
+        .get()
+        .and_then(|state| encode_filtered_metrics(state.registry.as_ref()).ok())
 }
 
 pub fn record_detection_latency(duration: Duration) {
@@ -356,6 +505,11 @@ struct Stage2PoolLabels {
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 struct HydrationAdapterLabels {
+    adapter: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct WatcherUpdateLabels {
     adapter: String,
 }
 
@@ -548,6 +702,96 @@ pub fn record_hydration_adapter_ingest(adapter: &str) {
     }
 }
 
+pub fn record_hydration_rpc_refresh(adapter: &str) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationAdapterLabels {
+            adapter: adapter.to_string(),
+        };
+        state
+            .hydration_rpc_refresh_success
+            .get_or_create(&labels)
+            .inc();
+    }
+}
+
+pub fn record_hydration_rpc_refresh_failure(adapter: &str) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationAdapterLabels {
+            adapter: adapter.to_string(),
+        };
+        state
+            .hydration_rpc_refresh_failure
+            .get_or_create(&labels)
+            .inc();
+    }
+}
+
+pub fn record_hydration_stale_pools(evicted: u64) {
+    if evicted == 0 {
+        return;
+    }
+    if let Some(state) = TELEMETRY.get() {
+        state.hydration_stale_pools.inc_by(evicted);
+    }
+}
+
+pub fn record_hydration_queue_depth(len: usize, capacity: usize) {
+    if let Some(state) = TELEMETRY.get() {
+        let pct = if capacity == 0 {
+            0.0
+        } else {
+            (len as f64 / capacity as f64 * 100.0).clamp(0.0, 100.0)
+        };
+        state.hydration_queue_depth_pct.set(pct.round() as i64);
+        state
+            .hydration_queue_depth_items
+            .set(clamp_u64_to_i64(len as u64));
+    }
+}
+
+pub fn record_hydration_queue_drop() {
+    if let Some(state) = TELEMETRY.get() {
+        state.hydration_queue_drop_events.inc();
+    }
+}
+
+pub fn record_watcher_update_age(adapter: &str, latency: Duration) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = WatcherUpdateLabels {
+            adapter: adapter.to_string(),
+        };
+        state
+            .watcher_update_age
+            .get_or_create(&labels)
+            .observe(latency.as_secs_f64() * 1_000.0);
+    }
+}
+
+pub fn record_watcher_cache_depth(cache_len: usize) {
+    if let Some(state) = TELEMETRY.get() {
+        state
+            .watcher_cache_size
+            .set(clamp_u64_to_i64(cache_len as u64));
+    }
+}
+
+pub fn record_watcher_cycle_pending(pending: bool) {
+    if let Some(state) = TELEMETRY.get() {
+        state.watcher_cycle_pending.set(if pending { 1 } else { 0 });
+    }
+}
+
+pub fn record_watcher_update_backlog(len: usize, capacity: usize) {
+    if let Some(state) = TELEMETRY.get() {
+        let pct = if capacity == 0 {
+            0.0
+        } else {
+            (len as f64 / capacity as f64 * 100.0).clamp(0.0, 100.0)
+        };
+        state.watcher_update_backlog.set(pct.round() as i64);
+    }
+}
+
 fn clamp_u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -619,5 +863,18 @@ pub fn record_stage2_pool_block(pool_id: &str) {
             pool_id: pool_id.to_string(),
         };
         state.stage2_pool_blocks.get_or_create(&labels).inc();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_metrics_by_prefix;
+
+    #[test]
+    fn filters_non_allowlisted_metrics() {
+        let input = "# HELP hydration_queue_depth_pct Hydration queue depth\n# TYPE hydration_queue_depth_pct gauge\nhydration_queue_depth_pct 42\n\n# HELP bundle_detection_latency_ms Stage 2 latency\n# TYPE bundle_detection_latency_ms histogram\nbundle_detection_latency_ms_bucket{le=\"0.1\"} 0\n";
+        let filtered = filter_metrics_by_prefix(input);
+        assert!(filtered.contains("hydration_queue_depth_pct 42"));
+        assert!(!filtered.contains("bundle_detection_latency_ms"));
     }
 }

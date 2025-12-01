@@ -6,12 +6,16 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use dashmap::DashMap;
+use crossbeam_channel::{Receiver, TryRecvError};
 use tracing::trace;
 
-use crate::core::{pin_current_thread, RingConsumer};
+use crate::builder::BuilderHandle;
+use crate::core::pin_current_thread;
 use crate::hydration::types::PoolSnapshot;
+use crate::hydration::{PoolStateEvent, PoolStateUpdate, PoolStoreView};
 use crate::planner::graph_manager::{ArbitrageOpportunity, GraphManager, PoolPath};
+use crate::planner::route_builder::RouteBuilder;
+use crate::planner::PlannerConfig;
 use crate::telemetry;
 
 #[derive(Clone)]
@@ -20,22 +24,29 @@ pub struct GraphHandle {
 }
 
 struct GraphState {
-    pools: DashMap<String, PoolSnapshot>,
+    pool_store: PoolStoreView,
     graph: RwLock<GraphManager>,
+    routes: RwLock<Vec<ArbitrageOpportunity>>,
+    route_builder: RouteBuilder,
+    cycle_notional: u64,
 }
 
-impl Default for GraphState {
-    fn default() -> Self {
+impl GraphState {
+    fn new(pool_store: PoolStoreView, builder: BuilderHandle, config: PlannerConfig) -> Self {
+        let route_builder = RouteBuilder::new(builder, pool_store.clone(), config.freshness_budget);
         Self {
-            pools: DashMap::new(),
+            pool_store,
             graph: RwLock::new(GraphManager::new()),
+            routes: RwLock::new(Vec::new()),
+            route_builder,
+            cycle_notional: config.cycle_notional_lamports,
         }
     }
 }
 
 struct GraphWorker {
     state: Arc<GraphState>,
-    pool_consumer: RingConsumer<PoolSnapshot>,
+    updates: Receiver<PoolStateUpdate>,
 }
 
 impl GraphWorker {
@@ -46,9 +57,14 @@ impl GraphWorker {
         trace!(target = "graph", "graph service online");
         while !stop.load(Ordering::Relaxed) {
             let mut made_progress = false;
-            while let Some(snapshot) = self.pool_consumer.pop() {
-                self.state.apply_snapshot(snapshot);
-                made_progress = true;
+            loop {
+                match self.updates.try_recv() {
+                    Ok(update) => {
+                        made_progress |= self.state.apply_update(update);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                }
             }
             if !made_progress {
                 thread::yield_now();
@@ -64,28 +80,85 @@ impl GraphState {
     fn apply_snapshot(&self, snapshot: PoolSnapshot) {
         let pool_id = snapshot.pool_id.clone();
         let latency = snapshot.updated_at.elapsed();
-        self.pools.insert(pool_id.clone(), snapshot.clone());
-        telemetry::record_graph_pool_count(self.pools.len());
+        telemetry::record_graph_pool_count(self.pool_store.len());
         telemetry::record_graph_snapshot_latency(latency);
-        if let Ok(mut graph) = self.graph.write() {
+        let cycles = if let Ok(mut graph) = self.graph.write() {
             graph.index_pool(&snapshot);
-            telemetry::record_graph_cycle_count(graph.latest_profitable_cycles().len());
-        }
+            graph.latest_profitable_cycles().to_vec()
+        } else {
+            Vec::new()
+        };
+        self.refresh_routes(cycles);
         trace!(target = "graph", pool = %pool_id, slot = snapshot.slot, "pool snapshot indexed");
+    }
+
+    fn remove_snapshot(&self, pool_id: &str) {
+        let cycles = if let Ok(mut graph) = self.graph.write() {
+            graph.remove_pool(pool_id);
+            graph.latest_profitable_cycles().to_vec()
+        } else {
+            Vec::new()
+        };
+        self.refresh_routes(cycles);
+        telemetry::record_graph_pool_count(self.pool_store.len());
+        trace!(target = "graph", pool = %pool_id, "pool snapshot removed");
+    }
+
+    fn apply_update(&self, update: PoolStateUpdate) -> bool {
+        let pool_id = update.pool_id.clone();
+        match update.event {
+            PoolStateEvent::Upsert(snapshot) => {
+                if snapshot.freshness.is_stale() {
+                    self.remove_snapshot(&pool_id);
+                    return true;
+                }
+                self.apply_snapshot(snapshot);
+                true
+            }
+            PoolStateEvent::Remove => {
+                self.remove_snapshot(&pool_id);
+                true
+            }
+        }
+    }
+
+    fn refresh_routes(&self, cycles: Vec<ArbitrageOpportunity>) {
+        let mut planned = Vec::with_capacity(cycles.len());
+        for mut cycle in cycles {
+            if let Some(result) = self
+                .route_builder
+                .build_from_path(&cycle.path, self.cycle_notional)
+            {
+                cycle.route_plan = Some(result.route_plan);
+                cycle.snapshot_generation = result.min_generation;
+                cycle.latest_slot = Some(result.max_slot);
+                planned.push(cycle);
+            }
+        }
+        telemetry::record_graph_cycle_count(planned.len());
+        if let Ok(mut guard) = self.routes.write() {
+            *guard = planned;
+        }
+    }
+
+    fn latest_cycles(&self) -> Vec<ArbitrageOpportunity> {
+        self.routes
+            .read()
+            .map(|cycles| cycles.clone())
+            .unwrap_or_default()
     }
 }
 
 impl GraphHandle {
     pub fn latest_snapshot(&self, pool_id: &str) -> Option<PoolSnapshot> {
         self.state
-            .pools
+            .pool_store
             .get(pool_id)
-            .map(|entry| entry.value().clone())
+            .map(|state| state.snapshot.clone())
     }
 
     pub fn latest_cycles(&self) -> Vec<ArbitrageOpportunity> {
-        self.with_graph(|graph| graph.latest_profitable_cycles().to_vec())
-            .unwrap_or_default()
+        self.state.latest_cycles()
     }
 
     pub fn find_paths(
@@ -122,16 +195,16 @@ impl GraphHandle {
 pub fn spawn_graph_service(
     stop: Arc<AtomicBool>,
     core_id: Option<usize>,
-    pool_consumer: RingConsumer<PoolSnapshot>,
+    updates: Receiver<PoolStateUpdate>,
+    pool_store: PoolStoreView,
+    builder: BuilderHandle,
+    planner_config: PlannerConfig,
 ) -> Result<(GraphHandle, thread::JoinHandle<Result<()>>)> {
-    let state = Arc::new(GraphState::default());
+    let state = Arc::new(GraphState::new(pool_store, builder, planner_config));
     let handle = GraphHandle {
         state: state.clone(),
     };
-    let worker = GraphWorker {
-        state,
-        pool_consumer,
-    };
+    let worker = GraphWorker { state, updates };
     let join_handle = thread::Builder::new()
         .name("graph_owner".into())
         .spawn(move || worker.run(stop, core_id))?;

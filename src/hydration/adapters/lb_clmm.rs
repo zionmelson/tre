@@ -244,7 +244,11 @@ impl LbClmmAdapter {
             return extras;
         };
 
-        if let Some(meta) = hydrator.hydrate(pool) {
+        let meta = hydrator
+            .hydrate(pool)
+            .or_else(|| hydrator.hydrate_blocking(pool));
+
+        if let Some(meta) = meta {
             extras.token_x_mint = extras
                 .token_x_mint
                 .or_else(|| Some(meta.token_x_mint.to_string()));
@@ -499,6 +503,48 @@ impl ProtocolAdapter for LbClmmAdapter {
 
         let extras = update.extensions.lb_clmm.clone().unwrap_or_default();
         self.upsert_state(update, extras);
+    }
+
+    fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
+        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
+            return;
+        };
+        let Some(state) = self.get_state(&pool_pubkey) else {
+            return;
+        };
+        let extras = snapshot
+            .extensions
+            .lb_clmm
+            .get_or_insert_with(LbClmmPoolExtras::default);
+
+        if extras.reserve_x.is_none() {
+            extras.reserve_x = state.reserve_x.map(|pk| pk.to_string());
+        }
+        if extras.reserve_y.is_none() {
+            extras.reserve_y = state.reserve_y.map(|pk| pk.to_string());
+        }
+        if extras.token_x_program.is_none() {
+            extras.token_x_program = state.token_x_program.map(|pk| pk.to_string());
+        }
+        if extras.token_y_program.is_none() {
+            extras.token_y_program = state.token_y_program.map(|pk| pk.to_string());
+        }
+        if extras.oracle.is_none() {
+            extras.oracle = state.oracle.map(|pk| pk.to_string());
+        }
+        if extras.bin_array_bitmap_extension.is_none() {
+            extras.bin_array_bitmap_extension =
+                state.bin_array_bitmap_extension.map(|pk| pk.to_string());
+        }
+        if extras.host_fee_account.is_none() {
+            extras.host_fee_account = state.host_fee_account.map(|pk| pk.to_string());
+        }
+        extras
+            .token_x_mint
+            .get_or_insert_with(|| state.token_x_mint.to_string());
+        extras
+            .token_y_mint
+            .get_or_insert_with(|| state.token_y_mint.to_string());
     }
 
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
@@ -1169,6 +1215,22 @@ impl LbClmmPoolHydrator {
             return Some(entry);
         }
         self.hydrator.get_or_schedule(pool)
+    }
+
+    fn hydrate_blocking(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
+        if let Some(entry) = self.cache.get(&pool) {
+            return Some(entry.clone());
+        }
+
+        let clients: &[Arc<RpcClient>] = self.clients.as_ref().as_slice();
+        fetch_lb_clmm_meta(
+            self.program_id,
+            clients,
+            pool,
+            self.cache.clone(),
+            self.extensions_pending.clone(),
+            self.window_cache.clone(),
+        )
     }
 
     fn ensure_active_window(&self, pool: Pubkey, active_bin_id: i32) {

@@ -1,6 +1,5 @@
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::HashSet;
-use std::str::FromStr;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -9,27 +8,26 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Receiver, Sender};
-use solana_sdk::pubkey::Pubkey;
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use tokio::runtime::Builder as TokioRuntime;
 use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
-use crate::builder::{templates::SwapTemplateDirection, BuilderHandle, BuilderStage};
+use crate::builder::{BuilderHandle, BuilderStage};
 use crate::config::AppConfig;
 use crate::core::{pin_current_thread, Lease, RingConsumer, RingProducer, SlabPool};
 use crate::corecast::CoreCastClient;
-use crate::hydration::types::{PoolQuoteDirection, PoolSnapshot, TradeUpdate};
-use crate::hydration::HydrationSnapshot;
+use crate::hydration::types::{PoolSnapshot, TradeUpdate};
+use crate::hydration::{HydrationSnapshot, PoolStateEvent, PoolStateUpdate, PoolStore};
 use crate::notifier::Notifier;
-use crate::planner::graph_manager::{ArbitrageOpportunity, PathLeg};
-use crate::planner::types::{BundleCandidate, Opportunity, RouteLegPlan, RoutePlan};
+use crate::planner::graph_manager::ArbitrageOpportunity;
+use crate::planner::types::{BundleCandidate, Opportunity};
 use crate::telemetry;
-use crate::template::TemplateContext;
 use crate::token_pair::TokenPair;
 
 mod graph;
 pub mod graph_manager;
+pub mod route_builder;
 mod submit;
 pub mod types;
 
@@ -41,9 +39,6 @@ const CYCLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CYCLE_ALERT_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_CYCLE_ALERTS_PER_BATCH: usize = 5;
 const DEFAULT_CYCLE_NOTIONAL_LAMPORTS: u64 = 1_000_000;
-const DEFAULT_LEG_FEE_BPS: u64 = 30;
-const DEFAULT_LEG_SLIPPAGE_BPS: u64 = 50;
-
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
     pub detection_budget: Duration,
@@ -65,14 +60,20 @@ pub struct FastLanePlanner {
     builder: BuilderHandle,
     config: PlannerConfig,
     trade_rx: Receiver<TradeUpdate>,
+    pool_updates: Receiver<PoolStateUpdate>,
     bundle_pool: SlabPool<BundleCandidate>,
     bundle_producer: RingProducer<Lease<BundleCandidate>>,
+    pending_cycle_scan: bool,
+    pool_cache: HashMap<String, CachedPool>,
     graph: GraphHandle,
     notifier: Arc<Notifier>,
     cycle_cache: HashSet<String>,
     next_cycle_poll: Instant,
     next_cycle_alert: Instant,
     opportunity_seq: u64,
+    pool_store: Arc<PoolStore>,
+    readiness_timeout: Duration,
+    min_ready_pools: usize,
 }
 
 impl FastLanePlanner {
@@ -82,21 +83,31 @@ impl FastLanePlanner {
         graph: GraphHandle,
         notifier: Arc<Notifier>,
         trade_rx: Receiver<TradeUpdate>,
+        pool_updates: Receiver<PoolStateUpdate>,
         bundle_pool: SlabPool<BundleCandidate>,
         bundle_producer: RingProducer<Lease<BundleCandidate>>,
+        pool_store: Arc<PoolStore>,
+        readiness_timeout: Duration,
+        min_ready_pools: usize,
     ) -> Self {
         Self {
             builder,
             config,
             trade_rx,
+            pool_updates,
             bundle_pool,
             bundle_producer,
+            pending_cycle_scan: false,
+            pool_cache: HashMap::new(),
             graph,
             notifier,
             cycle_cache: HashSet::new(),
             next_cycle_poll: Instant::now(),
             next_cycle_alert: Instant::now(),
             opportunity_seq: 0,
+            pool_store,
+            readiness_timeout,
+            min_ready_pools,
         }
     }
 
@@ -117,6 +128,19 @@ impl FastLanePlanner {
         if let Some(core) = core_id {
             let _ = pin_current_thread(core);
         }
+        if !self.await_initial_readiness(&stop) {
+            warn!(
+                target = "fastlane",
+                "fast-lane planner shutting down before hydration ready"
+            );
+            return Ok(());
+        }
+        info!(
+            target = "fastlane",
+            pools = self.pool_store.len(),
+            min_ready = self.min_ready_pools,
+            "initial pool hydration satisfied"
+        );
         info!(
             detection_budget_ms = self.config.detection_budget.as_millis(),
             freshness_budget_ms = self.config.freshness_budget.as_millis(),
@@ -125,6 +149,10 @@ impl FastLanePlanner {
         while !stop.load(Ordering::Relaxed) {
             self.builder.heartbeat(BuilderStage::EvalHotPath);
             let mut made_progress = false;
+            if self.drain_pool_updates() {
+                made_progress = true;
+                self.pending_cycle_scan = true;
+            }
             while let Some(snapshot) = snapshot_consumer.pop() {
                 self.handle_snapshot(snapshot);
                 made_progress = true;
@@ -134,10 +162,12 @@ impl FastLanePlanner {
                 made_progress = true;
             }
             let now = Instant::now();
-            if now >= self.next_cycle_poll {
+            if self.pending_cycle_scan || now >= self.next_cycle_poll {
                 self.emit_arbitrage_cycles(now);
                 self.next_cycle_poll = now + CYCLE_POLL_INTERVAL;
+                self.pending_cycle_scan = false;
             }
+            self.emit_watcher_metrics();
             if !made_progress {
                 thread::yield_now();
                 thread::sleep(Duration::from_millis(2));
@@ -145,6 +175,24 @@ impl FastLanePlanner {
         }
         info!("fast-lane planner shutting down");
         Ok(())
+    }
+
+    fn await_initial_readiness(&self, stop: &Arc<AtomicBool>) -> bool {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            if self.pool_store.wait_until_ready(self.readiness_timeout) {
+                return true;
+            }
+            warn!(
+                target = "fastlane",
+                timeout_ms = self.readiness_timeout.as_millis(),
+                ready_pools = self.pool_store.len(),
+                min_ready = self.min_ready_pools,
+                "still waiting for initial pool hydration"
+            );
+        }
     }
 
     fn handle_snapshot(&self, snapshot: HydrationSnapshot) {
@@ -168,17 +216,25 @@ impl FastLanePlanner {
     }
 
     fn handle_trade(&mut self, trade: TradeUpdate) {
-        let snapshot = match self.graph.latest_snapshot(&trade.pool_id) {
-            Some(snapshot) => snapshot,
-            None => {
-                trace!(
-                    target = "fastlane",
-                    pool = %trade.pool_id,
-                    "trade skipped; no pool snapshot yet"
-                );
-                return;
-            }
+        let (snapshot, generation) = if let Some(entry) = self.snapshot_for_pool(&trade.pool_id) {
+            entry
+        } else {
+            trace!(
+                target = "fastlane",
+                pool = %trade.pool_id,
+                "trade skipped; no pool snapshot yet"
+            );
+            return;
         };
+
+        if snapshot.freshness.is_stale() {
+            trace!(
+                target = "fastlane",
+                pool = %trade.pool_id,
+                "trade skipped; pool snapshot flagged stale"
+            );
+            return;
+        }
 
         if snapshot.updated_at.elapsed() > self.config.freshness_budget {
             trace!(
@@ -190,8 +246,58 @@ impl FastLanePlanner {
         }
 
         let seq = self.next_opportunity_seq();
-        let opportunity = Opportunity::from_trade(seq, trade, Some(snapshot), None);
+        let opportunity =
+            Opportunity::from_trade(seq, trade, Some(snapshot), Some(generation), None);
         self.enqueue_candidate(opportunity);
+    }
+
+    fn snapshot_for_pool(&self, pool_id: &str) -> Option<(PoolSnapshot, u64)> {
+        self.pool_cache
+            .get(pool_id)
+            .map(|entry| (entry.snapshot.clone(), entry.generation))
+    }
+
+    fn emit_watcher_metrics(&self) {
+        telemetry::record_watcher_cache_depth(self.pool_cache.len());
+        telemetry::record_watcher_cycle_pending(self.pending_cycle_scan);
+    }
+
+    fn drain_pool_updates(&mut self) -> bool {
+        let mut updated = false;
+        loop {
+            match self.pool_updates.try_recv() {
+                Ok(update) => {
+                    self.apply_pool_update(update);
+                    updated = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    warn!(target = "fastlane", "pool update channel closed");
+                    break;
+                }
+            }
+        }
+        let backlog = self.pool_updates.len();
+        let capacity = self.pool_updates.capacity().unwrap_or(0);
+        telemetry::record_watcher_update_backlog(backlog, capacity);
+        updated
+    }
+
+    fn apply_pool_update(&mut self, update: PoolStateUpdate) {
+        match update.event {
+            PoolStateEvent::Upsert(snapshot) => {
+                self.pool_cache.insert(
+                    update.pool_id,
+                    CachedPool {
+                        generation: update.generation,
+                        snapshot,
+                    },
+                );
+            }
+            PoolStateEvent::Remove => {
+                self.pool_cache.remove(&update.pool_id);
+            }
+        }
     }
 
     fn next_opportunity_seq(&mut self) -> u64 {
@@ -254,92 +360,49 @@ impl FastLanePlanner {
     }
 
     fn build_cycle_opportunity(
-        &self,
+        &mut self,
         seq: u64,
         cycle: &ArbitrageOpportunity,
     ) -> Option<Opportunity> {
-        let notional = self.config.cycle_notional_lamports.max(1);
-        let mut current_amount = notional;
-        let mut max_slot = 0u64;
-        let mut legs = Vec::with_capacity(cycle.path.legs.len());
-
-        for leg in &cycle.path.legs {
-            let snapshot = self.graph.latest_snapshot(&leg.pool_id)?;
-            max_slot = max_slot.max(snapshot.slot);
-
-            let (direction, price) = price_for_leg(&snapshot, leg)?;
-            let pool_key = Pubkey::from_str(&leg.pool_id).ok()?;
-            let template_direction = match direction {
-                PoolQuoteDirection::BaseToQuote => SwapTemplateDirection::BaseIn,
-                PoolQuoteDirection::QuoteToBase => SwapTemplateDirection::BaseOut,
-            };
-            let readiness = self
-                .builder
-                .template_readiness(&pool_key, template_direction);
-            if !readiness.template_ready || !readiness.alt_ready {
-                trace!(
-                    target = "fastlane",
-                    pool = %leg.pool_id,
-                    template_ready = readiness.template_ready,
-                    alt_ready = readiness.alt_ready,
-                    "cycle leg not ready"
-                );
-                return None;
-            }
-
-            let mut estimated_output = ((current_amount as f64) * price).round() as u64;
-            if estimated_output == 0 {
-                estimated_output = 1;
-            }
-            let min_output = estimated_output
-                .saturating_sub((estimated_output * DEFAULT_LEG_SLIPPAGE_BPS) / 10_000);
-
-            legs.push(RouteLegPlan {
-                pool_id: leg.pool_id.clone(),
-                program_id: leg.program_id.clone(),
-                input_mint: leg.input_mint.clone(),
-                output_mint: leg.output_mint.clone(),
-                input_amount: current_amount,
-                estimated_output_amount: estimated_output,
-                effective_price: price,
-                fee_bps: DEFAULT_LEG_FEE_BPS,
-                template_fee_bps: DEFAULT_LEG_FEE_BPS as u16,
-                estimated_slippage_bps: DEFAULT_LEG_SLIPPAGE_BPS as f64,
-                direction,
-                sqrt_price_limit: None,
-                min_output_amount: Some(min_output),
-                limit_price: None,
-                price_impact_limit_bps: None,
-                context: TemplateContext::default(),
-                template_ready: readiness.template_ready,
-                alt_ready: readiness.alt_ready,
-            });
-            current_amount = estimated_output;
+        let route_plan = cycle.route_plan.clone()?;
+        if route_plan.legs.is_empty() {
+            return None;
         }
-
-        if legs.is_empty() || current_amount <= notional {
+        if !route_plan
+            .legs
+            .iter()
+            .all(|leg| leg.template_ready && leg.alt_ready)
+        {
+            trace!(
+                target = "fastlane",
+                route = %cycle
+                    .path
+                    .legs
+                    .iter()
+                    .map(|leg| leg.pool_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join("->"),
+                "cycle route not ready"
+            );
             return None;
         }
 
-        let route_plan = RoutePlan {
-            start_mint: cycle.path.start_mint.clone(),
-            end_mint: cycle.path.end_mint.clone(),
-            legs,
-            estimated_final_output_amount: Some(current_amount),
-            flash_loan_permitted: false,
-        };
-
         let first_leg = route_plan.legs.first()?;
+        let estimated_final = route_plan.estimated_final_output_amount.unwrap_or(0);
+        if estimated_final <= first_leg.input_amount {
+            return None;
+        }
+
         let trade = TradeUpdate {
             seq,
-            slot: max_slot,
+            slot: cycle.latest_slot.unwrap_or_default(),
             program_id: first_leg.program_id.clone(),
             pool_id: first_leg.pool_id.clone(),
             signature: format!("cycle:{}", Self::cycle_signature(cycle)),
             buy_mint: route_plan.start_mint.clone(),
             sell_mint: route_plan.start_mint.clone(),
-            buy_amount: current_amount,
-            sell_amount: notional,
+            buy_amount: estimated_final,
+            sell_amount: first_leg.input_amount,
         };
 
         let estimated_edge_bps = ((cycle.gain - 1.0).max(0.0)) * 10_000.0;
@@ -348,6 +411,7 @@ impl FastLanePlanner {
             seq,
             trade,
             pool_snapshot: None,
+            snapshot_generation: cycle.snapshot_generation,
             estimated_edge_bps,
             created_at: Instant::now(),
             route_plan: Some(route_plan),
@@ -417,27 +481,9 @@ impl FastLanePlanner {
     }
 }
 
-fn price_for_leg(snapshot: &PoolSnapshot, leg: &PathLeg) -> Option<(PoolQuoteDirection, f64)> {
-    let direction =
-        if leg.input_mint == snapshot.base_mint && leg.output_mint == snapshot.quote_mint {
-            PoolQuoteDirection::BaseToQuote
-        } else if leg.input_mint == snapshot.quote_mint && leg.output_mint == snapshot.base_mint {
-            PoolQuoteDirection::QuoteToBase
-        } else {
-            return None;
-        };
-
-    let price = snapshot
-        .quote(direction)
-        .map(|side| side.price())
-        .filter(|price| *price > 0.0)
-        .unwrap_or_else(|| snapshot.spot_price());
-
-    if price <= 0.0 {
-        return None;
-    }
-
-    Some((direction, price))
+struct CachedPool {
+    generation: u64,
+    snapshot: PoolSnapshot,
 }
 
 pub fn spawn_fast_lane_planner(
@@ -451,6 +497,10 @@ pub fn spawn_fast_lane_planner(
     config: PlannerConfig,
     bundle_pool: SlabPool<BundleCandidate>,
     trade_rx: Receiver<TradeUpdate>,
+    pool_updates: Receiver<PoolStateUpdate>,
+    pool_store: Arc<PoolStore>,
+    readiness_timeout: Duration,
+    min_ready_pools: usize,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     let worker = FastLanePlanner::new(
         builder,
@@ -458,8 +508,12 @@ pub fn spawn_fast_lane_planner(
         graph,
         notifier,
         trade_rx,
+        pool_updates,
         bundle_pool,
         bundle_producer,
+        pool_store,
+        readiness_timeout,
+        min_ready_pools,
     );
     thread::Builder::new()
         .name("fast_lane_planner".into())
@@ -472,29 +526,20 @@ pub fn spawn_fast_lane_trade_feed(
     config: Arc<AppConfig>,
     capacity: usize,
 ) -> Result<(Receiver<TradeUpdate>, thread::JoinHandle<Result<()>>)> {
-    let (sender, receiver) = bounded(capacity.max(1));
-    let worker_config = config.clone();
-    let handle = thread::Builder::new()
-        .name("fastlane_trade_feed".into())
-        .spawn(move || run_trade_feed(stop, worker_config, sender))
-        .map_err(anyhow::Error::from)?;
+    let channel_capacity = capacity.max(1);
+    let (sender, receiver) = bounded(channel_capacity);
+    let thread_name = "fast_lane_trade_feed".to_string();
+    let handle = thread::Builder::new().name(thread_name).spawn(move || {
+        let client = CoreCastClient::new(config.clone())
+            .context("failed to initialize CoreCast client for fast-lane trade feed")?;
+        let allowlist = Arc::new(config.token_pair_allowlist());
+        let runtime = TokioRuntime::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build fast-lane trade feed runtime")?;
+        runtime.block_on(async move { pump_trade_stream(stop, client, sender, allowlist).await })
+    })?;
     Ok((receiver, handle))
-}
-
-fn run_trade_feed(
-    stop: Arc<AtomicBool>,
-    config: Arc<AppConfig>,
-    sender: Sender<TradeUpdate>,
-) -> Result<()> {
-    let client = CoreCastClient::new(config.clone())
-        .context("failed to initialize CoreCast client for fast-lane trade feed")?;
-    let allowlist = Arc::new(config.token_pair_allowlist());
-    let runtime = TokioRuntime::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build fast-lane trade feed runtime")?;
-
-    runtime.block_on(async move { pump_trade_stream(stop, client, sender, allowlist).await })
 }
 
 async fn pump_trade_stream(

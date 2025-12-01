@@ -43,6 +43,8 @@ pub trait ProtocolAdapter: Send + Sync {
     fn bidirectional_quotes(&self, _snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         None
     }
+
+    fn enrich_snapshot(&self, _snapshot: &mut PoolSnapshot) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

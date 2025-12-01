@@ -24,7 +24,7 @@ use crate::builder::{
 use crate::core::{pin_current_thread, Lease, RingConsumer, RingProducer};
 use crate::telemetry::{self, Stage2PlanEvent};
 
-use crate::hydration::types::{LB_CLMM_PROGRAM_ID, PoolQuoteDirection};
+use crate::hydration::types::{PoolQuoteDirection, LB_CLMM_PROGRAM_ID};
 use crate::planner::types::{
     BundleCandidate, FlashLoanSummary, PlannedInstruction, PlannedLookupTable, RouteLegPlan,
     RoutePlan,
@@ -880,6 +880,7 @@ mod tests {
                     input_mint: "A".into(),
                     output_mint: "B".into(),
                     input_amount: 100,
+                    available_input_liquidity: 100,
                     estimated_output_amount: 200,
                     effective_price: 2.0,
                     fee_bps: 30,
@@ -900,6 +901,7 @@ mod tests {
                     input_mint: "B".into(),
                     output_mint: "C".into(),
                     input_amount: 200,
+                    available_input_liquidity: 200,
                     estimated_output_amount: 190,
                     effective_price: 0.95,
                     fee_bps: 30,
@@ -964,6 +966,7 @@ mod tests {
             input_mint: WSOL_MINT_PUBKEY.to_string(),
             output_mint: WSOL_MINT_PUBKEY.to_string(),
             input_amount: 1_000_000,
+            available_input_liquidity: 1_000_000,
             estimated_output_amount: 999_000,
             effective_price: 1.0,
             fee_bps: 30,
@@ -1080,7 +1083,7 @@ mod tests {
             buy_amount: 100,
             sell_amount: 50,
         };
-        let opportunity = Opportunity::from_trade(seq, trade, None, Some(100.0));
+        let opportunity = Opportunity::from_trade(seq, trade, None, None, Some(100.0));
         BundleCandidate::from_opportunity(&opportunity)
     }
 }

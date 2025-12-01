@@ -16,6 +16,8 @@ pub struct PoolUpdate {
     pub slot: u64,
     pub program_id: String,
     pub pool_id: String,
+    pub block_hash: Option<String>,
+    pub block_time_unix: Option<i64>,
     pub base_mint: String,
     pub quote_mint: String,
     pub base_post_amount: u128,
@@ -42,11 +44,18 @@ impl PoolUpdate {
             return None;
         }
 
+        // CoreCast BlockAttributes currently expose only the slot number, so block metadata
+        // such as hash/timestamp is unavailable for now.
+        let block_hash = None;
+        let block_time_unix = None;
+
         Some(Self {
             seq,
             slot: block.slot,
             program_id,
             pool_id,
+            block_hash,
+            block_time_unix,
             base_mint: encode_pubkey(&base_currency.mint_address),
             quote_mint: encode_pubkey(&quote_currency.mint_address),
             base_post_amount: base_side.post_amount as u128,
@@ -62,11 +71,14 @@ impl PoolUpdate {
             pool_id: self.pool_id,
             program_id: self.program_id,
             slot: self.slot,
+            block_hash: self.block_hash,
+            block_time_unix: self.block_time_unix,
             base_mint: self.base_mint,
             quote_mint: self.quote_mint,
             base_post_amount: self.base_post_amount,
             quote_post_amount: self.quote_post_amount,
             updated_at: Instant::now(),
+            freshness: SnapshotFreshness::LiveCorecast,
             quotes: None,
             extensions: self.extensions,
         }
@@ -1330,16 +1342,32 @@ impl PoolBidirectionalQuotes {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotFreshness {
+    LiveCorecast,
+    RpcRefresh,
+    Stale,
+}
+
+impl SnapshotFreshness {
+    pub fn is_stale(self) -> bool {
+        matches!(self, SnapshotFreshness::Stale)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PoolSnapshot {
     pub pool_id: String,
     pub program_id: String,
     pub slot: u64,
+    pub block_hash: Option<String>,
+    pub block_time_unix: Option<i64>,
     pub base_mint: String,
     pub quote_mint: String,
     pub base_post_amount: u128,
     pub quote_post_amount: u128,
     pub updated_at: Instant,
+    pub freshness: SnapshotFreshness,
     pub quotes: Option<PoolBidirectionalQuotes>,
     pub extensions: PoolUpdateExtensions,
 }
