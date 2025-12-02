@@ -1,5 +1,6 @@
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
+pub use crate::hydration::types::QuoteStatus;
 use crate::hydration::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate};
 
 mod cp_amm;
@@ -59,14 +60,6 @@ pub struct QuoteRequest {
     pub amount: u64,
     pub slot: u64,
     pub direction: SwapDirection,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuoteStatus {
-    Ok,
-    StaleState,
-    InsufficientLiquidity,
-    MissingState,
 }
 
 #[derive(Debug, Clone)]

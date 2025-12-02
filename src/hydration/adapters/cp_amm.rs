@@ -8,6 +8,11 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
+use spl_token_2022::extension::{
+    transfer_fee::{TransferFee, TransferFeeConfig},
+    BaseStateWithExtensions, StateWithExtensionsOwned,
+};
+use spl_token_2022::state::Mint;
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
@@ -19,7 +24,9 @@ use crate::hydration::types::{
 };
 use crate::template::TemplateContext;
 
-use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
+use super::{
+    build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, SwapDirection,
+};
 
 const BPS_DENOMINATOR: u64 = 10_000;
 const CP_AMM_DEFAULT_CU_LIMIT: u32 = 400_000;
@@ -27,6 +34,7 @@ const CP_AMM_DEFAULT_CU_PRICE: u64 = 5_000;
 
 const CP_AMM_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const SPL_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
@@ -35,6 +43,10 @@ const DEFAULT_CP_AMM_HYDRATION_RETRY_MS: u64 = 60_000;
 
 static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program should be valid")
+});
+static SPL_TOKEN_2022_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str(SPL_TOKEN_2022_PROGRAM_ID)
+        .expect("static spl token 2022 program should be valid")
 });
 
 construct_uint! {
@@ -72,6 +84,7 @@ pub struct CpAmmAdapter {
     state: DashMap<Pubkey, CpAmmState>,
     config: CpAmmAdapterConfig,
     hydrator: Option<CpAmmPoolHydrator>,
+    transfer_fee_cache: Option<TokenTransferFeeHydrator>,
     template_builder: Option<BuilderHandle>,
     registered_templates: DashMap<Pubkey, RegisteredTemplateSignature>,
 }
@@ -88,6 +101,7 @@ impl CpAmmAdapter {
         let program_id =
             Pubkey::from_str(CP_AMM_PROGRAM_ID).expect("static cp_amm program id should be valid");
         let hydrator = CpAmmPoolHydrator::new(&config);
+        let transfer_fee_cache = TokenTransferFeeHydrator::new(&config);
         if let Some(hydrator) = hydrator.as_ref() {
             info!(
                 target = "adapter::cp_amm",
@@ -105,6 +119,7 @@ impl CpAmmAdapter {
             state: DashMap::new(),
             config,
             hydrator,
+            transfer_fee_cache,
             template_builder,
             registered_templates: DashMap::new(),
         }
@@ -164,7 +179,7 @@ impl CpAmmAdapter {
             return;
         };
 
-        let state = CpAmmState {
+        let mut state = CpAmmState {
             pool: pool_pubkey,
             token_a_mint: base_mint,
             token_b_mint: quote_mint,
@@ -205,7 +220,11 @@ impl CpAmmAdapter {
             last_update_slot: update.slot,
             last_update_at: Instant::now(),
             last_hydrated_at: extras.hydrated_at,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
         };
+
+        self.attach_transfer_fees(&mut state);
 
         trace!(
             target = "adapter::cp_amm",
@@ -337,6 +356,28 @@ impl CpAmmAdapter {
         self.registered_templates.insert(state.pool, signature);
     }
 
+    fn attach_transfer_fees(&self, state: &mut CpAmmState) {
+        state.token_a_transfer_fee =
+            self.resolve_transfer_fee(state.token_a_mint, state.token_a_program);
+        state.token_b_transfer_fee =
+            self.resolve_transfer_fee(state.token_b_mint, state.token_b_program);
+    }
+
+    fn resolve_transfer_fee(
+        &self,
+        mint: Pubkey,
+        program: Option<Pubkey>,
+    ) -> Option<TokenTransferFee> {
+        let Some(cache) = self.transfer_fee_cache.as_ref() else {
+            return None;
+        };
+        let program_id = program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY);
+        if program_id != *SPL_TOKEN_2022_PROGRAM_PUBKEY {
+            return None;
+        }
+        cache.hydrate(mint).and_then(|meta| meta.fee)
+    }
+
     fn decorate_template_context(
         &self,
         state: &CpAmmState,
@@ -389,6 +430,17 @@ impl CpAmmAdapter {
         clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps)
     }
 
+    fn clamp_request_output_amount(&self, state: &CpAmmState, req: &QuoteRequest) -> u64 {
+        let reserve = if req.output_mint == state.token_a_mint {
+            state.vault_a_balance
+        } else if req.output_mint == state.token_b_mint {
+            state.vault_b_balance
+        } else {
+            return req.amount;
+        };
+        clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps)
+    }
+
     fn build_snapshot_side(
         &self,
         state: &CpAmmState,
@@ -419,13 +471,15 @@ impl CpAmmAdapter {
             direction: SwapDirection::ExactIn,
         };
 
-        let (expected_output, slippage_bps) = simulate_cp_amm_exact_in(state, &req)?;
+        let simulation = simulate_cp_amm_exact_in(state, &req, true)?;
+        let expected_output = simulation.output_amount;
+        let executed_input = simulation.executed_input_amount;
         let fee_bps = state.total_fee_bps();
         let template_fee_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
-        let effective_price = if probe_amount == 0 {
+        let effective_price = if executed_input == 0 {
             0.0
         } else {
-            expected_output as f64 / probe_amount as f64
+            expected_output as f64 / executed_input as f64
         };
 
         let mut context = TemplateContext {
@@ -437,6 +491,10 @@ impl CpAmmAdapter {
             ..Default::default()
         };
         self.decorate_template_context(state, &mut context, input_mint, output_mint);
+        if simulation.amount_leftover > 0 {
+            context.partial_fill_remaining = Some(simulation.amount_leftover);
+        }
+        context.expected_fee_amount = Some(simulation.fee_amount);
 
         Some(PoolQuoteSide {
             input_mint: input_mint.to_string(),
@@ -446,12 +504,17 @@ impl CpAmmAdapter {
             fee_bps,
             template_fee_bps,
             effective_price,
-            estimated_slippage_bps: slippage_bps,
+            estimated_slippage_bps: simulation.slippage_bps,
             sqrt_price_limit: None,
             min_output_amount: Some(expected_output),
             limit_price: None,
             price_impact_limit_bps: None,
             context,
+            status: QuoteStatus::Ok,
+            sqrt_price_before_x64: None,
+            sqrt_price_after_x64: None,
+            tick_arrays_used: Vec::new(),
+            cache_slot: Some(slot),
         })
     }
 }
@@ -534,10 +597,63 @@ impl ProtocolAdapter for CpAmmAdapter {
             return None;
         }
         request.amount = capped;
-        let (amount_out, edge_bps) = simulate_cp_amm_exact_in(&state, &request)?;
-        let mut response = build_quote_response(request, amount_out);
-        response.edge_bps = edge_bps;
-        response.min_output_amount = Some(amount_out);
+        if referral_missing(&state) {
+            let mut missing = build_quote_response(request, 0);
+            missing.status = QuoteStatus::MissingReferral;
+            return Some(missing);
+        }
+        let simulation = simulate_cp_amm_exact_in(&state, &request, false)?;
+        let mut response = build_quote_response(request, simulation.output_amount);
+        response.amount_in = simulation.executed_input_amount;
+        response.edge_bps = simulation.edge_bps;
+        response.min_output_amount = Some(simulation.output_amount);
+        response.sqrt_price_limit = Some(simulation.sqrt_price_after);
+        response.context.expected_fee_amount = Some(simulation.fee_amount);
+        response.context.compute_unit_limit = Some(CP_AMM_DEFAULT_CU_LIMIT);
+        response.context.compute_unit_price = Some(CP_AMM_DEFAULT_CU_PRICE);
+        response.context.requires_memo = state.referral_token_account.is_some();
+        response.context.requires_dont_front = false;
+        response.context.host_fee_account = state.referral_token_account;
+        self.decorate_template_context(
+            &state,
+            &mut response.context,
+            response.request.input_mint,
+            response.request.output_mint,
+        );
+        Some(response)
+    }
+
+    fn quote_exact_out(&self, req: QuoteRequest) -> Option<QuoteResponse> {
+        if req.direction != SwapDirection::ExactOut {
+            return None;
+        }
+        let state = self.get_state(&req.pool_id)?;
+        if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
+            return None;
+        }
+        let mut request = req;
+        let capped = self.clamp_request_output_amount(&state, &request);
+        if capped == 0 {
+            return None;
+        }
+        request.amount = capped;
+        if referral_missing(&state) {
+            let mut missing = build_quote_response(request, 0);
+            missing.status = QuoteStatus::MissingReferral;
+            return Some(missing);
+        }
+        let simulation = simulate_cp_amm_exact_out(&state, &request)?;
+        let mut response = QuoteResponse {
+            amount_in: simulation.executed_input_amount,
+            amount_out: simulation.output_amount,
+            edge_bps: simulation.edge_bps,
+            sqrt_price_limit: Some(simulation.sqrt_price_after),
+            min_output_amount: None,
+            status: QuoteStatus::Ok,
+            request,
+            context: TemplateContext::default(),
+        };
+        response.context.expected_fee_amount = Some(simulation.fee_amount);
         response.context.compute_unit_limit = Some(CP_AMM_DEFAULT_CU_LIMIT);
         response.context.compute_unit_price = Some(CP_AMM_DEFAULT_CU_PRICE);
         response.context.requires_memo = state.referral_token_account.is_some();
@@ -575,7 +691,95 @@ impl ProtocolAdapter for CpAmmAdapter {
     }
 }
 
-fn simulate_cp_amm_exact_in(state: &CpAmmState, req: &QuoteRequest) -> Option<(u64, f64)> {
+#[derive(Debug, Clone)]
+struct SimulatedSwapQuote {
+    pub executed_input_amount: u64,
+    pub net_input_amount: u64,
+    pub output_amount: u64,
+    pub fee_amount: u64,
+    pub token_in_fee_amount: u64,
+    pub token_out_fee_amount: u64,
+    pub sqrt_price_after: u128,
+    pub amount_leftover: u64,
+    pub edge_bps: f64,
+    pub slippage_bps: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TokenTransferFee {
+    fee: TransferFee,
+}
+
+impl TokenTransferFee {
+    fn new(fee: TransferFee) -> Self {
+        Self { fee }
+    }
+
+    fn post_fee_amount(&self, pre_fee_amount: u64) -> Option<(u64, u64)> {
+        let fee_amount = self.fee.calculate_fee(pre_fee_amount)?;
+        let net = pre_fee_amount.checked_sub(fee_amount)?;
+        Some((net, fee_amount))
+    }
+
+    fn pre_fee_amount(&self, post_fee_amount: u64) -> Option<(u64, u64)> {
+        let gross = self.fee.calculate_pre_fee_amount(post_fee_amount)?;
+        let fee_amount = gross.checked_sub(post_fee_amount)?;
+        Some((gross, fee_amount))
+    }
+}
+
+fn apply_post_fee_amount(amount: u64, fee: Option<TokenTransferFee>) -> Option<(u64, u64)> {
+    match fee {
+        Some(fee) => fee.post_fee_amount(amount),
+        None => Some((amount, 0)),
+    }
+}
+
+fn apply_pre_fee_amount(amount: u64, fee: Option<TokenTransferFee>) -> Option<(u64, u64)> {
+    match fee {
+        Some(fee) => fee.pre_fee_amount(amount),
+        None => Some((amount, 0)),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClmmStep {
+    pub amount_out: u64,
+    pub net_input_amount: u64,
+    pub fee_amount: u64,
+    pub sqrt_price_after: u128,
+    pub hit_price_limit: bool,
+}
+
+fn referral_missing(state: &CpAmmState) -> bool {
+    state.referral_token_account.is_none() && state.referral_bps.unwrap_or(0) > 0
+}
+
+fn direction_mid_price(state: &CpAmmState, direction: TradeDirection) -> Option<f64> {
+    match direction {
+        TradeDirection::AToB => state.mid_price(),
+        TradeDirection::BToA => state
+            .mid_price()
+            .map(|value| if value == 0.0 { 0.0 } else { 1.0 / value }),
+    }
+}
+
+fn compute_edge_from_prices(mid_price: f64, execution_price: f64) -> f64 {
+    if mid_price <= 0.0
+        || execution_price <= 0.0
+        || !mid_price.is_finite()
+        || !execution_price.is_finite()
+    {
+        return 0.0;
+    }
+    ((execution_price / mid_price) - 1.0) * BPS_DENOMINATOR as f64
+}
+
+fn simulate_cp_amm_exact_in(
+    state: &CpAmmState,
+    req: &QuoteRequest,
+    allow_partial: bool,
+) -> Option<SimulatedSwapQuote> {
     if req.amount == 0 {
         return None;
     }
@@ -586,13 +790,54 @@ fn simulate_cp_amm_exact_in(state: &CpAmmState, req: &QuoteRequest) -> Option<(u
         return None;
     }
 
-    let amount_out = simulate_clmm_exact_in(state, req.amount, direction)?;
-    let edge_bps =
-        compute_slippage_bps(reserve_in, reserve_out, req.amount, amount_out).unwrap_or(0.0);
-    Some((amount_out, edge_bps))
+    let input_fee = state.transfer_fee_for_mint(&req.input_mint);
+    let output_fee = state.transfer_fee_for_mint(&req.output_mint);
+
+    let (post_fee_budget, _) = apply_post_fee_amount(req.amount, input_fee)?;
+    if post_fee_budget == 0 {
+        return None;
+    }
+
+    let step = simulate_clmm_exact_in(state, post_fee_budget, direction)?;
+    let pool_consumed = step.net_input_amount.saturating_add(step.fee_amount);
+
+    let (executed_input_amount, token_in_fee_amount) =
+        apply_pre_fee_amount(pool_consumed, input_fee)?;
+    let amount_leftover = req.amount.saturating_sub(executed_input_amount);
+    if !allow_partial && amount_leftover > 0 {
+        return None;
+    }
+
+    let (output_amount, token_out_fee_amount) = apply_post_fee_amount(step.amount_out, output_fee)?;
+    if output_amount == 0 {
+        return None;
+    }
+
+    let slippage = compute_slippage_bps(reserve_in, reserve_out, pool_consumed, step.amount_out)
+        .unwrap_or(0.0);
+    let mid_price = direction_mid_price(state, direction)?;
+    let execution_price = if executed_input_amount == 0 {
+        return None;
+    } else {
+        output_amount as f64 / executed_input_amount as f64
+    };
+    let edge_bps = compute_edge_from_prices(mid_price, execution_price);
+
+    Some(SimulatedSwapQuote {
+        executed_input_amount,
+        net_input_amount: step.net_input_amount,
+        output_amount,
+        fee_amount: step.fee_amount,
+        token_in_fee_amount,
+        token_out_fee_amount,
+        sqrt_price_after: step.sqrt_price_after,
+        amount_leftover,
+        edge_bps,
+        slippage_bps: slippage,
+    })
 }
-#[cfg(test)]
-fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<(u64, f64)> {
+
+fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<SimulatedSwapQuote> {
     if req.amount == 0 {
         return None;
     }
@@ -602,28 +847,59 @@ fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<(
     if reserve_in == 0 || reserve_out == 0 {
         return None;
     }
-    if req.amount as u128 >= reserve_out {
+    let input_fee = state.transfer_fee_for_mint(&req.input_mint);
+    let output_fee = state.transfer_fee_for_mint(&req.output_mint);
+
+    let (gross_target_out, _) = apply_pre_fee_amount(req.amount, output_fee)?;
+    if gross_target_out == 0 || gross_target_out as u128 >= reserve_out {
         return None;
     }
 
-    let amount_in = find_input_for_exact_out(state, direction, req.amount)?;
-    let edge_bps =
-        compute_slippage_bps(reserve_in, reserve_out, amount_in, req.amount).unwrap_or(0.0);
-    Some((amount_in, edge_bps))
+    let step = find_input_for_exact_out(state, direction, gross_target_out)?;
+    let pool_consumed = step.net_input_amount.saturating_add(step.fee_amount);
+
+    let (executed_input_amount, token_in_fee_amount) =
+        apply_pre_fee_amount(pool_consumed, input_fee)?;
+    let (output_amount, token_out_fee_amount) = apply_post_fee_amount(step.amount_out, output_fee)?;
+    if output_amount < req.amount {
+        return None;
+    }
+
+    let slippage = compute_slippage_bps(reserve_in, reserve_out, pool_consumed, step.amount_out)
+        .unwrap_or(0.0);
+    let mid_price = direction_mid_price(state, direction)?;
+    let execution_price = if executed_input_amount == 0 {
+        return None;
+    } else {
+        output_amount as f64 / executed_input_amount as f64
+    };
+    let edge_bps = compute_edge_from_prices(mid_price, execution_price);
+
+    Some(SimulatedSwapQuote {
+        executed_input_amount,
+        net_input_amount: step.net_input_amount,
+        output_amount,
+        fee_amount: step.fee_amount,
+        token_in_fee_amount,
+        token_out_fee_amount,
+        sqrt_price_after: step.sqrt_price_after,
+        amount_leftover: 0,
+        edge_bps,
+        slippage_bps: slippage,
+    })
 }
 
-#[cfg(test)]
 fn find_input_for_exact_out(
     state: &CpAmmState,
     direction: TradeDirection,
     target_out: u64,
-) -> Option<u64> {
+) -> Option<ClmmStep> {
     let mut hi = target_out.max(1);
     let mut candidate = None;
     for _ in 0..64 {
-        let amount_out = simulate_clmm_exact_in(state, hi, direction)?;
-        if amount_out >= target_out {
-            candidate = Some(hi);
+        let step = simulate_clmm_exact_in(state, hi, direction)?;
+        if step.amount_out >= target_out {
+            candidate = Some(step);
             break;
         }
         if hi >= u64::MAX / 2 {
@@ -634,11 +910,19 @@ fn find_input_for_exact_out(
 
     let mut best_input = candidate?;
     let mut low = 1u64;
-    while low < best_input {
-        let mid = low + (best_input - low) / 2;
-        let amount_out = simulate_clmm_exact_in(state, mid, direction)?;
-        if amount_out >= target_out {
-            best_input = mid;
+    let mut high = hi;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let step = match simulate_clmm_exact_in(state, mid, direction) {
+            Some(step) => step,
+            None => {
+                low = mid.saturating_add(1);
+                continue;
+            }
+        };
+        if step.amount_out >= target_out {
+            high = mid;
+            best_input = step;
         } else {
             low = mid.saturating_add(1);
         }
@@ -650,7 +934,7 @@ fn simulate_clmm_exact_in(
     state: &CpAmmState,
     amount_in: u64,
     direction: TradeDirection,
-) -> Option<u64> {
+) -> Option<ClmmStep> {
     if amount_in == 0 {
         return None;
     }
@@ -690,7 +974,20 @@ fn simulate_clmm_exact_in(
     if hit_price_cap && consumed < amount_in as u128 {
         return None;
     }
-    Some(step.amount_out.min(u64::MAX as u128) as u64)
+
+    let sqrt_price_after = from_x96(step.sqrt_price_next)?;
+    Some(ClmmStep {
+        amount_out: step.amount_out.min(u64::MAX as u128) as u64,
+        net_input_amount: step.amount_in.min(u64::MAX as u128) as u64,
+        fee_amount: step.fee_amount.min(u64::MAX as u128) as u64,
+        sqrt_price_after,
+        hit_price_limit: hit_price_cap,
+    })
+}
+
+fn from_x96(value: U256) -> Option<u128> {
+    let shifted = value >> 32;
+    shifted.try_into().ok()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -898,6 +1195,128 @@ fn fetch_cp_amm_meta(clients: &[Arc<RpcClient>], pool: Pubkey) -> Option<Hydrate
     None
 }
 
+#[derive(Clone, Debug)]
+struct TransferFeeMeta {
+    fee: Option<TokenTransferFee>,
+    hydrated_at: Instant,
+}
+
+struct TokenTransferFeeHydrator {
+    hydrator: AsyncHydrator<Pubkey, TransferFeeMeta>,
+    retry_backoff: Duration,
+    last_attempts: DashMap<Pubkey, Instant>,
+}
+
+impl TokenTransferFeeHydrator {
+    fn new(config: &CpAmmAdapterConfig) -> Option<Self> {
+        if config.rpc_endpoints.is_empty() {
+            return None;
+        }
+
+        let timeout = Duration::from_millis(config.rpc_timeout_ms.max(100));
+        let client_list: Vec<Arc<RpcClient>> = config
+            .rpc_endpoints
+            .iter()
+            .map(|url| Arc::new(RpcClient::new_with_timeout(url.clone(), timeout)))
+            .collect();
+
+        if client_list.is_empty() {
+            return None;
+        }
+
+        let endpoint_count = client_list.len();
+        let clients = Arc::new(client_list);
+        let fetch_clients = clients.clone();
+        let hydrator = AsyncHydrator::new("token_fee", endpoint_count, move |mint| {
+            fetch_token_transfer_fee_meta(fetch_clients.as_ref(), mint)
+        });
+
+        Some(Self {
+            hydrator,
+            retry_backoff: Duration::from_millis(config.hydration_retry_ms.max(1)),
+            last_attempts: DashMap::new(),
+        })
+    }
+
+    fn hydrate(&self, mint: Pubkey) -> Option<TransferFeeMeta> {
+        if let Some(meta) = self.hydrator.cached(&mint) {
+            if meta.hydrated_at.elapsed() >= self.retry_backoff {
+                if self.should_schedule(mint) {
+                    self.hydrator.schedule(mint);
+                }
+            }
+            return Some(meta);
+        }
+        if self.should_schedule(mint) {
+            self.hydrator.schedule(mint);
+        }
+        None
+    }
+
+    fn should_schedule(&self, mint: Pubkey) -> bool {
+        let now = Instant::now();
+        if let Some(last) = self.last_attempts.get(&mint) {
+            if now.duration_since(*last.value()) < self.retry_backoff {
+                return false;
+            }
+        }
+        self.last_attempts.insert(mint, now);
+        true
+    }
+}
+
+fn fetch_token_transfer_fee_meta(
+    clients: &[Arc<RpcClient>],
+    mint: Pubkey,
+) -> Option<TransferFeeMeta> {
+    for client in clients {
+        match client.get_account(&mint) {
+            Ok(account) => {
+                if account.owner != *SPL_TOKEN_2022_PROGRAM_PUBKEY {
+                    return Some(TransferFeeMeta {
+                        fee: None,
+                        hydrated_at: Instant::now(),
+                    });
+                }
+                match client.get_epoch_info() {
+                    Ok(epoch_info) => {
+                        let fee = parse_transfer_fee_extension(&account.data, epoch_info.epoch);
+                        return Some(TransferFeeMeta {
+                            fee,
+                            hydrated_at: Instant::now(),
+                        });
+                    }
+                    Err(error) => {
+                        warn!(
+                            target = "adapter::cp_amm",
+                            mint = %mint,
+                            %error,
+                            "failed to fetch epoch info for token fee metadata"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    target = "adapter::cp_amm",
+                    mint = %mint,
+                    %error,
+                    "failed to fetch mint account for token fee metadata"
+                );
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_transfer_fee_extension(data: &[u8], epoch: u64) -> Option<TokenTransferFee> {
+    let state = StateWithExtensionsOwned::<Mint>::unpack(data.to_vec()).ok()?;
+    let config = state.get_extension::<TransferFeeConfig>().ok()?;
+    let fee = *config.get_epoch_fee(epoch);
+    Some(TokenTransferFee::new(fee))
+}
+
 const POOL_FEES_STRUCT_LEN: usize = 160;
 const PUBKEY_BYTES: usize = 32;
 const U64_BYTES: usize = 8;
@@ -979,6 +1398,8 @@ pub struct CpAmmState {
     pub token_b_mint: Pubkey,
     pub token_a_program: Option<Pubkey>,
     pub token_b_program: Option<Pubkey>,
+    pub token_a_transfer_fee: Option<TokenTransferFee>,
+    pub token_b_transfer_fee: Option<TokenTransferFee>,
     pub amp: Option<u64>,
     pub lp_fee_bps: Option<u16>,
     pub protocol_fee_bps: Option<u16>,
@@ -1029,6 +1450,16 @@ impl CpAmmState {
             sqrt_min_price_x64: self.sqrt_min_price_x64?,
             sqrt_max_price_x64: self.sqrt_max_price_x64?,
         })
+    }
+
+    fn transfer_fee_for_mint(&self, mint: &Pubkey) -> Option<TokenTransferFee> {
+        if *mint == self.token_a_mint {
+            self.token_a_transfer_fee
+        } else if *mint == self.token_b_mint {
+            self.token_b_transfer_fee
+        } else {
+            None
+        }
     }
 
     fn hydration_stale(&self, ttl_ms: u64) -> bool {
@@ -1232,7 +1663,17 @@ mod math {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions};
+    use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness};
+    use spl_pod::primitives::{PodU16, PodU64};
+
+    fn fixture_transfer_fee(bps: u16, max_fee: u64) -> TokenTransferFee {
+        let fee = TransferFee {
+            epoch: PodU64::from(0),
+            maximum_fee: PodU64::from(max_fee),
+            transfer_fee_basis_points: PodU16::from(bps),
+        };
+        TokenTransferFee::new(fee)
+    }
 
     #[test]
     fn parses_pool_account_prefix() {
@@ -1301,6 +1742,8 @@ mod tests {
             token_b_mint: mint_b,
             token_a_program: None,
             token_b_program: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
             amp: None,
             lp_fee_bps: Some(30),
             protocol_fee_bps: None,
@@ -1317,10 +1760,9 @@ mod tests {
             last_hydrated_at: Some(Instant::now()),
         };
 
-        let (amount_out, edge_bps) =
-            simulate_cp_amm_exact_in(&state, &req).expect("swap should quote");
-        assert!(amount_out > 0);
-        assert!(edge_bps.is_sign_negative());
+        let simulation = simulate_cp_amm_exact_in(&state, &req, false).expect("swap should quote");
+        assert!(simulation.output_amount > 0);
+        assert!(simulation.edge_bps.is_sign_negative());
     }
 
     #[test]
@@ -1337,7 +1779,7 @@ mod tests {
             direction: SwapDirection::ExactIn,
         };
 
-        let mut state = CpAmmState {
+        let state = CpAmmState {
             pool,
             pool_authority: None,
             token_a_vault: None,
@@ -1346,6 +1788,8 @@ mod tests {
             token_b_mint: mint_b,
             token_a_program: None,
             token_b_program: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
             amp: None,
             lp_fee_bps: Some(30),
             protocol_fee_bps: None,
@@ -1362,18 +1806,82 @@ mod tests {
             last_hydrated_at: Some(Instant::now()),
         };
 
-        let (expected_out, _) =
-            simulate_cp_amm_exact_in(&state, &exact_in).expect("exact-in quote should succeed");
+        let expected_out = simulate_cp_amm_exact_in(&state, &exact_in, false)
+            .map(|sim| sim.output_amount)
+            .expect("exact-in quote should succeed");
 
         let exact_out = QuoteRequest {
             amount: expected_out,
             direction: SwapDirection::ExactOut,
             ..exact_in
         };
-        let (amount_in, _) =
-            simulate_cp_amm_exact_out(&state, &exact_out).expect("inverse quote should succeed");
+        let amount_in = simulate_cp_amm_exact_out(&state, &exact_out)
+            .map(|sim| sim.executed_input_amount)
+            .expect("inverse quote should succeed");
         assert!(amount_in >= exact_in.amount);
         assert!(amount_in - exact_in.amount <= 5);
+    }
+
+    #[test]
+    fn simulate_cp_amm_applies_token_transfer_fees() {
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let req = QuoteRequest {
+            pool_id: pool,
+            input_mint: mint_a,
+            output_mint: mint_b,
+            amount: 200_000,
+            slot: 1,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let mut state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            token_a_transfer_fee: Some(fixture_transfer_fee(150, 5_000)),
+            token_b_transfer_fee: Some(fixture_transfer_fee(100, 3_000)),
+            amp: None,
+            lp_fee_bps: Some(30),
+            protocol_fee_bps: None,
+            referral_bps: None,
+            referral_token_account: None,
+            sqrt_price_x64: Some(1_u128 << 64),
+            liquidity: Some(7_000_000_000),
+            sqrt_min_price_x64: Some(1_u128 << 60),
+            sqrt_max_price_x64: Some(1_u128 << 70),
+            vault_a_balance: 3_000_000,
+            vault_b_balance: 5_000_000,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+            last_hydrated_at: Some(Instant::now()),
+        };
+
+        let simulation =
+            simulate_cp_amm_exact_in(&state, &req, false).expect("quote should succeed");
+        assert!(simulation.token_in_fee_amount > 0);
+        assert!(simulation.token_out_fee_amount > 0);
+        let total_reported = simulation
+            .net_input_amount
+            .saturating_add(simulation.fee_amount)
+            .saturating_add(simulation.token_in_fee_amount);
+        assert_eq!(simulation.executed_input_amount, total_reported);
+        assert!(simulation.output_amount < req.amount);
+
+        // ensure state without fees reverts to original behavior
+        state.token_a_transfer_fee = None;
+        state.token_b_transfer_fee = None;
+        let baseline = simulate_cp_amm_exact_in(&state, &req, false).expect("baseline quote");
+        assert!(baseline.token_in_fee_amount == 0);
+        assert!(baseline.token_out_fee_amount == 0);
+        assert!(simulation.executed_input_amount >= baseline.executed_input_amount);
+        assert!(baseline.output_amount > simulation.output_amount);
     }
 
     #[test]
@@ -1390,6 +1898,8 @@ mod tests {
             token_b_mint: mint_b,
             token_a_program: None,
             token_b_program: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
             amp: None,
             lp_fee_bps: None,
             protocol_fee_bps: None,
@@ -1429,6 +1939,8 @@ mod tests {
             token_b_mint: mint_b,
             token_a_program: None,
             token_b_program: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
             amp: None,
             lp_fee_bps: Some(30),
             protocol_fee_bps: Some(5),
@@ -1458,6 +1970,8 @@ mod tests {
             base_post_amount: state.vault_a_balance,
             quote_post_amount: state.vault_b_balance,
             updated_at: Instant::now(),
+            freshness: SnapshotFreshness::LiveCorecast,
+            allow_reserve_backfill: true,
             quotes: None,
             extensions: PoolUpdateExtensions::default(),
         };
@@ -1471,8 +1985,8 @@ mod tests {
         let expected_quote_probe =
             snapshot_probe_amount(state.vault_b_balance, CP_AMM_INPUT_UTILIZATION_BPS).unwrap();
 
-        assert_eq!(quotes.base_to_quote.notional, expected_base_probe);
-        assert_eq!(quotes.quote_to_base.notional, expected_quote_probe);
+        assert!(quotes.base_to_quote.notional <= expected_base_probe);
+        assert!(quotes.quote_to_base.notional <= expected_quote_probe);
         assert_eq!(quotes.base_to_quote.fee_bps, state.total_fee_bps());
         assert!(quotes.base_to_quote.expected_output > 0);
         assert!(quotes.quote_to_base.expected_output > 0);

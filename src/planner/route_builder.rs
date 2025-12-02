@@ -133,10 +133,17 @@ fn price_for_leg(snapshot: &PoolSnapshot, leg: &PathLeg) -> Option<(PoolQuoteDir
             return None;
         };
 
-    let (price, available_input_liquidity) = snapshot
-        .quote(direction)
-        .map(|side| (side.price(), side.notional))
-        .unwrap_or_else(|| (snapshot.spot_price(), 0));
+    let (price, available_input_liquidity) = if let Some(side) = snapshot.quote(direction) {
+        if let Some(price) = side.price() {
+            (price, side.notional)
+        } else {
+            (0.0, 0)
+        }
+    } else if let Some(price) = snapshot.price_for_mints(&leg.input_mint, &leg.output_mint) {
+        (price, 0)
+    } else {
+        (0.0, 0)
+    };
 
     if price <= 0.0 {
         return None;

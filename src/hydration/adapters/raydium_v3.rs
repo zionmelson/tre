@@ -27,7 +27,9 @@ use crate::hydration::types::{
 use crate::template::TemplateContext;
 
 use super::hydration::AsyncHydrator;
-use super::{build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, SwapDirection};
+use super::{
+    build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, SwapDirection,
+};
 
 const RAYDIUM_V3_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 const POOL_VAULT_SEED: &[u8] = b"pool_vault";
@@ -154,34 +156,6 @@ impl RaydiumV3Adapter {
 
     pub fn get_state(&self, pool: &Pubkey) -> Option<RaydiumV3State> {
         self.state.get(pool).map(|entry| entry.clone())
-    }
-
-    fn xyk_amount_out(
-        reserve_in: u128,
-        reserve_out: u128,
-        amount_in: u64,
-        fee_bps: u64,
-    ) -> Option<u64> {
-        if reserve_in == 0 || reserve_out == 0 || amount_in == 0 {
-            return None;
-        }
-
-        let fee_deduction = 10_000u128.saturating_sub(fee_bps as u128);
-        let amount_less_fee = (amount_in as u128)
-            .saturating_mul(fee_deduction)
-            .checked_div(10_000)?;
-        if amount_less_fee == 0 {
-            return None;
-        }
-
-        let numerator = amount_less_fee.saturating_mul(reserve_out);
-        let denominator = reserve_in.saturating_add(amount_less_fee);
-        if denominator == 0 {
-            return None;
-        }
-
-        let amount_out = numerator.checked_div(denominator)?;
-        Some(amount_out.min(u64::MAX as u128) as u64)
     }
 
     fn evict_stale(&self, current_slot: u64) {
@@ -667,31 +641,10 @@ impl RaydiumV3Adapter {
     }
 
     fn quote_amount_out(&self, state: &RaydiumV3State, req: &QuoteRequest) -> Option<QuoteOutcome> {
-        if let Some(simulation) = self.simulate_clmm_exact_in(state, req) {
-            return Some(QuoteOutcome {
-                amount_out: simulation.amount_out,
-                sqrt_price_limit: Some(simulation.sqrt_price_after),
-            });
-        }
-
-        let (reserve_in, reserve_out) =
-            if req.input_mint == state.base_mint && req.output_mint == state.quote_mint {
-                (state.vault_base, state.vault_quote)
-            } else if req.input_mint == state.quote_mint && req.output_mint == state.base_mint {
-                (state.vault_quote, state.vault_base)
-            } else {
-                return None;
-            };
-
-        if reserve_in == 0 || reserve_out == 0 {
-            return None;
-        }
-
-        let fee_bps = state.trade_fee_bps.unwrap_or(DEFAULT_FEE_BPS);
-        let amount_out = Self::xyk_amount_out(reserve_in, reserve_out, req.amount, fee_bps)?;
+        let simulation = self.simulate_clmm_exact_in(state, req)?;
         Some(QuoteOutcome {
-            amount_out,
-            sqrt_price_limit: None,
+            amount_out: simulation.amount_out,
+            sqrt_price_limit: Some(simulation.sqrt_price_after),
         })
     }
 
@@ -768,6 +721,11 @@ impl RaydiumV3Adapter {
                 self.decorate_quote_context(&mut context, state, input_mint, output_mint);
                 context
             },
+            status: QuoteStatus::Ok,
+            sqrt_price_before_x64: None,
+            sqrt_price_after_x64: None,
+            tick_arrays_used: Vec::new(),
+            cache_slot: Some(slot),
         })
     }
 }

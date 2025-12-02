@@ -4,6 +4,17 @@ use crate::proto::solana_corecast::{DexTradeStreamMessage, PoolLiquidityChangeSt
 use crate::proto::solana_messages::{ParsedIdlInstruction, PoolLiquidityChangeEvent};
 use crate::template::TemplateContext;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteStatus {
+    Ok,
+    StaleState,
+    InsufficientLiquidity,
+    MissingState,
+    MissingReferral,
+    RateLimited,
+    MissingTickArrays,
+}
+
 mod protocols;
 
 pub use protocols::{
@@ -87,6 +98,7 @@ impl PoolUpdate {
             quote_post_amount: self.quote_post_amount,
             updated_at: Instant::now(),
             freshness: SnapshotFreshness::LiveCorecast,
+            allow_reserve_backfill: true,
             quotes: None,
             extensions: self.extensions,
         }
@@ -138,15 +150,31 @@ pub struct PoolQuoteSide {
     pub limit_price: Option<i64>,
     pub price_impact_limit_bps: Option<u16>,
     pub context: TemplateContext,
+    pub status: QuoteStatus,
+    pub sqrt_price_before_x64: Option<u128>,
+    pub sqrt_price_after_x64: Option<u128>,
+    pub tick_arrays_used: Vec<String>,
+    pub cache_slot: Option<u64>,
 }
 
 impl PoolQuoteSide {
-    pub fn price(&self) -> f64 {
-        self.effective_price
+    pub fn price(&self) -> Option<f64> {
+        if self.status == QuoteStatus::Ok
+            && self.effective_price.is_finite()
+            && self.effective_price > 0.0
+        {
+            Some(self.effective_price)
+        } else {
+            None
+        }
     }
 
-    pub fn slippage_bps(&self) -> f64 {
-        self.estimated_slippage_bps
+    pub fn slippage_bps(&self) -> Option<f64> {
+        if self.status == QuoteStatus::Ok {
+            Some(self.estimated_slippage_bps)
+        } else {
+            None
+        }
     }
 }
 
@@ -191,6 +219,7 @@ pub struct PoolSnapshot {
     pub quote_post_amount: u128,
     pub updated_at: Instant,
     pub freshness: SnapshotFreshness,
+    pub allow_reserve_backfill: bool,
     pub quotes: Option<PoolBidirectionalQuotes>,
     pub extensions: PoolUpdateExtensions,
 }
@@ -209,6 +238,44 @@ impl PoolSnapshot {
 
     pub fn quote(&self, direction: PoolQuoteDirection) -> Option<&PoolQuoteSide> {
         self.quotes().map(|bundle| bundle.side(direction))
+    }
+
+    pub fn quoted_price(&self, direction: PoolQuoteDirection) -> Option<f64> {
+        self.quote(direction).and_then(|side| side.price())
+    }
+
+    pub fn price_for_mints(&self, input_mint: &str, output_mint: &str) -> Option<f64> {
+        if input_mint == self.base_mint && output_mint == self.quote_mint {
+            self.quoted_price(PoolQuoteDirection::BaseToQuote)
+                .or_else(|| {
+                    if self.allow_reserve_backfill {
+                        let spot = self.spot_price();
+                        if spot > 0.0 {
+                            Some(spot)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+        } else if input_mint == self.quote_mint && output_mint == self.base_mint {
+            self.quoted_price(PoolQuoteDirection::QuoteToBase)
+                .or_else(|| {
+                    if self.allow_reserve_backfill {
+                        let spot = self.spot_price();
+                        if spot > 0.0 {
+                            Some(1.0 / spot)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        }
     }
 
     pub fn base_to_quote_quote(&self) -> Option<&PoolQuoteSide> {

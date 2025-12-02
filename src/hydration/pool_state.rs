@@ -7,7 +7,7 @@ use dashmap::{iter::Iter, DashMap};
 use tracing::debug;
 
 use crate::config::QueueDropPolicy;
-use crate::hydration::types::{PoolSnapshot, SnapshotFreshness};
+use crate::hydration::types::{PoolQuoteDirection, PoolSnapshot, SnapshotFreshness};
 use crate::telemetry;
 
 #[derive(Clone, Debug)]
@@ -121,6 +121,21 @@ impl PoolStore {
         let slot = snapshot.slot;
         let block_hash = snapshot.block_hash.clone();
         let block_time_unix = snapshot.block_time_unix;
+        let price = snapshot
+            .quoted_price(PoolQuoteDirection::BaseToQuote)
+            .or_else(|| {
+                if snapshot.allow_reserve_backfill {
+                    let spot = snapshot.spot_price();
+                    if spot > 0.0 {
+                        Some(spot)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0);
         let state = PoolState {
             pool_id: pool_id.clone(),
             program_id: program_id.clone(),
@@ -131,9 +146,19 @@ impl PoolStore {
             generation,
             base_liquidity: snapshot.base_post_amount,
             quote_liquidity: snapshot.quote_post_amount,
-            price: snapshot.spot_price(),
+            price,
             snapshot: snapshot.clone(),
         };
+        telemetry::record_hydration_pool_snapshot(
+            &program_id,
+            &pool_id,
+            &snapshot.base_mint,
+            &snapshot.quote_mint,
+            slot,
+            price,
+            snapshot.base_post_amount,
+            snapshot.quote_post_amount,
+        );
         self.inner.insert(pool_id.clone(), state);
         self.maybe_notify_ready();
         self.prune_if_needed();
@@ -354,6 +379,7 @@ mod tests {
             quote_post_amount: 20,
             updated_at: Instant::now(),
             freshness,
+            allow_reserve_backfill: true,
             quotes: None,
             extensions: PoolUpdateExtensions::default(),
         }

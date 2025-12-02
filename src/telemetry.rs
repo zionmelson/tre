@@ -23,6 +23,7 @@ use tracing::{info, warn};
 
 const PROMETHEUS_ENV: &str = "PROMETHEUS_METRICS_ADDR";
 const PROMETHEUS_METRIC_PREFIX_ALLOWLIST: &[&str] = &["hydration_", "watcher_", "fastlane_"];
+const HYDRATION_POOL_PRICE_SCALE: f64 = 1_000_000.0;
 
 static TELEMETRY: OnceCell<TelemetryState> = OnceCell::new();
 static HTTP_SERVER: OnceCell<Option<JoinHandle<()>>> = OnceCell::new();
@@ -49,6 +50,10 @@ struct TelemetryState {
     hydration_adapter_ingest: Family<HydrationAdapterLabels, Counter>,
     hydration_rpc_refresh_success: Family<HydrationAdapterLabels, Counter>,
     hydration_rpc_refresh_failure: Family<HydrationAdapterLabels, Counter>,
+    hydration_pool_price_scaled: Family<HydrationPoolLabels, Gauge>,
+    hydration_pool_slot: Family<HydrationPoolLabels, Gauge>,
+    hydration_pool_base_liquidity: Family<HydrationPoolLabels, Gauge>,
+    hydration_pool_quote_liquidity: Family<HydrationPoolLabels, Gauge>,
     hydration_stale_pools: Counter,
     hydration_queue_depth_pct: Gauge,
     hydration_queue_depth_items: Gauge,
@@ -211,6 +216,34 @@ impl TelemetryState {
             hydration_rpc_refresh_failure.clone(),
         );
 
+        let hydration_pool_price_scaled = Family::default();
+        registry.register(
+            "hydration_pool_price_scaled",
+            "Scaled (1e6) base→quote price for the last observed pool snapshot",
+            hydration_pool_price_scaled.clone(),
+        );
+
+        let hydration_pool_slot = Family::default();
+        registry.register(
+            "hydration_pool_slot",
+            "Slot of the last observed pool snapshot",
+            hydration_pool_slot.clone(),
+        );
+
+        let hydration_pool_base_liquidity = Family::default();
+        registry.register(
+            "hydration_pool_base_liquidity",
+            "Base-side post balance associated with the most recent pool snapshot",
+            hydration_pool_base_liquidity.clone(),
+        );
+
+        let hydration_pool_quote_liquidity = Family::default();
+        registry.register(
+            "hydration_pool_quote_liquidity",
+            "Quote-side post balance associated with the most recent pool snapshot",
+            hydration_pool_quote_liquidity.clone(),
+        );
+
         let hydration_stale_pools = Counter::default();
         registry.register(
             "hydration_stale_pool_events_total",
@@ -353,6 +386,10 @@ impl TelemetryState {
             hydration_adapter_ingest,
             hydration_rpc_refresh_success,
             hydration_rpc_refresh_failure,
+            hydration_pool_price_scaled,
+            hydration_pool_slot,
+            hydration_pool_base_liquidity,
+            hydration_pool_quote_liquidity,
             hydration_stale_pools,
             hydration_queue_depth_pct,
             hydration_queue_depth_items,
@@ -560,6 +597,14 @@ struct Stage2PoolLabels {
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 struct HydrationAdapterLabels {
     adapter: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct HydrationPoolLabels {
+    program: String,
+    pool: String,
+    base_mint: String,
+    quote_mint: String,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
@@ -780,6 +825,49 @@ pub fn record_hydration_rpc_refresh_failure(adapter: &str) {
     }
 }
 
+pub fn record_hydration_pool_snapshot(
+    program_id: &str,
+    pool_id: &str,
+    base_mint: &str,
+    quote_mint: &str,
+    slot: u64,
+    price: f64,
+    base_liquidity: u128,
+    quote_liquidity: u128,
+) {
+    if program_id.is_empty() || pool_id.is_empty() {
+        return;
+    }
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationPoolLabels {
+            program: program_id.to_string(),
+            pool: pool_id.to_string(),
+            base_mint: base_mint.to_string(),
+            quote_mint: quote_mint.to_string(),
+        };
+        state
+            .hydration_pool_slot
+            .get_or_create(&labels)
+            .set(clamp_u64_to_i64(slot));
+        if price.is_finite() && price > 0.0 {
+            let scaled = (price * HYDRATION_POOL_PRICE_SCALE).round();
+            let clamped = scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+            state
+                .hydration_pool_price_scaled
+                .get_or_create(&labels)
+                .set(clamped);
+        }
+        state
+            .hydration_pool_base_liquidity
+            .get_or_create(&labels)
+            .set(clamp_u128_to_i64(base_liquidity));
+        state
+            .hydration_pool_quote_liquidity
+            .get_or_create(&labels)
+            .set(clamp_u128_to_i64(quote_liquidity));
+    }
+}
+
 pub fn record_hydration_stale_pools(evicted: u64) {
     if evicted == 0 {
         return;
@@ -888,6 +976,14 @@ pub fn record_fastlane_slab_exhaustion() {
 
 fn clamp_u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn clamp_u128_to_i64(value: u128) -> i64 {
+    if value > i64::MAX as u128 {
+        i64::MAX
+    } else {
+        value as i64
+    }
 }
 
 fn age_since_unix_ms(last_refresh_unix_ms: u64) -> Option<u64> {

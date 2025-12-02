@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -17,11 +17,13 @@ const BPS_DENOMINATOR: u64 = 10_000;
 
 pub struct AdapterBook {
     adapters: HashMap<String, Arc<dyn ProtocolAdapter>>, // key = program id string
+    strict_price_programs: HashSet<String>,
 }
 
 impl AdapterBook {
     pub fn new(config: Arc<AppConfig>, builder: BuilderHandle) -> Self {
         let mut adapters: HashMap<String, Arc<dyn ProtocolAdapter>> = HashMap::new();
+        let mut strict_price_programs: HashSet<String> = HashSet::new();
 
         register_adapter(
             &mut adapters,
@@ -44,15 +46,17 @@ impl AdapterBook {
                 Some(builder.clone()),
             )),
         );
-        register_adapter(
-            &mut adapters,
-            Arc::new(WhirlpoolAdapter::new(
-                whirlpool_config(config.as_ref()),
-                Some(builder),
-            )),
-        );
+        let whirlpool_adapter = Arc::new(WhirlpoolAdapter::new(
+            whirlpool_config(config.as_ref()),
+            Some(builder),
+        ));
+        strict_price_programs.insert(whirlpool_adapter.program_id().to_string());
+        register_adapter(&mut adapters, whirlpool_adapter);
 
-        Self { adapters }
+        Self {
+            adapters,
+            strict_price_programs,
+        }
     }
 
     pub fn ingest(&self, update: &PoolUpdate) -> Option<&'static str> {
@@ -64,7 +68,8 @@ impl AdapterBook {
         }
     }
 
-    pub fn snapshot_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
+    pub fn snapshot_quotes(&self, snapshot: &mut PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
+        snapshot.allow_reserve_backfill = !self.requires_authoritative_quotes(&snapshot.program_id);
         let adapter = self.adapters.get(&snapshot.program_id)?;
         adapter.bidirectional_quotes(snapshot)
     }
@@ -91,6 +96,10 @@ impl AdapterBook {
         };
 
         adapter.quote_exact_in(request)
+    }
+
+    pub fn requires_authoritative_quotes(&self, program_id: &str) -> bool {
+        self.strict_price_programs.contains(program_id)
     }
 }
 

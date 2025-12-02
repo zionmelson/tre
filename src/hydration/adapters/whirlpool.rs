@@ -559,22 +559,16 @@ impl WhirlpoolAdapter {
         };
 
         let direction = resolve_direction(state, &req)?;
-        let mut sqrt_price_limit = None;
         let mut preferred_arrays = Vec::new();
-        let (expected_output, slippage_bps) = if let Some(simulation) =
-            simulate_best_exact_in(self.hydrator.as_ref(), state, &req, probe_amount)
-        {
-            sqrt_price_limit = Some(simulation.sqrt_price_after);
-            if !simulation.tick_arrays.is_empty() {
-                preferred_arrays = simulation.tick_arrays.clone();
-            }
-            (simulation.amount_out, simulation.edge_bps)
-        } else {
-            let price = state.mid_price()?;
-            let amount_out =
-                quote_from_price(&req, &state.token_mint_a, &state.token_mint_b, price)?;
-            (amount_out, 0.0)
-        };
+        let simulation =
+            simulate_authoritative_exact_in(self.hydrator.as_ref(), state, &req, probe_amount)
+                .ok()?;
+        let sqrt_price_limit = Some(simulation.sqrt_price_after);
+        if !simulation.tick_arrays.is_empty() {
+            preferred_arrays = simulation.tick_arrays.clone();
+        }
+        let expected_output = simulation.amount_out;
+        let slippage_bps = simulation.edge_bps;
 
         if expected_output == 0 {
             return None;
@@ -583,7 +577,7 @@ impl WhirlpoolAdapter {
         let effective_price = if probe_amount == 0 {
             0.0
         } else {
-            expected_output as f64 / probe_amount as f64
+            expected_output as f64 / simulation.consumed_input as f64
         };
 
         let fee_bps = whirlpool_trade_fee_bps(state);
@@ -611,6 +605,11 @@ impl WhirlpoolAdapter {
             limit_price: None,
             price_impact_limit_bps: None,
             context,
+            status: QuoteStatus::Ok,
+            sqrt_price_before_x64: simulation.sqrt_price_before,
+            sqrt_price_after_x64: Some(simulation.sqrt_price_after),
+            tick_arrays_used: preferred_arrays.iter().map(|pk| pk.to_string()).collect(),
+            cache_slot: Some(slot),
         })
     }
 }
@@ -691,26 +690,30 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         }
         request.amount = capped_amount;
 
-        if let Some(simulation) =
-            simulate_best_exact_in(self.hydrator.as_ref(), &state, &request, request.amount)
-        {
-            let mut response = build_quote_response(request, simulation.amount_out);
-            response.edge_bps = simulation.edge_bps;
-            response.sqrt_price_limit = Some(simulation.sqrt_price_after);
-            response.min_output_amount = Some(simulation.amount_out);
-            if !simulation.tick_arrays.is_empty() {
-                response.context.whirlpool_tick_arrays = simulation.tick_arrays.clone();
+        match simulate_best_exact_in(self.hydrator.as_ref(), &state, &request, request.amount) {
+            Ok(simulation) => {
+                let mut response = build_quote_response(request, simulation.amount_out);
+                response.edge_bps = simulation.edge_bps;
+                response.sqrt_price_limit = Some(simulation.sqrt_price_after);
+                response.min_output_amount = Some(simulation.amount_out);
+                if !simulation.tick_arrays.is_empty() {
+                    response.context.whirlpool_tick_arrays = simulation.tick_arrays.clone();
+                }
+                self.decorate_template_context(&mut response, &state);
+                Some(response)
             }
-            self.decorate_template_context(&mut response, &state);
-            return Some(response);
+            Err(err) => {
+                let status: QuoteStatus = err.into();
+                let price = state.mid_price()?;
+                let amount_out =
+                    quote_from_price(&request, &state.token_mint_a, &state.token_mint_b, price)?;
+                let mut fallback = build_quote_response(request, amount_out);
+                fallback.status = status;
+                fallback.min_output_amount = Some(amount_out);
+                self.decorate_template_context(&mut fallback, &state);
+                Some(fallback)
+            }
         }
-        let price = state.mid_price()?;
-        let amount_out =
-            quote_from_price(&request, &state.token_mint_a, &state.token_mint_b, price)?;
-        let mut fallback = build_quote_response(request, amount_out);
-        fallback.min_output_amount = Some(amount_out);
-        self.decorate_template_context(&mut fallback, &state);
-        Some(fallback)
     }
 
     fn quote_exact_out(&self, req: QuoteRequest) -> Option<QuoteResponse> {
@@ -727,39 +730,41 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         if request.amount == 0 {
             return None;
         }
-        if let Some((amount_in, simulation)) =
-            find_input_for_exact_out(self.hydrator.as_ref(), &state, &request, request.amount)
-        {
-            let mut response = QuoteResponse {
-                amount_in,
-                amount_out: request.amount,
-                edge_bps: simulation.edge_bps,
-                sqrt_price_limit: Some(simulation.sqrt_price_after),
-                min_output_amount: None,
-                status: QuoteStatus::Ok,
-                request,
-                context: TemplateContext::default(),
-            };
-            if !simulation.tick_arrays.is_empty() {
-                response.context.whirlpool_tick_arrays = simulation.tick_arrays.clone();
+        match find_input_for_exact_out(self.hydrator.as_ref(), &state, &request, request.amount) {
+            Ok((amount_in, simulation)) => {
+                let mut response = QuoteResponse {
+                    amount_in,
+                    amount_out: request.amount,
+                    edge_bps: simulation.edge_bps,
+                    sqrt_price_limit: Some(simulation.sqrt_price_after),
+                    min_output_amount: None,
+                    status: QuoteStatus::Ok,
+                    request,
+                    context: TemplateContext::default(),
+                };
+                if !simulation.tick_arrays.is_empty() {
+                    response.context.whirlpool_tick_arrays = simulation.tick_arrays.clone();
+                }
+                self.decorate_template_context(&mut response, &state);
+                Some(response)
             }
-            self.decorate_template_context(&mut response, &state);
-            return Some(response);
+            Err(err) => {
+                let status: QuoteStatus = err.into();
+                let amount_in = quote_exact_out_from_price(&request, &state)?;
+                let mut response = QuoteResponse {
+                    amount_in,
+                    amount_out: request.amount,
+                    edge_bps: 0.0,
+                    sqrt_price_limit: None,
+                    min_output_amount: None,
+                    status,
+                    request,
+                    context: TemplateContext::default(),
+                };
+                self.decorate_template_context(&mut response, &state);
+                Some(response)
+            }
         }
-
-        let amount_in = quote_exact_out_from_price(&request, &state)?;
-        let mut response = QuoteResponse {
-            amount_in,
-            amount_out: request.amount,
-            edge_bps: 0.0,
-            sqrt_price_limit: None,
-            min_output_amount: None,
-            status: QuoteStatus::Ok,
-            request,
-            context: TemplateContext::default(),
-        };
-        self.decorate_template_context(&mut response, &state);
-        Some(response)
     }
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
@@ -1046,6 +1051,7 @@ struct WhirlpoolTickArrayCursor<'a> {
     cache: HashMap<i32, HydratedTickArray>,
     used_arrays: Vec<Pubkey>,
     seen_arrays: HashSet<Pubkey>,
+    missing_arrays: bool,
 }
 
 impl<'a> WhirlpoolTickArrayCursor<'a> {
@@ -1066,6 +1072,7 @@ impl<'a> WhirlpoolTickArrayCursor<'a> {
             cache: HashMap::new(),
             used_arrays: Vec::new(),
             seen_arrays: HashSet::new(),
+            missing_arrays: false,
         }
     }
 
@@ -1081,6 +1088,7 @@ impl<'a> WhirlpoolTickArrayCursor<'a> {
                 .hydrate_tick_array_window(self.pool, self.tick_spacing, start, 1);
             return Some(entry);
         }
+        self.missing_arrays = true;
         None
     }
 
@@ -1088,6 +1096,10 @@ impl<'a> WhirlpoolTickArrayCursor<'a> {
         if self.seen_arrays.insert(address) {
             self.used_arrays.push(address);
         }
+    }
+
+    fn missing_coverage(&self) -> bool {
+        self.missing_arrays
     }
 
     fn used_arrays(&self) -> Vec<Pubkey> {
@@ -1411,10 +1423,29 @@ enum TradeDirection {
     BToA,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimulationError {
+    MissingState,
+    MissingTickArrays,
+    InsufficientLiquidity,
+}
+
+impl From<SimulationError> for QuoteStatus {
+    fn from(value: SimulationError) -> Self {
+        match value {
+            SimulationError::MissingState => QuoteStatus::MissingState,
+            SimulationError::MissingTickArrays => QuoteStatus::MissingTickArrays,
+            SimulationError::InsufficientLiquidity => QuoteStatus::InsufficientLiquidity,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SlippageSimulation {
     amount_out: u64,
+    consumed_input: u64,
     edge_bps: f64,
+    sqrt_price_before: Option<u128>,
     sqrt_price_after: u128,
     tick_arrays: Vec<Pubkey>,
 }
@@ -1422,23 +1453,23 @@ struct SlippageSimulation {
 fn simulate_constant_liquidity_exact_in(
     state: &WhirlpoolState,
     req: &QuoteRequest,
-) -> Option<SlippageSimulation> {
-    let liquidity = state.liquidity?;
-    let sqrt_price_x64 = state.sqrt_price_x64?;
-    let fee_rate = state.fee_rate?;
+) -> Result<SlippageSimulation, SimulationError> {
+    let liquidity = state.liquidity.ok_or(SimulationError::MissingState)?;
+    let sqrt_price_x64 = state.sqrt_price_x64.ok_or(SimulationError::MissingState)?;
+    let fee_rate = state.fee_rate.ok_or(SimulationError::MissingState)?;
     if liquidity == 0 || req.amount == 0 {
-        return None;
+        return Err(SimulationError::InsufficientLiquidity);
     }
 
-    let direction = resolve_direction(state, req)?;
+    let direction = resolve_direction(state, req).ok_or(SimulationError::MissingState)?;
     let zero_for_one = matches!(direction, TradeDirection::AToB);
     let fee_bps = fee_bps_from_hundredth_bip(fee_rate);
 
     let sqrt_price_current = math::to_x96(sqrt_price_x64);
     let sqrt_price_limit = if zero_for_one {
-        math::sqrt_price_at_tick_x96(math::MIN_TICK)?
+        math::sqrt_price_at_tick_x96(math::MIN_TICK).ok_or(SimulationError::MissingState)?
     } else {
-        math::sqrt_price_at_tick_x96(math::MAX_TICK)?
+        math::sqrt_price_at_tick_x96(math::MAX_TICK).ok_or(SimulationError::MissingState)?
     };
 
     let step = math::compute_swap_step(
@@ -1448,17 +1479,21 @@ fn simulate_constant_liquidity_exact_in(
         req.amount as u128,
         fee_bps,
         zero_for_one,
-    )?;
+    )
+    .ok_or(SimulationError::MissingState)?;
 
     let amount_out = step.amount_out.min(u64::MAX as u128) as u64;
     if amount_out == 0 {
-        return None;
+        return Err(SimulationError::InsufficientLiquidity);
     }
 
     let actual_amount_in = step
         .amount_in
         .saturating_add(step.fee_amount)
         .min(req.amount as u128) as u64;
+    if actual_amount_in == 0 {
+        return Err(SimulationError::InsufficientLiquidity);
+    }
 
     let reference_price = match direction {
         TradeDirection::AToB => state.mid_price(),
@@ -1482,9 +1517,11 @@ fn simulate_constant_liquidity_exact_in(
 
     let sqrt_price_after = sqrt_price_x64_from_x96(&step.sqrt_price_next);
 
-    Some(SlippageSimulation {
+    Ok(SlippageSimulation {
         amount_out,
+        consumed_input: actual_amount_in,
         edge_bps,
+        sqrt_price_before: Some(sqrt_price_x64),
         sqrt_price_after,
         tick_arrays: Vec::new(),
     })
@@ -1494,17 +1531,19 @@ fn simulate_tick_arrays_exact_in(
     hydrator: &WhirlpoolPoolHydrator,
     state: &WhirlpoolState,
     req: &QuoteRequest,
-) -> Option<SlippageSimulation> {
-    let tick_spacing = state.tick_spacing?;
-    let mut current_tick = state.tick_current_index?;
-    let mut liquidity = state.liquidity?;
-    let sqrt_price_x64 = state.sqrt_price_x64?;
-    let fee_rate = state.fee_rate?;
+) -> Result<SlippageSimulation, SimulationError> {
+    let tick_spacing = state.tick_spacing.ok_or(SimulationError::MissingState)?;
+    let mut current_tick = state
+        .tick_current_index
+        .ok_or(SimulationError::MissingState)?;
+    let mut liquidity = state.liquidity.ok_or(SimulationError::MissingState)?;
+    let sqrt_price_x64 = state.sqrt_price_x64.ok_or(SimulationError::MissingState)?;
+    let fee_rate = state.fee_rate.ok_or(SimulationError::MissingState)?;
     if liquidity == 0 || req.amount == 0 {
-        return None;
+        return Err(SimulationError::InsufficientLiquidity);
     }
 
-    let direction = resolve_direction(state, req)?;
+    let direction = resolve_direction(state, req).ok_or(SimulationError::MissingState)?;
     let zero_for_one = matches!(direction, TradeDirection::AToB);
     let fee_bps = fee_bps_from_hundredth_bip(fee_rate);
 
@@ -1514,11 +1553,13 @@ fn simulate_tick_arrays_exact_in(
     } else {
         math::MAX_TICK
     };
-    let sqrt_price_limit = math::sqrt_price_at_tick_x96(sqrt_limit_tick)?;
+    let sqrt_price_limit =
+        math::sqrt_price_at_tick_x96(sqrt_limit_tick).ok_or(SimulationError::MissingState)?;
 
-    let anchor_start = active_tick_array_start(tick_spacing, current_tick);
+    let anchor_start =
+        active_tick_array_start(tick_spacing, current_tick).ok_or(SimulationError::MissingState)?;
     let mut cursor =
-        WhirlpoolTickArrayCursor::new(hydrator, state.whirlpool, tick_spacing, anchor_start);
+        WhirlpoolTickArrayCursor::new(hydrator, state.whirlpool, tick_spacing, Some(anchor_start));
 
     let mut amount_remaining = req.amount as u128;
     let mut amount_out_accum = 0u128;
@@ -1533,7 +1574,8 @@ fn simulate_tick_arrays_exact_in(
         let mut target_price = sqrt_price_limit;
         let mut crossing = None;
         if let Some(next_tick) = cursor.next_initialized_tick(current_tick, zero_for_one) {
-            let tick_price = math::sqrt_price_at_tick_x96(next_tick.index)?;
+            let tick_price = math::sqrt_price_at_tick_x96(next_tick.index)
+                .ok_or(SimulationError::MissingState)?;
             if zero_for_one {
                 if tick_price > target_price {
                     target_price = tick_price;
@@ -1551,7 +1593,8 @@ fn simulate_tick_arrays_exact_in(
             amount_remaining,
             fee_bps,
             zero_for_one,
-        )?;
+        )
+        .ok_or(SimulationError::MissingState)?;
 
         if step.amount_in == 0 {
             break;
@@ -1570,8 +1613,8 @@ fn simulate_tick_arrays_exact_in(
                 } else {
                     init_tick.index
                 };
-                liquidity =
-                    apply_liquidity_delta(liquidity, init_tick.liquidity_net, zero_for_one)?;
+                liquidity = apply_liquidity_delta(liquidity, init_tick.liquidity_net, zero_for_one)
+                    .ok_or(SimulationError::MissingState)?;
             } else {
                 break;
             }
@@ -1581,12 +1624,16 @@ fn simulate_tick_arrays_exact_in(
     }
 
     if amount_out_accum == 0 {
-        return None;
+        return Err(if cursor.missing_coverage() {
+            SimulationError::MissingTickArrays
+        } else {
+            SimulationError::InsufficientLiquidity
+        });
     }
 
     let consumed_input = (req.amount as u128).saturating_sub(amount_remaining);
     if consumed_input == 0 {
-        return None;
+        return Err(SimulationError::InsufficientLiquidity);
     }
 
     let amount_out = amount_out_accum.min(u64::MAX as u128) as u64;
@@ -1614,9 +1661,11 @@ fn simulate_tick_arrays_exact_in(
 
     let tick_arrays = cursor.used_arrays();
 
-    Some(SlippageSimulation {
+    Ok(SlippageSimulation {
         amount_out,
+        consumed_input: actual_amount_in,
         edge_bps,
+        sqrt_price_before: state.sqrt_price_x64,
         sqrt_price_after: sqrt_price_x64_from_x96(&sqrt_price_x96),
         tick_arrays,
     })
@@ -1627,16 +1676,31 @@ fn simulate_best_exact_in(
     state: &WhirlpoolState,
     req: &QuoteRequest,
     amount: u64,
-) -> Option<SlippageSimulation> {
+) -> Result<SlippageSimulation, SimulationError> {
     let mut scoped_req = req.clone();
     scoped_req.amount = amount;
     scoped_req.direction = SwapDirection::ExactIn;
     if let Some(h) = hydrator {
-        if let Some(simulation) = simulate_tick_arrays_exact_in(h, state, &scoped_req) {
-            return Some(simulation);
+        match simulate_tick_arrays_exact_in(h, state, &scoped_req) {
+            Ok(simulation) => return Ok(simulation),
+            Err(SimulationError::MissingTickArrays) => {}
+            Err(err) => return Err(err),
         }
     }
     simulate_constant_liquidity_exact_in(state, &scoped_req)
+}
+
+fn simulate_authoritative_exact_in(
+    hydrator: Option<&WhirlpoolPoolHydrator>,
+    state: &WhirlpoolState,
+    req: &QuoteRequest,
+    amount: u64,
+) -> Result<SlippageSimulation, SimulationError> {
+    let h = hydrator.ok_or(SimulationError::MissingState)?;
+    let mut scoped_req = req.clone();
+    scoped_req.amount = amount;
+    scoped_req.direction = SwapDirection::ExactIn;
+    simulate_tick_arrays_exact_in(h, state, &scoped_req)
 }
 
 fn find_input_for_exact_out(
@@ -1644,9 +1708,9 @@ fn find_input_for_exact_out(
     state: &WhirlpoolState,
     req: &QuoteRequest,
     target_out: u64,
-) -> Option<(u64, SlippageSimulation)> {
+) -> Result<(u64, SlippageSimulation), SimulationError> {
     if target_out == 0 {
-        return None;
+        return Err(SimulationError::InsufficientLiquidity);
     }
 
     let mut high = target_out.max(1);
@@ -1664,7 +1728,7 @@ fn find_input_for_exact_out(
         high = high.saturating_mul(2);
     }
 
-    let (mut best_input, mut best_sim) = best?;
+    let (mut best_input, mut best_sim) = best.ok_or(SimulationError::InsufficientLiquidity)?;
 
     let mut low = 1u64;
     while low < best_input {
@@ -1681,7 +1745,7 @@ fn find_input_for_exact_out(
         }
     }
 
-    Some((best_input, best_sim))
+    Ok((best_input, best_sim))
 }
 
 fn quote_exact_out_from_price(req: &QuoteRequest, state: &WhirlpoolState) -> Option<u64> {
@@ -2029,7 +2093,7 @@ mod math {
 mod tests {
     use super::*;
     use crate::hydration::adapters::{QuoteRequest, SwapDirection};
-    use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions};
+    use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness};
     use dashmap::DashMap;
 
     #[test]
@@ -2344,6 +2408,8 @@ mod tests {
             base_post_amount: 2_000_000u128,
             quote_post_amount: 3_000_000u128,
             updated_at: Instant::now(),
+            freshness: SnapshotFreshness::LiveCorecast,
+            allow_reserve_backfill: true,
             quotes: None,
             extensions: PoolUpdateExtensions::default(),
         };

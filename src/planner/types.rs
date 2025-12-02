@@ -27,9 +27,10 @@ impl Opportunity {
     ) -> Self {
         let estimated_edge_bps = override_edge_bps
             .or_else(|| {
-                snapshot
-                    .as_ref()
-                    .map(|snap| compute_edge_bps(trade.price(), snap.spot_price()))
+                snapshot.as_ref().and_then(|snap| {
+                    snap.price_for_mints(&trade.sell_mint, &trade.buy_mint)
+                        .map(|pool_price| compute_edge_bps(trade.price(), pool_price))
+                })
             })
             .unwrap_or_default();
 

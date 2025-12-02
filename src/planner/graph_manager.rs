@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 const NEGATIVE_CYCLE_EPSILON: f64 = 1e-12;
 
-use crate::hydration::types::PoolSnapshot;
+use crate::hydration::types::{PoolQuoteDirection, PoolSnapshot};
 use crate::planner::types::RoutePlan;
 use crate::token_pair::TokenPair;
 
@@ -639,7 +639,7 @@ impl PoolSummary {
             liquidity_score: snapshot
                 .base_post_amount
                 .saturating_add(snapshot.quote_post_amount),
-            price: PriceMetrics::new(snapshot.base_post_amount, snapshot.quote_post_amount),
+            price: PriceMetrics::from_snapshot(snapshot),
         }
     }
 
@@ -663,20 +663,56 @@ struct PriceMetrics {
 }
 
 impl PriceMetrics {
-    fn new(base_reserve: u128, quote_reserve: u128) -> Self {
-        if base_reserve == 0 || quote_reserve == 0 {
-            return Self::default();
+    fn from_snapshot(snapshot: &PoolSnapshot) -> Self {
+        let mut metrics = Self::default();
+        metrics.apply_price(
+            PoolQuoteDirection::BaseToQuote,
+            snapshot.quoted_price(PoolQuoteDirection::BaseToQuote),
+        );
+        metrics.apply_price(
+            PoolQuoteDirection::QuoteToBase,
+            snapshot.quoted_price(PoolQuoteDirection::QuoteToBase),
+        );
+
+        if snapshot.allow_reserve_backfill
+            && (metrics.forward_price.is_none() || metrics.reverse_price.is_none())
+        {
+            metrics.backfill_with_reserves(snapshot.base_post_amount, snapshot.quote_post_amount);
         }
 
-        let base = base_reserve as f64;
-        let quote = quote_reserve as f64;
-        let forward_price = quote / base;
-        let reverse_price = base / quote;
-        Self {
-            forward_price: Some(forward_price),
-            reverse_price: Some(reverse_price),
-            forward_weight: Some(-forward_price.ln()),
-            reverse_weight: Some(-reverse_price.ln()),
+        metrics
+    }
+
+    fn apply_price(&mut self, direction: PoolQuoteDirection, price: Option<f64>) {
+        let Some(value) = price else {
+            return;
+        };
+        if value <= 0.0 || !value.is_finite() {
+            return;
+        }
+        match direction {
+            PoolQuoteDirection::BaseToQuote => {
+                self.forward_price = Some(value);
+                self.forward_weight = Some(-value.ln());
+            }
+            PoolQuoteDirection::QuoteToBase => {
+                self.reverse_price = Some(value);
+                self.reverse_weight = Some(-value.ln());
+            }
+        }
+    }
+
+    fn backfill_with_reserves(&mut self, base_reserve: u128, quote_reserve: u128) {
+        if base_reserve == 0 || quote_reserve == 0 {
+            return;
+        }
+        if self.forward_price.is_none() {
+            let value = quote_reserve as f64 / base_reserve as f64;
+            self.apply_price(PoolQuoteDirection::BaseToQuote, Some(value));
+        }
+        if self.reverse_price.is_none() {
+            let value = base_reserve as f64 / quote_reserve as f64;
+            self.apply_price(PoolQuoteDirection::QuoteToBase, Some(value));
         }
     }
 }
@@ -717,7 +753,7 @@ struct WeightedEdgeCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::PoolUpdateExtensions;
+    use crate::hydration::types::{PoolUpdateExtensions, SnapshotFreshness};
     use std::time::Instant;
 
     fn snapshot(
@@ -749,6 +785,9 @@ mod tests {
             base_post_amount: base_liquidity,
             quote_post_amount: quote_liquidity,
             updated_at: Instant::now(),
+            freshness: SnapshotFreshness::LiveCorecast,
+            allow_reserve_backfill: true,
+            allow_reserve_backfill: true,
             quotes: None,
             extensions: PoolUpdateExtensions::default(),
         }

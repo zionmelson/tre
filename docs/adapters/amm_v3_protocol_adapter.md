@@ -36,7 +36,7 @@ Eviction happens whenever `slot` drift exceeds `config.stale_slot_threshold` or 
 
 ## Pricing Architecture
 
-### Simulation Path (preferred)
+### Simulation Path
 
 1. Clamp request size via `clamp_request_amount` (max `RAYDIUM_V3_INPUT_UTILIZATION_BPS`, currently 40% of the input-side vault).
 2. Determine direction with `classify_swap_direction` (mirrors mint ordering logic from `swap_v2.rs`).
@@ -45,11 +45,7 @@ Eviction happens whenever `slot` drift exceeds `config.stale_slot_threshold` or 
    - Iterates up to 512 steps, same guard as upstream.
    - Applies `liquidity_net` when crossing initialized ticks.
    - Computes `sqrt_price_after` so we can set `QuoteResponse.sqrt_price_limit`.
-5. Return `QuoteOutcome` with `amount_out` + post-trade sqrt price. This is the only path that sets `sqrt_price_limit`.
-
-### Fallback Path (XYK)
-
-If hydration is missing (no tick arrays, liquidity zero, or math fails), we compute `xyk_amount_out` using current vault balances and fee tier. This mirrors Raydium’s pool reserve invariant but ignores ticks, so mark quotes with reduced confidence.
+5. Return `QuoteOutcome` with `amount_out` + post-trade sqrt price. If simulation preconditions are not met (missing hydrations, zero liquidity, etc.) the adapter declines to quote rather than approximating with XYK math.
 
 ### Fees & Limits
 

@@ -265,7 +265,9 @@ async fn pump_pool_stream(
                                     }
                                     let mut snapshot = update.into_snapshot();
                                     adapter_book.enrich_snapshot(&mut snapshot);
-                                    if let Some(quotes) = adapter_book.snapshot_quotes(&snapshot) {
+                                    if let Some(quotes) =
+                                        adapter_book.snapshot_quotes(&mut snapshot)
+                                    {
                                         snapshot.quotes = Some(quotes);
                                     }
                                     pool_store.update(snapshot);
@@ -355,7 +357,7 @@ fn run_pool_maintenance_loop(
             }
             let protocol = state.program_id.clone();
             if let Some(mut refreshed) = refresher.refresh(&state.snapshot) {
-                if let Some(quotes) = adapter_book.snapshot_quotes(&refreshed) {
+                if let Some(quotes) = adapter_book.snapshot_quotes(&mut refreshed) {
                     refreshed.quotes = Some(quotes);
                 }
                 pool_store.update(refreshed);

@@ -52,10 +52,10 @@ Any upstream change across those modules should be mirrored here and in the hydr
 
 1. **Direction resolution** – Compare `QuoteRequest.input_mint` against `token_x_mint` cached in state. This maps directly to the `swap_for_y` boolean used by `Bin::swap` and determines whether we decrement or increment `active_bin_id`.
 2. **Bin discovery** – Start with the `LbPair`’s `bin_array_bitmap` (from CoreCast) to jump to the next non-empty bin. If liquidity is missing or the trade requires bins beyond our cached window, request fresh `BinArray` accounts using the offsets provided by `BinArrayExtension::bin_id_to_bin_array_key`.
-3. **Per-bin execution** – For each bin, call the simulated `Bin::swap` to compute `amount_out`, `fee`, `protocol_fee`, and optional host fee. Respect `max_bin_walk` so we do not traverse unbounded ranges.
+3. **Per-bin execution** – For each bin, call the simulated `Bin::swap` to compute `amount_out`, `fee`, `protocol_fee`, and optional host fee. Respect `max_bin_walk` (default 800 bins) so we do not traverse unbounded ranges; once the walk exhausts that budget we fail the quote instead of degrading accuracy.
 4. **Fees** – Combine `LbPairExtension::get_base_fee()` and `get_variable_fee()` (which depends on `volatility_accumulator`) and apply host-fee overrides when `host_fee_in` is configured. Variable fee clamps must be mirrored from upstream to avoid quoting trades that on-chain would reject via `MAX_FEE_RATE`.
 5. **Guards** – Enforce `max_price_impact_bps` by comparing the execution price after bin walk with the pre-trade price computed via `price_math::get_price_from_id(active_bin_id, bin_step)`. If impact exceeds config, mark status `PriceImpactExceeded`.
-6. **Partial fills & insufficiency** – If the simulator runs out of bins (`next_bin_array_index_with_liquidity_internal` returns empty) before satisfying the request, set `QuoteResponse.status = InsufficientBins` and surface the filled amount. Strategies can downsize or refresh after hydration fetches more arrays.
+6. **Partial fills & insufficiency** – If the simulator runs out of bins (`next_bin_array_index_with_liquidity_internal` returns empty) before satisfying the request, set `QuoteResponse.status = InsufficientBins` and surface the filled amount. Strategies can downsize or refresh after hydration fetches more arrays. XYK fallbacks are no longer allowed; missing bin data now aborts the quote rather than approximating with a constant-product model.
 
 ## Swap Template Generation
 
