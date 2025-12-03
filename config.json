@@ -1,10 +1,10 @@
 {
   "wallets": {
     "auth": {
-      "path": "~/.config/solana/jit.json"
+      "path": "/home/ubuntu/cain/wallets/jito-auth.json"
     },
     "payer": {
-      "path": "~/.config/solana/id.json"
+      "path": "/home/ubuntu/cain/wallets/jito-payer.json"
     }
   },
   "jito": {
