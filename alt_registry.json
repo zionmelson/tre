@@ -1,11 +1,31 @@
 {
-  "generated_unix_ms": 1764759530695,
+  "generated_unix_ms": 1764760101790,
   "entries": [
+    {
+      "pool": "8kvGYkeqDnb21b2BnSb9BMS2gJSfqF91EhpvAtzExCfM",
+      "handle": 49,
+      "version": 0,
+      "status": "Error",
+      "accounts": [
+        "8kvGYkeqDnb21b2BnSb9BMS2gJSfqF91EhpvAtzExCfM",
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        "7mAAQe9yZ47p6pJ75fpMck6BQTEguK4parhSPQ16ckXC",
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "HQ2sofaypCpGqGBn4FQz9S4w67zJdzu9LAmWSAGtgFTj",
+        "HJ3he3Dc2VxRu6nLntJNtV58YQB9jYwjC3UxfVbVP4VH",
+        "2RrppDmoHNSoatRG8t18z71eLoyMnDj1j7uG499bu4Lt",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+      ],
+      "tables": [],
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760091575
+    },
     {
       "pool": "BnztueWcXv93mgW7yJe8WYpnCxpz34nujPhfjQT6SLu1",
       "handle": 21,
-      "version": 26,
-      "status": "Pending",
+      "version": 27,
+      "status": "Error",
       "accounts": [
         "BnztueWcXv93mgW7yJe8WYpnCxpz34nujPhfjQT6SLu1",
         "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
@@ -14,11 +34,11 @@
         "5jhPbB45eN1Yyo7EVT1LKiiqzYqEBKds1JRJwE66rVX1",
         "4cSB2rx17N8u1mvRqw8Pt3MK22oFr5zPdW2u9Y5P9yhi",
         "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-        "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
+        "7PxF52h3kB2kWagGDxQ2fdhDC4xc6PHkwQ21KE4Fabxq"
       ],
       "tables": [],
-      "last_error": null,
-      "last_updated_unix_ms": 1764759527628
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760096764
     },
     {
       "pool": "HnwqvhAnw7e4AavFot8AcUTb181ZuJj5goKMWydRJAm6",
@@ -35,8 +55,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759524697
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760077029
     },
     {
       "pool": "2YCAQMv3PNcFXkDrahjjQ2n4oaVj9fbHtdS1dkXbhEMu",
@@ -55,8 +75,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759529847
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760091584
     },
     {
       "pool": "3Tva4jZreJfvKXDS9UvM3NQ4c7SFTAShMMmuhUmoLfjT",
@@ -75,8 +95,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759521285
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760100174
     },
     {
       "pool": "3sehQcVywWcFJZ1ri3NmJ7MRkrXbViJMRNN5b6kz8Mqn",
@@ -96,13 +116,13 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759525548
+      "last_updated_unix_ms": 1764760078725
     },
     {
       "pool": "6hkZPECgXEBFkQHR746qQSYqujw8dRD38y5NM7xvRHZt",
       "handle": 28,
       "version": 1,
-      "status": "Pending",
+      "status": "Error",
       "accounts": [
         "6hkZPECgXEBFkQHR746qQSYqujw8dRD38y5NM7xvRHZt",
         "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
@@ -115,8 +135,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": null,
-      "last_updated_unix_ms": 1764759525443
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760088160
     },
     {
       "pool": "Ehp5ZXxifoYG2eh3h1izb9QCNmPuLte4SF5s2dEJtQUA",
@@ -135,8 +155,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759511023
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760087317
     },
     {
       "pool": "7KmL38JpNtVhTavwGgymLgerbfHg6z6U12Lmk9hsR55X",
@@ -156,13 +176,13 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759519575
+      "last_updated_unix_ms": 1764760098463
     },
     {
       "pool": "ArxWNdfZjwbfpkf5phwCWSNz7oVhGbkyU94k4PzateYs",
       "handle": 40,
       "version": 1,
-      "status": "Pending",
+      "status": "Error",
       "accounts": [
         "ArxWNdfZjwbfpkf5phwCWSNz7oVhGbkyU94k4PzateYs",
         "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
@@ -174,8 +194,8 @@
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
       ],
       "tables": [],
-      "last_error": null,
-      "last_updated_unix_ms": 1764759520703
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760099301
     },
     {
       "pool": "4gjL21v62YF76EfRG4Q7LjqGHbpM7XPoqbpXJM4bY7Yp",
@@ -194,19 +214,19 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759522147
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760100179
     },
     {
       "pool": "D2ze4v7YYmBPfrDzA3XrFm4rvsmtDqoVJ4twdHS7QB98",
       "handle": 37,
-      "version": 0,
+      "version": 1,
       "status": "Error",
       "accounts": [
         "D2ze4v7YYmBPfrDzA3XrFm4rvsmtDqoVJ4twdHS7QB98",
         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-        "moat5sFf2DwfL53x8WP8vZCMf5jP6W9k37G9Ex32nXH",
+        "BPiunxZKqnVjfyGwxEGDJ8fo2Anc9KZW2w81gpbPRJV3",
         "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
         "EYrd3prs4ypz8HLkDfMNsQhYzQg67DGHuFy5t7RDdjXJ",
         "FbbhHTunfe2fn8wJok5b37kVtjorpuBQCDxBBQf9TvZn",
@@ -215,7 +235,7 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759509317
+      "last_updated_unix_ms": 1764760087288
     },
     {
       "pool": "3ELtf8LZ3nwX16ZbGas4QKt6T4N2N985akkmazsAwJ2o",
@@ -234,8 +254,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759528098
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760081312
     },
     {
       "pool": "GQJuzVMUSPwkuEPjdw1zYcoFQhjVXNvyRSMHBcVLWFpd",
@@ -254,8 +274,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759518708
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760096756
     },
     {
       "pool": "DUD2MbSKujsSRBzFcoQsdeL4Gx5Dccp3cJAffGffcuDy",
@@ -274,8 +294,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759528133
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760093321
     },
     {
       "pool": "FDAd6k4KsmjbJiiaHU759A4gmduzokDFpvJPypyjSxJ5",
@@ -294,8 +314,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759530630
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760084711
     },
     {
       "pool": "EN9mKweVAcnBFwNYqnrYEPXvue4fv5Z5pfg7whTVB4RV",
@@ -315,7 +335,7 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759518690
+      "last_updated_unix_ms": 1764760096735
     },
     {
       "pool": "8X5yDboAEtV1SeoZoG3issAc9zB6qGSe5ZCtJyUz2S5W",
@@ -332,8 +352,8 @@
         "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759514370
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760092426
     },
     {
       "pool": "5hbf9JP8k5zdrZp9pokPypFQoBse5mGCmW6nqodurGcd",
@@ -350,14 +370,14 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759528069
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760095904
     },
     {
       "pool": "Eqv1tJGkLFeH4giGy8vqKxF4NJBHtGR5cGmKG6cpVy4Z",
       "handle": 17,
       "version": 3,
-      "status": "Error",
+      "status": "Creating",
       "accounts": [
         "Eqv1tJGkLFeH4giGy8vqKxF4NJBHtGR5cGmKG6cpVy4Z",
         "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
@@ -370,8 +390,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759522984
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760101780
     },
     {
       "pool": "9iUZnKysZX1w9xo9KziFv7WADs5pFYvkqgpTyze7Cqxo",
@@ -390,8 +410,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759512736
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760089884
     },
     {
       "pool": "3xNGdc58axYtrJ64STQz5TrdQWVtWHLR888iRBbWZnEe",
@@ -410,8 +430,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759530693
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760085585
     },
     {
       "pool": "3fUj4dDSwgpJuzriE32KsgmGGowKNZpnt7T9AD1noZrV",
@@ -430,8 +450,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759528999
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760092438
     },
     {
       "pool": "HfgjZDmexhFVD28Vkb1NbQwWeXP3uDcVTLPjSGHmRHhL",
@@ -451,7 +471,7 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759523849
+      "last_updated_unix_ms": 1764760076972
     },
     {
       "pool": "CHpPTFvpyomKdHSbsPT2sYTbDZ8BqXzpG72A8ZcgRMGU",
@@ -470,8 +490,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759515294
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760094152
     },
     {
       "pool": "EkFKxsBR1vswKrRqf5yYUJf4erFqXLZc42UkE8zy1DwT",
@@ -491,7 +511,7 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759523848
+      "last_updated_unix_ms": 1764760094181
     },
     {
       "pool": "41s3pCUT6hhVyGtnvPBcDJng3b5d8ZJ2g4uzHgDEaPgx",
@@ -510,8 +530,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759516098
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760094155
     },
     {
       "pool": "GW27NDmFXdro5y3XD7FGHcp2KqxdxR5TbjD9zMjLdVus",
@@ -530,7 +550,7 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759520426
+      "last_updated_unix_ms": 1764760098471
     },
     {
       "pool": "2FAaQdbzVN5NJWhqSQsBZhJFivYDMycRTDJBzxmKKAig",
@@ -549,8 +569,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759522139
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760101021
     },
     {
       "pool": "EfooyPcNMWfYR8M7dMRQ3Uo3XPLWaa4C3MCcwb1W5SNt",
@@ -569,8 +589,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759510121
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760085618
     },
     {
       "pool": "rks9tRMy3tBGAgbHMzE93VLWEwKSxEpH9vXbXGVHJiW",
@@ -588,8 +608,8 @@
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759515224
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760093304
     },
     {
       "pool": "GjDp2sUpWxgKjpabLkmUcQBENM8iMs7dpDdB9X99zXsP",
@@ -608,8 +628,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759527281
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760080427
     },
     {
       "pool": "9d9mb8kooFfaD3SctgZtkxQypkshx6ezhbKio89ixyy2",
@@ -628,8 +648,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759527249
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760095012
     },
     {
       "pool": "A6c5Pt1U4m8WNMjnHKUEkCiBn8HoGzkvymD9UT5GVMbD",
@@ -648,8 +668,8 @@
         "BZP7eTQqi4M7XXWci3rVcM3kJsTCHqdpBewLa6aCyZVu"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759520412
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760099319
     },
     {
       "pool": "HGekzxfgpBdJ69c7f3Z5UNJatgQhuj2KXdYwSZqprcN3",
@@ -668,14 +688,14 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759521297
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760100165
     },
     {
       "pool": "HyhMt7jPKJ1LLXQTm5wjf5f4kWqAeTeKQZvMq8TtZnPV",
       "handle": 9,
       "version": 5,
-      "status": "Error",
+      "status": "Creating",
       "accounts": [
         "HyhMt7jPKJ1LLXQTm5wjf5f4kWqAeTeKQZvMq8TtZnPV",
         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
@@ -689,7 +709,7 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759527220
+      "last_updated_unix_ms": 1764760101784
     },
     {
       "pool": "9zFtr5cbmVcrXbse7pPwKmMJ4Jn5h8syqbPZz5ve6gmJ",
@@ -709,33 +729,33 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759522118
+      "last_updated_unix_ms": 1764760101014
     },
     {
       "pool": "3JinM7rCD6YQbB83Zr4a8AHpWhpSrS1N9p3a3VGzfM8x",
       "handle": 42,
-      "version": 0,
+      "version": 1,
       "status": "Error",
       "accounts": [
         "3JinM7rCD6YQbB83Zr4a8AHpWhpSrS1N9p3a3VGzfM8x",
         "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "AE861PyrYJXm2TuxiMc8Ecwo4YYgAHfcYum3GWpSRFe3",
         "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
         "GbCehBccmTYFPNFMEzXjYF14C6DERTAAGQbdRf4PMcrX",
         "EMbbQ9WJEzkNjzPu6KyWzVvA3RuLDZKX6XUmTNiCJTzR",
         "GAXiNy9h6srhvVsr6G39czpoZ18S3GkXYgQbp5bPUctQ",
-        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
-        "6Tz3FFTBMZJP7oHge5xoKmyZjdUVm2G6jjWHZbB4nhjC"
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
       "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759529814
+      "last_updated_unix_ms": 1764760083871
     },
     {
       "pool": "3FyabbwU3C8yL8imXkuABuGHp1QJ8pPhhPVothM2GQAT",
       "handle": 43,
-      "version": 5,
-      "status": "Error",
+      "version": 13,
+      "status": "Creating",
       "accounts": [
         "3FyabbwU3C8yL8imXkuABuGHp1QJ8pPhhPVothM2GQAT",
         "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
@@ -744,11 +764,11 @@
         "G2dSLVyXU2gKb9is5Npgrcma7MKJ7cBWZArqcJWPJLJH",
         "BC9Lknj3UbuwVTsH5SuKLT9gbX7i6ShoMt7cGnmN4ZEw",
         "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-        "He2uhHBU7uE9BiSe2QLRzQd9U3fWwjZY5anmC9k84nzd"
+        "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759526365
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760101769
     },
     {
       "pool": "9ToMYnmEeYKc1AWYAFo8yjPKM1bt3vPhgw1U6qh9RxBd",
@@ -766,7 +786,7 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759526438
+      "last_updated_unix_ms": 1764760099323
     },
     {
       "pool": "3Hsh6oCcQzz5Ga4hHe59aspcPAJkz4bU8uEx2JdjR4j1",
@@ -785,8 +805,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759525513
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760091562
     },
     {
       "pool": "ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq",
@@ -806,7 +826,7 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759528957
+      "last_updated_unix_ms": 1764760083019
     },
     {
       "pool": "46uRcsntuEFD8H6Em2x8iXSJakEsgPz3jLJhCDLndr48",
@@ -825,7 +845,7 @@
       ],
       "tables": [],
       "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759525588
+      "last_updated_unix_ms": 1764760079593
     },
     {
       "pool": "4dkFXCLzpC2uoZmKbQzXATEgK8AehyTMzu25Nn2per84",
@@ -843,8 +863,8 @@
         "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759513513
+      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760090720
     },
     {
       "pool": "Hk25q7zys179Awoyaa15DVT8DmLECwyha1F8Drp3r9Bj",
@@ -863,8 +883,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759529780
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760083846
     },
     {
       "pool": "9Jhn8FhQo1h4XHqrzzb7iJhU1K8xuM81TtppixJscUp1",
@@ -883,8 +903,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759530665
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760085572
     },
     {
       "pool": "FcjjezXg8afwpVWxdVcXALLkqSXAAoGLuWaS6LmtNoZG",
@@ -903,8 +923,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759519566
+      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760098450
     },
     {
       "pool": "BhQEFZCRnWKQ21LEt4DUby7fKynfmLVJcNjfHNqjEF61",
@@ -923,8 +943,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n\nCaused by:\n    0: error sending request for url (https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759526401
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760086438
     },
     {
       "pool": "86RyHcpAF5VJhajsnAkaqBZmU6Bg6FVoTDmhgodfJjra",
@@ -943,8 +963,8 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "tables": [],
-      "last_error": "error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n\nCaused by:\n    0: error sending request for url (https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
-      "last_updated_unix_ms": 1764759522960
+      "last_error": "error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n\nCaused by:\n    0: error sending request for url (https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/)\n    1: client error (Connect)\n    2: received fatal alert: InternalError",
+      "last_updated_unix_ms": 1764760101023
     }
   ]
 }
