@@ -852,7 +852,7 @@ mod whirlpool {
     use super::shared::{lookup_account_string, pubkey_from_bytes, InstructionAccountLookup};
     use super::*;
 
-    pub const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicV1cqQhBYtbJX3Yq9z7Dfc7gXLMGr5vLyN";
+    pub const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
     pub const WHIRLPOOL_INPUT_UTILIZATION_BPS: u64 = 4_000;
     static WHIRLPOOL_PROGRAM_PUBKEY: Lazy<Pubkey> =
         Lazy::new(|| Pubkey::from_str(WHIRLPOOL_PROGRAM_ID).expect("static Whirlpool program id"));

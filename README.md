@@ -11,7 +11,17 @@ This repository currently provides:
 - CPU-affine runtime with lock-free channels + slabs wiring hydrator threads to the fast watcher lane (`runtime.rs`, `core/`, `hydration/`, `planner.rs`)
 - A CoreCast → Hydrator → Watcher pipeline with config management, IDL caching, instruction template hydration, flash-loan planning, and Prometheus-friendly telemetry
 - Bundle lifecycle tracking that streams `SubscribeBundleResults`, taps the state-auction websocket feed, and publishes per-bundle alerts/metrics for accepted, rejected, finalized, or expired bundles
-- Documentation covering hydrator/watcher responsibilities and deployment assumptions (see `docs/hydrator_watcher.md` and `docs/architecture.md`)
+- Documentation covering hydrator/watcher responsibilities and deployment assumptions (see `docs/architecture.md` and `docs/deploy_latitude.md`)
+- An operational CLI with `run` (default) and `resign` subcommands so operators can either launch the executor or refresh archived bundles without spinning up the full runtime
+
+## Runtime Overview
+
+- `src/main.rs` exposes the user-facing CLI. `tre-arb-bot run` (default) spins up the executor, while `tre-arb-bot resign` reloads a logged bundle, fetches a fresh blockhash, and re-signs it with the configured payer.
+- `runtime::ExecutorRuntime` bridges the config, `BuilderHandle`, `HydrationService`, planners, submission lane, and graceful shutdown (`SIGINT` stops every thread via an `AtomicBool`).
+- `hydration/service.rs` owns CoreCast ingestion, the `AdapterBook`, template cache, ALT manager, flash-loan planner, RPC refreshers, and the shared `PoolStore`. It periodically publishes `HydrationSnapshot`s so planners know template/ALT freshness.
+- `planner/` hosts the graph service, CoreCast trade feed, and `FastLanePlanner`. The planner consumes `PoolStateUpdate`s + `HydrationSnapshot`s, calls into `StrategyEngine`, and emits `BundleCandidate` leases via an SPSC ring backed by slab allocators from `core/`.
+- `submission.rs` and `bundle/` house the fast-lane submitter, Jito gRPC client, and `BundleTracker`. Successful sends go through `BundleClient`; lifecycle updates stream from result + auction feeds and are mirrored via `Notifier` + telemetry.
+- Telemetry (`telemetry.rs`) exports Prometheus counters/histograms that cover hydration freshness, graph state, planner queues, submission success, and bundle outcomes. Modes such as `pipeline.hydration_only_mode` and `pipeline.dry_run_mode` gate planner or submitter threads without code changes.
 
 ## Quick Start
 
@@ -33,6 +43,9 @@ cargo build --release --target x86_64-unknown-linux-gnu
 
 # Non-submitting dry run (planner runs, submissions disabled)
 ./scripts/run-bot.sh --dry-run
+
+# Refresh a previously logged bundle payload with a fresh blockhash/signature
+tre-arb-bot resign --config config.json --input bundle.b64 --output refreshed.b64
 
 # Use Docker (requires config volume mounted at /config)
 docker build -t tre-arb-bot .
@@ -60,6 +73,16 @@ Environment variables:
 - `alerts.webhook_url`: optional HTTPS endpoint that receives JSON bundle/arbitrage lifecycle events; pair with `alerts.environment` to tag messages by deployment.
 
 Submission tracking knobs live under the `submission` section of `config.json`. Use the checked-in file as the canonical reference, copy it for each deployment, and swap any sensitive values with `$ENV{VAR}` placeholders so secrets stay outside of version control.
+
+## Bundle Payload Re-Signing
+
+`tre-arb-bot resign` is a maintenance-only subcommand implemented in `src/main.rs`. It:
+
+1. Loads the same `config.json` that powers the runtime so it can locate the payer wallet and QuickNode (or custom) RPC endpoint.
+2. Accepts a base64-encoded `VersionedTransaction` via `--input <path>` or stdin, decodes it, and fetches the latest blockhash (overrideable via `--rpc-url`).
+3. Re-signs the message with the payer keypair referenced in `wallets.payer`, then emits the refreshed payload to `--output <path>` or stdout.
+
+This flow is useful when you want to replay a logged bundle without restarting the executor or when you need to re-tip a payload for manual submission/debugging.
 
 ### Docker & CI
 

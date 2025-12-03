@@ -753,19 +753,19 @@ fn encode_whirlpool_args(
                 let value = parse_u64(arg)?;
                 amount_in = Some(write_u64(buffer, value)?);
             }
-            "otherAmountThreshold" => {
+            "otherAmountThreshold" | "other_amount_threshold" => {
                 let value = parse_u64(arg)?;
                 amount_out = Some(write_u64(buffer, value)?);
             }
-            "sqrtPriceLimit" => {
+            "sqrtPriceLimit" | "sqrt_price_limit" => {
                 let value = parse_u128(arg)?;
                 sqrt_price_limit = Some(write_u128(buffer, value)?);
             }
-            "amountSpecifiedIsInput" => {
+            "amountSpecifiedIsInput" | "amount_specified_is_input" => {
                 let is_input = matches!(template.direction, SwapTemplateDirection::BaseIn);
                 write_bool(buffer, is_input)?;
             }
-            "aToB" => {
+            "aToB" | "a_to_b" => {
                 let literal = parse_bool(arg)?;
                 buffer.push(literal);
             }

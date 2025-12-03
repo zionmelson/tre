@@ -1,106 +1,119 @@
-# Hydrator ↔ Watcher Architecture
+# Executor Runtime Architecture
 
 ## Objectives
 
-- **Freshness first:** Derived price/liquidity, flash routes, templates, and blockhashes all carry timestamps plus TTLs. Anything older than 45 ms at use time is rejected.
-- **Single in-memory path:** Hydrator produces runtime state directly in RAM and streams updates to the watcher; no RocksDB, JSON polling, or stage queues.
-- **Deterministic latency:** CPU-pinned threads, lock-free channels, and slab allocators keep the decode→plan→submit chain well under 50 ms.
-- **Observability-backed safety:** Telemetry surfaces queue saturation, stale pools, planner latency, and submission failures so the bot auto-pauses before leaking bad bundles.
+- **Freshness first:** Pool snapshots, template caches, ALT tables, flash-loan routes, and blockhashes carry TTLs that cap end-to-end latency at ~45 ms. Anything older is rejected before the builder signs a bundle.
+- **Single in-memory path:** CoreCast deltas are decoded once by the hydration service and stay in RAM via `PoolStore`, `SpscRing`, and `SlabPool` structures—no RocksDB, JSON polling, or multi-stage disk queues.
+- **Deterministic latency:** CPU affinity, lock-free channels, and bounded allocators keep `CoreCast → HydrationSnapshot → Planner → Submitter` deterministic even under load.
+- **Observability-backed safety:** Prometheus metrics (`telemetry.rs`) expose queue depth, stale pools, planner backlog, submission latency, bundle outcomes, and tip pressure so automation (or humans) can pause trading quickly.
 
-## System Overview
+## Topology Overview
 
 ```
-              CoreCast Streams / RPC fallbacks
+        CoreCast Streams  +  RPC refreshers
+                      |
+            +-----------------------+
+            | HydrationService      |
+            |  AdapterBook/ALT/etc. |
+            +-----------------------+
+                 |           |
+        PoolStateUpdate   HydrationSnapshot
+                 |           |
+         Arc<PoolStore>     v
+                 |    +----------------+
+                 +--> | FastLanePlanner|
+                      +----------------+
                               |
-                    +---------------------+
-                    | Hydrator Workers    |
-                    |  (per protocol)     |
-                    +---------------------+
+                 Ring<Lease<BundleCandidate>>
                               |
-                 decode + derive PoolState
+                    FastLane Submitter
                               |
-                    +---------------------+
-                    | Runtime Pool Map    |
-                    | Arc<ShardMap<...>>  |
-                    +---------------------+
+                      BundleClient (Jito)
                               |
-                broadcast compact PoolUpdate
-                              |
-                    +---------------------+
-                    | Lock-Free Channel   |
-                    +---------------------+
-                              |
-                    apply updates / TTL check
-                              |
-                    +---------------------+
-                    | Watcher (Planner)   |
-                    | Strategy + Graph    |
-                    +---------------------+
-                              |
-                     Bundle Slab / Tracker
-                              |
-                          Submitter
+                      BundleTracker/Notifier
 ```
 
-- Hydrator owns every external feed (CoreCast, template/ALT refreshers, flash-loan reserves) and is the only writer to the runtime pool map.
-- Watcher subscribes to the broadcast channel, maintains a read-only view, evaluates routes, clamps borrow sizing, and pushes bundles into the tracker.
-- Submission lane signs bundles and fires them down Jito + TPU the moment watcher declares a win.
+`BuilderHandle` (templates, ALT manager, flash-loan planner, blockhash cache, MEV guard) is shared across stages, ensuring that hydration, planning, and submission agree on accounts, ALTs, and signer state.
 
-## Detailed Flow
+## Stage Responsibilities
 
-1. **Bootstrap** – Load `config.json`, wallets, IDLs, and the JSON ALT registry (templates only). Start CoreCast streams + RPC fallbacks, allocate pool map shards, and create the bounded MPMC channel.
-2. **Hydrator ingest** – Each adapter worker decodes CoreCast deltas (or fallback RPC responses) into `PoolState { slot, ts, mid_price, bid_depth, ask_depth, fee_bps, volatility_flag }`. The pool map is updated in-place; a `PoolUpdate` struct is enqueued.
-3. **Watcher refresh** – A lightweight thread drains the channel, refreshes its local view, drops stale entries, and wakes the planner when liquidity changed for any subscribed route.
-4. **Strategy execution** – `planner.rs` pulls pool snapshots, applies borrow caps (`borrow_pct` per protocol), runs GraphManager/StrategyEngine, and, when profitable, allocates bundle handles inside the slab before hydrating instruction templates.
-5. **Submission** – Bundle bytes are signed and submitted to both Jito gRPC and TPU fanout. Tip policy + BAM gating live entirely in the submission lane.
-6. **Feedback** – Bundle tracker streams `SubscribeBundleResults` and state-auction websockets to mark accepted/rejected bundles. Telemetry and alerts reflect queue health, stale pools, planner latency, and submission outcomes.
+### 1. Hydration ingress & resource managers (`src/hydration/service.rs`)
 
-## Component Responsibilities
+- Builds a single `HydrationService` around a shared `BuilderHandle`. It owns the `AdapterBook`, template cache, ALT manager, flash-loan planner, and the `PoolStore` (runtime map of hydrated pools subject to freshness/size policies from `config.watcher`).
+- `spawn_adapter_ingest` opens the credentialed `CoreCastClient`, consumes pool deltas, enriches them with adapter-specific metadata, and applies them to `PoolStore`. An allowlist derived from `AppConfig::token_pair_allowlist` limits ingestion to configured mint pairs.
+- `spawn_snapshot_worker` publishes lightweight `HydrationSnapshot`s onto an SPSC ring every ~25 ms. Each snapshot advertises template counts, ALT freshness, and flash-route readiness so the planner can skip pools that are warming up.
+- `spawn_pool_maintenance` coordinates RPC refresh via `RpcRefresher` when CoreCast stalls, and `pool_store.collect_stale` ensures old entries are either refreshed or marked stale for the planner.
+- `pool_store.subscribe` fans updates out to graph builders, planners, and metrics threads. Thread shutdown is coordinated through a shared `AtomicBool` stop flag owned by the runtime.
 
-- **`hydration/`** – CoreCast clients, adapter decoders, template cache, flash-loan + ALT managers, runtime pool map, broadcast queue, stale-pool scanners, and hydration telemetry.
-- **`planner.rs` (Watcher)** – Subscribes to hydrator updates, manages the read-only pool view, enforces borrow config, runs StrategyEngine/GraphManager, and produces bundle candidates.
-- **`submission.rs` / `bundle.rs`** – Sign bundles, push to Jito + TPU, manage retries, consume bundle-result streams, and expose send telemetry.
-- **`config.rs`** – Validates hydrator queue sizes, borrow percentages, endpoint lists, BAM validator CSV path, and telemetry toggles.
-- **`core/`** – Lock-free slabs, rings, and affinity helpers shared by hydrator + watcher.
-- **`telemetry.rs`** – Registers gauges + histograms (`hydration_adapter_ingest_total`, `hydrator_queue_depth`, `hydration_stale_pool_total`, `watcher_update_age_ms`, `watcher_strategy_latency_ms`, `bundle_execution_retry_events_total`, etc.).
+### 2. Graph + fast-lane planner (`src/planner/`)
+
+- `spawn_graph_service` consumes `PoolStateUpdate`s directly from `PoolStore`, maintains graph state inside `GraphManager`, and surfaces arbitrage cycles (`ArbitrageOpportunity`).
+- `spawn_fast_lane_trade_feed` opens a second CoreCast trade stream dedicated to the fast lane. Trades are filtered through the token-pair allowlist and queued via a bounded `crossbeam` channel.
+- `FastLanePlanner` merges three inputs: pool updates, hydration snapshots, and trade updates. It waits for `PoolStore::wait_until_ready` and then loops, producing `Opportunity` structs that feed `StrategyEngine::evaluate`.
+- `StrategyEngine` enforces `strategy.*` overrides (min edge, hop count, profit/tip floors, duplicate suppression, protocol borrow limits) and returns `BundleCandidate`s once routes are profitable and fresh. Candidates carry `BundleBuildContext` handles so the submitter can sign without rehydrating templates.
+- `Notifier` mirrors arbitrage cycles, candidate creation, and submission state to logs/webhooks. Alerts are tagged via `alerts.environment` for downstream dashboards.
+
+### 3. Submission & tracking (`src/submission.rs`, `src/bundle/`)
+
+- `submission::spawn_fast_lane_submitter` consumes `Lease<BundleCandidate>` entries from the ring. Each lease tracks creation timestamps and optional flash-loan reservations so the builder can release them on errors.
+- `BuilderHandle::sign_bundle` swaps in a fresh blockhash (from the cached RPC client) before handing the transaction to `BundleClient`.
+- `BundleClient` multiplexes across the configured Jito block-engine endpoints, handles auth token refresh, and applies endpoint-specific exponential backoff. Successful sends result in `BundleSubmitResult { endpoint, bundle_id }` objects that feed telemetry + tracking.
+- `BundleTracker` listens to `SubscribeBundleResults`, optional auction streams, and a REST poller so it can mark bundles `Submitted/Accepted/Rejected/Expired`. Every state change is emitted through `Notifier` and recorded for `tip_pressure` heuristics.
+- `pipeline.dry_run_mode` routes planner output to a drain thread instead of the submitter. `pipeline.hydration_only_mode` drains snapshots immediately after hydration, skipping graph/planner entirely.
+
+### 4. Support services
+
+- **Builder (`src/builder/`)** – Seeds static templates from the IDL set, lazily registers pool-specific templates, owns the ALT manager (`alt_registry.json` by default), manages the flash-loan planner, blockhash cache, token ATA map, and MEV guard heuristics.
+- **Strategy + tips (`src/strategy.rs`, `src/tip_pressure.rs`)** – Combine config-driven borrow limits with tip floors fetched from the Jito REST API. Wallet-level caps are optional via `strategy.wallet_tip_cap_bps`, and congestion heuristics track Stage3 latency.
+- **Config (`src/config.rs`)** – Loads JSON, resolves `$ENV{VAR}` placeholders, populates derived sets (token pairs, ATAs, host-fee accounts, protocol defaults), and validates queue/buffer sizing before runtime startup.
+- **Telemetry & notifier (`src/telemetry.rs`, `src/notifier.rs`)** – Spin up the Prometheus HTTP server (if `PROMETHEUS_METRICS_ADDR` is set) and multiplex structured events to logs plus optional webhooks.
 
 ## Data Contracts
 
-- **PoolState** – Canonical runtime struct containing slot, monotonic timestamp, current price/liquidity summary, adapter id, and health flags.
-- **PoolUpdate** – Compact struct sent over the channel: `{ pool_id, slot, mid_price, bid_depth, ask_depth, health_flags, gen }`.
-- **Borrow config** – `config.json` exposes `protocols.*.borrow_pct` (default 0.35) so StrategyEngine can clamp trade size deterministically.
-- **Protocol RPC endpoints** – Each entry in `protocols.<name>.rpc_endpoints` must list the Solana RPC URLs the hydrator can use for one-off refreshes when CoreCast stalls. Provide at least two prioritized endpoints per supported protocol (Raydium, cp_amm, lb_clmm, Whirlpool) so the refresher can fetch vault balances and mark snapshots `RpcRefresh` instead of `Stale`. The template exposes env vars such as `$ENV{TRE_RPC_RAYDIUM_PRIMARY}` to keep credentials out of source; production configs should populate concrete HTTPS URLs.
-- **Freshness** – `PoolState` and template/flash artifacts track `last_update_ms`; watcher refuses to trade if `now - last_update_ms > hydrator.max_staleness_ms` or if hydrator flagged the pool as stale.
+- **`PoolState` / `PoolStateUpdate`** – Represent hydrated protocol state: slot, `Instant` timestamps, base/quote liquidity summaries, protocol identifiers, freshness flags, and a monotonically increasing generation counter.
+- **`HydrationSnapshot`** – Cheap `Copy` struct delivered via SPSC ring that includes template counts, ALT manager stats, and flash-route readiness plus the `issued_at` timestamp. Callers compare `Instant::now()` against `snapshot.stale_at(freshness_budget)` to guard planners.
+- **`TemplateReadiness`** – Returned by `BuilderHandle::template_readiness(pool, direction)` and combines template TTL + ALT TTL so route planning can skip pools missing a hydrated template/ALT table.
+- **`BundleCandidate`** – Planner output containing `BundleBuildContext`, route metadata, estimated edge/profit/tip, flash-loan reservations, and detection timestamps. Candidates always live inside a `Lease` from `SlabPool` so memory stays deterministic.
+- **`PendingSubmission`** – Tracker input with `bundle_id`, `seq`, endpoint, detection time, and optional tips. Tracker augments it with result streams and emits `BundleSubmissionEvent`s (submitted, accepted, rejected, expired, etc.).
+
+## Operating Modes & Failure Handling
+
+- `pipeline.hydration_only_mode` – Spins up hydration/graph threads but drains both snapshots and planner outputs immediately. Useful for soak-testing CoreCast or RPC refreshers.
+- `pipeline.dry_run_mode` – Keeps planner/graph online but routes bundle candidates to a drain thread while recording planner metrics. Submission, tracker, and bundle client threads are skipped.
+- Backpressure is surfaced via metrics and logs: `hydration_queue_depth_pct`, `watcher_pool_update_backlog_pct`, `fastlane_ring_depth_pct`, and `fastlane_ring_drop_events_total` all spike before candidates are dropped.
+- Template/ALT freshness is enforced via TTLs (`TemplateCache` ~40 ms, ALT tables ~40 ms). Pools that fall behind are either refreshed via RPC or flagged stale, preventing planners from emitting bundles they cannot safely build.
 
 ## Telemetry & Alerting
 
-- **Hydrator ingest** – `hydration_adapter_ingest_total{adapter}`, `hydrator_decode_latency_ms`, and `hydrator_queue_depth` highlight CoreCast speed + backlog.
-- **Pool freshness** – `hydration_stale_pool_total{adapter}` counts pools that exceeded `max_staleness_ms`. Alert when non-zero for >1 minute.
-- **Watcher health** – `watcher_update_age_ms` (per adapter/protocol) and `watcher_strategy_latency_ms` expose freshness + compute time. Page if p99 update age > 45 ms.
-- **Submission** – `bundle_execution_retry_events_total{reason="sign|submit|context"}` and `bundle_execution_latency_ms` track signing/send loops.
-- **Sample alert:**
+- **Hydration** – `hydration_adapter_ingest_total{protocol}`, `hydration_rpc_refresh_total`, `hydration_stale_pool_events_total`, `hydration_template_cache_entries`, `hydration_alt_ready_tables`, and queue gauges measure ingest health plus template readiness.
+- **Planner/graph** – `graph_pool_count`, `graph_cycle_count`, `watcher_update_age_ms{adapter}`, `watcher_cache_entries`, and `watcher_cycle_scan_pending` indicate whether CoreCast deltas are being consumed quickly enough.
+- **Fast lane buffers** – `fastlane_ring_depth_pct`, `fastlane_ring_drop_events_total`, `fastlane_slab_free_pct`, and `fastlane_slab_exhaustion_events_total` highlight saturation inside the bundle ring/slab.
+- **Submission + tracking** – `bundle_execution_latency_ms`, `bundle_execution_attempts_total{status}`, `bundle_result_events_total{status}`, `bundle_execution_retry_events_total{reason}`, and `bundle_result_latency_ms` capture send performance and downstream outcomes.
+- **Tip heuristics** – `bundle_execution_tip_lamports`, `bundle_execution_tip_multiplier_milli`, and `tip_pressure`-derived gauges (exported via telemetry) show how congestion controls are behaving.
+- Example PromQL alert:
+
   ```yaml
-  - alert: WatcherStalePools
-    expr: quantile_over_time(0.99, watcher_update_age_ms[1m]) > 0.045
-    for: 2m
+  - alert: FastLaneBacklog
+    expr: fastlane_ring_depth_pct > 80
+    for: 30s
     labels:
-      severity: critical
+      severity: warning
       service: tre-arb-bot
     annotations:
-      summary: Watcher is trading on stale data
-      description: "{{ $labels.environment }} watcher update age p99 >45ms for {{ $value }}s. Hydrator queue depth: {{ $labels.queue_depth }}."
+      summary: Fast lane backlog is growing
+      description: "Ring occupancy is {{ $value }}% which will drop bundle throughput; inspect watcher_update_age_ms and hydration_queue_depth_pct."
   ```
 
 ## Deployment & Testing
 
-1. **Unit tests** – Cover adapter decode paths with fixture accounts and verify borrow clamping math.
-2. **Integration tests** – Simulate CoreCast deltas → hydrator queue → watcher to confirm update age + borrow sizing behavior.
-3. **Dry runs** – Execute `scripts/run-bot.sh` with submissions disabled; inspect metrics to ensure hydrator queue depth <50%, watcher update age <30 ms, submission retries zero.
-4. **Live trading** – Enable submissions once telemetry is green; keep Grafana panels for hydrator queue depth, watcher update age, and bundle results on the same dashboard.
+1. **Unit tests** – Focus on adapter decode paths, template cache hydration, borrow-cap math, and strategy tip calculations.
+2. **Integration tests** – Replay recorded CoreCast deltas through `PoolStore`, ensure the planner emits expected opportunities, and validate `StrategyEngine` rejects stale or duplicate trades.
+3. **Dry runs** – Start the binary with `pipeline.dry_run_mode=true` (or `./scripts/run-bot.sh --dry-run`); confirm planner metrics stay below thresholds while submission threads remain idle.
+4. **Live trading** – Flip both pipeline flags off only when `hydration_queue_depth_pct < 50`, `watcher_update_age_ms p99 < 30 ms`, and `bundle_execution_retry_events_total` is flat. Keep Grafana dashboards for hydration/planner/submission on one page for quick triage.
 
 ## Future Work
 
-- Add secondary broadcast consumers (e.g., analytics or shadow planners) without impacting hydrator latency.
-- Experiment with shared-memory snapshots (mmap) for cross-process watchers if we ever split the binary.
-- Layer adaptive borrow sizing on top of the global `borrow_pct` using volatility heuristics when we need finer control.
-- Extend telemetry with per-route win/loss tracking to feed dynamic tipping policies.
+- Add secondary consumers to the `PoolStore` broadcast channel (analytics, shadow planners) with backpressure isolation.
+- Investigate shared-memory snapshots or QUIC feeds if multiple watcher binaries run on the same host.
+- Layer adaptive borrow sizing (volatility-aware) over the current per-protocol `borrow_pct` defaults.
+- Extend telemetry with per-route win/loss tracking and surface `tip_pressure` state through a dedicated API for downstream automation.

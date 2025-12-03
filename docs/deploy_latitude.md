@@ -158,11 +158,11 @@ sudo systemctl start tre-arb-bot.service
 
 ## 8. Troubleshooting checklist
 
-| Symptom                                | Action                                                                                                                          |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `bundle contains an expired blockhash` | Confirm Stage3 logs show rate-limited retries; ensure the server clock is in sync (`sudo systemctl restart systemd-timesyncd`). |
-| `ResourceExhausted` spikes             | Verify multiple `TRE_JITO_ENDPOINT_*` values and that firewall rules allow outbound to both regions.                            |
-| Empty metrics endpoint                 | Confirm `PROMETHEUS_METRICS_ADDR` is set and port 9898 is allowed in Latitude firewall (Project → Security → Firewalls).        |
-| Container exits immediately            | Run `docker logs tre-arb-bot` and make sure every `$ENV{VAR}` from `config.json` exists in `/etc/tre-arb-bot/tre.env`.          |
+| Symptom                                | Action                                                                                                                   |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `bundle contains an expired blockhash` | Confirm logs show rate-limited retries; ensure the server clock is in sync (`sudo systemctl restart systemd-timesyncd`). |
+| `ResourceExhausted` spikes             | Verify multiple `TRE_JITO_ENDPOINT_*` values and that firewall rules allow outbound to both regions.                     |
+| Empty metrics endpoint                 | Confirm `PROMETHEUS_METRICS_ADDR` is set and port 9898 is allowed in Latitude firewall (Project → Security → Firewalls). |
+| Container exits immediately            | Run `docker logs tre-arb-bot` and make sure every `$ENV{VAR}` from `config.json` exists in `/etc/tre-arb-bot/tre.env`.   |
 
 Following the above steps keeps secrets out of the repo, ensures reproducible Docker builds, and matches the deployment profile described in `README.md`.

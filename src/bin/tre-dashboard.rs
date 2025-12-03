@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -97,6 +98,7 @@ impl ProtocolBucket {
 enum DashboardPage {
     Metrics,
     Pools,
+    Tokens,
 }
 
 impl DashboardPage {
@@ -104,13 +106,76 @@ impl DashboardPage {
         match self {
             DashboardPage::Metrics => "Metrics",
             DashboardPage::Pools => "Pools",
+            DashboardPage::Tokens => "Tokens",
         }
     }
 
-    fn toggle(&self) -> Self {
+    fn next(self) -> Self {
         match self {
             DashboardPage::Metrics => DashboardPage::Pools,
+            DashboardPage::Pools => DashboardPage::Tokens,
+            DashboardPage::Tokens => DashboardPage::Metrics,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            DashboardPage::Metrics => DashboardPage::Tokens,
             DashboardPage::Pools => DashboardPage::Metrics,
+            DashboardPage::Tokens => DashboardPage::Pools,
+        }
+    }
+}
+
+impl Default for DashboardPage {
+    fn default() -> Self {
+        DashboardPage::Metrics
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct UiState {
+    page: DashboardPage,
+    pools_scroll: usize,
+    tokens_scroll: usize,
+}
+
+impl UiState {
+    fn set_page(&mut self, page: DashboardPage) {
+        if self.page != page {
+            self.page = page;
+        }
+    }
+
+    fn cycle_next(&mut self) {
+        self.page = self.page.next();
+    }
+
+    fn cycle_prev(&mut self) {
+        self.page = self.page.prev();
+    }
+
+    fn scroll_up(&mut self) {
+        match self.page {
+            DashboardPage::Pools => {
+                self.pools_scroll = self.pools_scroll.saturating_sub(1);
+            }
+            DashboardPage::Tokens => {
+                self.tokens_scroll = self.tokens_scroll.saturating_sub(1);
+            }
+            DashboardPage::Metrics => {}
+        }
+    }
+
+    fn scroll_down(&mut self) {
+        match self.page {
+            DashboardPage::Pools => {
+                self.pools_scroll = self.pools_scroll.saturating_add(1);
+            }
+            DashboardPage::Tokens => {
+                self.tokens_scroll = self.tokens_scroll.saturating_add(1);
+            }
+            DashboardPage::Metrics => {}
         }
     }
 }
@@ -337,17 +402,21 @@ fn run_tui(rx: watch::Receiver<DashboardState>, resolver: Arc<SymbolResolver>) -
     terminal.clear()?;
 
     let tick_rate = Duration::from_millis(200);
-    let mut page = DashboardPage::Metrics;
+    let mut ui_state = UiState::default();
     loop {
         let state = rx.borrow().clone();
-        terminal.draw(|f| draw_ui(f, &state, page, resolver.as_ref()))?;
+        terminal.draw(|f| draw_ui(f, &state, resolver.as_ref(), &ui_state))?;
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('1') => page = DashboardPage::Metrics,
-                    KeyCode::Char('2') => page = DashboardPage::Pools,
-                    KeyCode::Tab | KeyCode::BackTab => page = page.toggle(),
+                    KeyCode::Char('1') => ui_state.set_page(DashboardPage::Metrics),
+                    KeyCode::Char('2') => ui_state.set_page(DashboardPage::Pools),
+                    KeyCode::Char('3') => ui_state.set_page(DashboardPage::Tokens),
+                    KeyCode::Tab => ui_state.cycle_next(),
+                    KeyCode::BackTab => ui_state.cycle_prev(),
+                    KeyCode::Up | KeyCode::Char('k') => ui_state.scroll_up(),
+                    KeyCode::Down | KeyCode::Char('j') => ui_state.scroll_down(),
                     _ => {}
                 }
             }
@@ -373,9 +442,22 @@ struct PoolRow {
     base_mint: String,
     quote_mint: String,
     slot: u64,
-    price: f64,
+    price: Option<f64>,
     base_liquidity: f64,
     quote_liquidity: f64,
+    hydrated: bool,
+}
+
+#[derive(Clone)]
+struct TokenRow {
+    pair_label: String,
+    protocol: String,
+    pool: String,
+    slot: u64,
+    price: Option<f64>,
+    base_liquidity: f64,
+    quote_liquidity: f64,
+    hydrated: bool,
 }
 
 #[derive(Default)]
@@ -465,20 +547,28 @@ fn parse_pool_rows(
     pool_base_liquidity: HashMap<PoolKey, f64>,
     pool_quote_liquidity: HashMap<PoolKey, f64>,
 ) -> Vec<PoolRow> {
-    let mut rows = Vec::with_capacity(pool_prices.len());
-    for (key, price_scaled) in pool_prices {
+    let mut keys: HashSet<PoolKey> = HashSet::new();
+    keys.extend(pool_prices.keys().cloned());
+    keys.extend(pool_slots.keys().cloned());
+    keys.extend(pool_base_liquidity.keys().cloned());
+    keys.extend(pool_quote_liquidity.keys().cloned());
+
+    let mut rows = Vec::with_capacity(keys.len());
+    for key in keys {
         let slot = pool_slots.get(&key).copied().unwrap_or_default();
         let base_liquidity = pool_base_liquidity.get(&key).copied().unwrap_or_default();
         let quote_liquidity = pool_quote_liquidity.get(&key).copied().unwrap_or_default();
+        let price = pool_prices.get(&key).map(|value| value / POOL_PRICE_SCALE);
         rows.push(PoolRow {
             program_id: key.program,
             pool: key.pool,
             base_mint: key.base_mint,
             quote_mint: key.quote_mint,
             slot,
-            price: price_scaled / POOL_PRICE_SCALE,
+            price,
             base_liquidity,
             quote_liquidity,
+            hydrated: price.is_some(),
         });
     }
     rows.sort_by_key(|row| Reverse(row.slot));
@@ -542,16 +632,21 @@ fn sort_metric_rows(rows: &mut Vec<MetricRow>) {
         rows.truncate(MAX_METRIC_ROWS);
     }
 }
-fn draw_ui(f: &mut Frame, state: &DashboardState, page: DashboardPage, resolver: &SymbolResolver) {
+fn draw_ui(f: &mut Frame, state: &DashboardState, resolver: &SymbolResolver, ui_state: &UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
         .split(f.size());
-    draw_tabs(f, chunks[0], page);
+    draw_tabs(f, chunks[0], ui_state.page);
 
-    match page {
+    match ui_state.page {
         DashboardPage::Metrics => draw_metrics_page(f, chunks[1], state),
-        DashboardPage::Pools => draw_pools_page(f, chunks[1], state, resolver),
+        DashboardPage::Pools => {
+            draw_pools_page(f, chunks[1], state, resolver, ui_state.pools_scroll)
+        }
+        DashboardPage::Tokens => {
+            draw_tokens_page(f, chunks[1], state, resolver, ui_state.tokens_scroll)
+        }
     }
 }
 
@@ -582,7 +677,13 @@ fn draw_metrics_page(f: &mut Frame, area: Rect, state: &DashboardState) {
     render_metric_group(f, columns[1], "Watcher metrics", &state.watcher_metrics);
 }
 
-fn draw_pools_page(f: &mut Frame, area: Rect, state: &DashboardState, resolver: &SymbolResolver) {
+fn draw_pools_page(
+    f: &mut Frame,
+    area: Rect,
+    state: &DashboardState,
+    resolver: &SymbolResolver,
+    scroll_offset: usize,
+) {
     let block = Block::default()
         .title("Pools by protocol (from Prometheus)")
         .borders(Borders::ALL);
@@ -619,16 +720,139 @@ fn draw_pools_page(f: &mut Frame, area: Rect, state: &DashboardState, resolver: 
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)].as_ref())
         .split(chunks[1]);
 
-    render_protocol_tables(f, top_chunks[0], ProtocolBucket::RaydiumV3, state, resolver);
-    render_protocol_tables(f, top_chunks[1], ProtocolBucket::CpAmm, state, resolver);
-    render_protocol_tables(f, bottom_chunks[0], ProtocolBucket::LbClmm, state, resolver);
+    render_protocol_tables(
+        f,
+        top_chunks[0],
+        ProtocolBucket::RaydiumV3,
+        state,
+        resolver,
+        scroll_offset,
+    );
+    render_protocol_tables(
+        f,
+        top_chunks[1],
+        ProtocolBucket::CpAmm,
+        state,
+        resolver,
+        scroll_offset,
+    );
+    render_protocol_tables(
+        f,
+        bottom_chunks[0],
+        ProtocolBucket::LbClmm,
+        state,
+        resolver,
+        scroll_offset,
+    );
     render_protocol_tables(
         f,
         bottom_chunks[1],
         ProtocolBucket::Whirlpool,
         state,
         resolver,
+        scroll_offset,
     );
+}
+
+fn draw_tokens_page(
+    f: &mut Frame,
+    area: Rect,
+    state: &DashboardState,
+    resolver: &SymbolResolver,
+    scroll_offset: usize,
+) {
+    let block = Block::default()
+        .title("Token pairs (from Prometheus)")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(error) = &state.last_error {
+        let paragraph = Paragraph::new(error.clone())
+            .style(Style::default().fg(Color::Red))
+            .block(Block::default().borders(Borders::NONE));
+        f.render_widget(paragraph, inner);
+        return;
+    }
+
+    if state.pools.is_empty() {
+        let paragraph = Paragraph::new("No pairs observed yet.")
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::NONE));
+        f.render_widget(paragraph, inner);
+        return;
+    }
+
+    let mut rows: Vec<TokenRow> = state
+        .pools
+        .iter()
+        .map(|pool| TokenRow {
+            pair_label: resolver.pair_label(&pool.base_mint, &pool.quote_mint),
+            protocol: protocol_label(&pool.program_id),
+            pool: pool.pool.clone(),
+            slot: pool.slot,
+            price: pool.price,
+            base_liquidity: pool.base_liquidity,
+            quote_liquidity: pool.quote_liquidity,
+            hydrated: pool.hydrated,
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        a.pair_label
+            .cmp(&b.pair_label)
+            .then(b.slot.cmp(&a.slot))
+            .then(a.protocol.cmp(&b.protocol))
+    });
+
+    let header = Row::new(vec![
+        Cell::from("Status"),
+        Cell::from("Pair"),
+        Cell::from("Protocol"),
+        Cell::from("Pool"),
+        Cell::from("Slot"),
+        Cell::from("Price"),
+        Cell::from("Base Liquidity"),
+        Cell::from("Quote Liquidity"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let visible_rows = visible_row_capacity(inner.height).max(1);
+    let start = clamp_scroll(scroll_offset, rows.len(), visible_rows);
+    let take = visible_rows;
+
+    let data_rows = rows.into_iter().skip(start).take(take).map(|row| {
+        let (status, fg_color) = hydration_style(row.hydrated);
+        let row_style = pair_row_style(&row.pair_label, fg_color);
+        Row::new(vec![
+            Cell::from(status.to_string()),
+            Cell::from(row.pair_label),
+            Cell::from(row.protocol),
+            Cell::from(truncate_pubkey(&row.pool)),
+            Cell::from(row.slot.to_string()),
+            Cell::from(format_optional_price(row.price)),
+            Cell::from(format_number(row.base_liquidity)),
+            Cell::from(format_number(row.quote_liquidity)),
+        ])
+        .style(row_style)
+    });
+
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(16),
+        Constraint::Length(14),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(14),
+        Constraint::Length(16),
+        Constraint::Min(10),
+    ];
+
+    let table = Table::new(data_rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::NONE))
+        .column_spacing(1);
+    f.render_widget(table, inner);
 }
 
 fn render_protocol_tables(
@@ -637,6 +861,7 @@ fn render_protocol_tables(
     bucket: ProtocolBucket,
     state: &DashboardState,
     resolver: &SymbolResolver,
+    scroll_offset: usize,
 ) {
     let rows: Vec<PoolRow> = state
         .pools
@@ -657,7 +882,7 @@ fn render_protocol_tables(
         return;
     }
 
-    let table = render_pool_table(rows, resolver);
+    let table = render_pool_table(rows, resolver, scroll_offset, inner.height);
     f.render_widget(table, inner);
 }
 
@@ -702,8 +927,14 @@ fn render_metric_group(f: &mut Frame, area: Rect, title: &str, metrics: &[Metric
     f.render_widget(table, inner);
 }
 
-fn render_pool_table(rows: Vec<PoolRow>, resolver: &SymbolResolver) -> Table<'static> {
+fn render_pool_table(
+    rows: Vec<PoolRow>,
+    resolver: &SymbolResolver,
+    scroll_offset: usize,
+    area_height: u16,
+) -> Table<'static> {
     let header = Row::new(vec![
+        Cell::from("Status"),
         Cell::from("Pool"),
         Cell::from("Pair"),
         Cell::from("Slot"),
@@ -713,19 +944,27 @@ fn render_pool_table(rows: Vec<PoolRow>, resolver: &SymbolResolver) -> Table<'st
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let data_rows = rows.into_iter().map(|row| {
+    let visible_rows = visible_row_capacity(area_height).max(1);
+    let start = clamp_scroll(scroll_offset, rows.len(), visible_rows);
+    let take = visible_rows;
+
+    let data_rows = rows.into_iter().skip(start).take(take).map(|row| {
         let pair = resolver.pair_label(&row.base_mint, &row.quote_mint);
+        let (status, fg_color) = hydration_style(row.hydrated);
         Row::new(vec![
+            Cell::from(status.to_string()),
             Cell::from(truncate_pubkey(&row.pool)),
             Cell::from(pair),
             Cell::from(row.slot.to_string()),
-            Cell::from(format!("{:.6}", row.price)),
+            Cell::from(format_optional_price(row.price)),
             Cell::from(format_number(row.base_liquidity)),
             Cell::from(format_number(row.quote_liquidity)),
         ])
+        .style(Style::default().fg(fg_color))
     });
 
     let widths = [
+        Constraint::Length(10),
         Constraint::Length(12),
         Constraint::Length(16),
         Constraint::Length(12),
@@ -741,19 +980,23 @@ fn render_pool_table(rows: Vec<PoolRow>, resolver: &SymbolResolver) -> Table<'st
 }
 
 fn draw_tabs(f: &mut Frame, area: Rect, page: DashboardPage) {
-    let titles: Vec<Line> = [DashboardPage::Metrics, DashboardPage::Pools]
-        .iter()
-        .map(|tab| {
-            let style = if *tab == page {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            Line::from(Span::styled(tab.label(), style))
-        })
-        .collect();
+    let titles: Vec<Line> = [
+        DashboardPage::Metrics,
+        DashboardPage::Pools,
+        DashboardPage::Tokens,
+    ]
+    .iter()
+    .map(|tab| {
+        let style = if *tab == page {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Line::from(Span::styled(tab.label(), style))
+    })
+    .collect();
 
     let block = Block::default()
         .title("tre-dashboard")
@@ -764,10 +1007,29 @@ fn draw_tabs(f: &mut Frame, area: Rect, page: DashboardPage) {
         .select(match page {
             DashboardPage::Metrics => 0,
             DashboardPage::Pools => 1,
+            DashboardPage::Tokens => 2,
         })
         .block(block);
 
     f.render_widget(tabs, area);
+}
+
+fn protocol_label(program_id: &str) -> String {
+    ProtocolBucket::from_program(program_id)
+        .map(|bucket| bucket.title().to_string())
+        .unwrap_or_else(|| truncate_pubkey(program_id))
+}
+
+fn visible_row_capacity(area_height: u16) -> usize {
+    area_height.saturating_sub(2) as usize
+}
+
+fn clamp_scroll(offset: usize, total_rows: usize, capacity: usize) -> usize {
+    if capacity == 0 || total_rows <= capacity {
+        0
+    } else {
+        offset.min(total_rows - capacity)
+    }
 }
 
 fn format_number(value: f64) -> String {
@@ -790,6 +1052,42 @@ fn format_metric_value(value: f64) -> String {
     } else {
         format!("{value:.3}")
     }
+}
+
+fn format_optional_price(value: Option<f64>) -> String {
+    match value {
+        Some(price) => format!("{price:.6}"),
+        None => "-".to_string(),
+    }
+}
+
+fn hydration_style(hydrated: bool) -> (&'static str, Color) {
+    if hydrated {
+        ("💦 hydrated", Color::Cyan)
+    } else {
+        ("🔴 warming", Color::Red)
+    }
+}
+
+fn pair_row_style(pair_label: &str, fg_color: Color) -> Style {
+    Style::default()
+        .fg(fg_color)
+        .bg(pair_band_color(pair_label))
+}
+
+fn pair_band_color(pair_label: &str) -> Color {
+    const PALETTE: [Color; 6] = [
+        Color::Rgb(255, 255, 255),
+        Color::Rgb(240, 255, 240),
+        Color::Rgb(222, 245, 222),
+        Color::Rgb(255, 248, 235),
+        Color::Rgb(238, 228, 210),
+        Color::Rgb(222, 210, 190),
+    ];
+    let mut hasher = DefaultHasher::new();
+    pair_label.hash(&mut hasher);
+    let idx = (hasher.finish() as usize) % PALETTE.len();
+    PALETTE[idx]
 }
 
 fn truncate_pubkey(key: &str) -> String {
