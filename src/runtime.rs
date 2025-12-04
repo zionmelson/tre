@@ -57,7 +57,8 @@ impl ExecutorRuntime {
         let queue_capacity = config.watcher.queue_capacity.max(1);
         let graph_updates = pool_store.subscribe(queue_capacity);
         let planner_updates = pool_store.subscribe(queue_capacity);
-        let planner_config = PlannerConfig::default();
+        let mut planner_config = PlannerConfig::default();
+        planner_config.require_alt_ready = !config.pipeline.dry_run_mode;
         let (graph_handle, graph_thread) = spawn_graph_service(
             stop.clone(),
             None,

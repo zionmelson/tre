@@ -42,6 +42,10 @@ cargo build --release --target x86_64-unknown-linux-gnu
 ./scripts/run-bot.sh
 
 # Non-submitting dry run (planner runs, submissions disabled)
+# Always-on dry run helper
+./scripts/run-dry.sh
+
+# One-off dry run using the primary script
 ./scripts/run-bot.sh --dry-run
 
 # Refresh a previously logged bundle payload with a fresh blockhash/signature

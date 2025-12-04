@@ -18,6 +18,7 @@ pub struct RouteBuilder {
     builder: BuilderHandle,
     pool_store: PoolStoreView,
     freshness_budget: Duration,
+    require_alt_ready: bool,
 }
 
 pub struct RouteBuildResult {
@@ -31,11 +32,13 @@ impl RouteBuilder {
         builder: BuilderHandle,
         pool_store: PoolStoreView,
         freshness_budget: Duration,
+        require_alt_ready: bool,
     ) -> Self {
         Self {
             builder,
             pool_store,
             freshness_budget,
+            require_alt_ready,
         }
     }
 
@@ -64,7 +67,10 @@ impl RouteBuilder {
             let readiness = self
                 .builder
                 .template_readiness(&pool_key, template_direction);
-            if !readiness.template_ready || !readiness.alt_ready {
+            if !readiness.template_ready {
+                return None;
+            }
+            if self.require_alt_ready && !readiness.alt_ready {
                 return None;
             }
 

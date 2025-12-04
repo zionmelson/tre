@@ -16,6 +16,7 @@ pub struct TemplateContext {
     pub host_fee_account: Option<Pubkey>,
     pub remaining_accounts: Vec<AccountMeta>,
     pub whirlpool_tick_arrays: Vec<Pubkey>,
+    pub whirlpool_remaining_accounts: Vec<WhirlpoolRemainingAccountsSlice>,
     pub slippage_tolerance_bps: Option<u16>,
     pub expected_fee_amount: Option<u64>,
     pub partial_fill_remaining: Option<u64>,
@@ -38,6 +39,7 @@ impl Default for TemplateContext {
             host_fee_account: None,
             remaining_accounts: Vec::new(),
             whirlpool_tick_arrays: Vec::new(),
+            whirlpool_remaining_accounts: Vec::new(),
             slippage_tolerance_bps: None,
             expected_fee_amount: None,
             partial_fill_remaining: None,
@@ -45,4 +47,39 @@ impl Default for TemplateContext {
             alt_ready: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhirlpoolRemainingAccountsType {
+    TransferHookA,
+    TransferHookB,
+    TransferHookReward,
+    TransferHookInput,
+    TransferHookIntermediate,
+    TransferHookOutput,
+    SupplementalTickArrays,
+    SupplementalTickArraysOne,
+    SupplementalTickArraysTwo,
+}
+
+impl WhirlpoolRemainingAccountsType {
+    pub fn discriminant(self) -> u8 {
+        match self {
+            Self::TransferHookA => 0,
+            Self::TransferHookB => 1,
+            Self::TransferHookReward => 2,
+            Self::TransferHookInput => 3,
+            Self::TransferHookIntermediate => 4,
+            Self::TransferHookOutput => 5,
+            Self::SupplementalTickArrays => 6,
+            Self::SupplementalTickArraysOne => 7,
+            Self::SupplementalTickArraysTwo => 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WhirlpoolRemainingAccountsSlice {
+    pub accounts_type: WhirlpoolRemainingAccountsType,
+    pub length: u8,
 }

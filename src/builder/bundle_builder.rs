@@ -655,12 +655,13 @@ fn config_token_account(
     })
 }
 
-fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [u8]) -> Result<()> {
+fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut Vec<u8>) -> Result<()> {
     let offset = patch.offset as usize;
     let length = patch.length as usize;
-    let slice = data
-        .get_mut(offset..offset + length)
-        .ok_or_else(|| anyhow!("template patch out of bounds"))?;
+    if offset + length > data.len() {
+        bail!("template patch out of bounds");
+    }
+    let slice = &mut data[offset..offset + length];
 
     match patch.kind {
         TemplateFieldKind::AmmV3(field) => match field {
@@ -717,10 +718,48 @@ fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut [
                     write_u128(limit, slice);
                 }
             }
+            WhirlpoolField::RemainingAccountsInfo => {
+                encode_whirlpool_remaining_accounts(plan, data, offset, length, slice)?;
+            }
         },
         TemplateFieldKind::Custom(_) => {}
     }
 
+    Ok(())
+}
+
+fn encode_whirlpool_remaining_accounts(
+    plan: &BundleInstructionPlan,
+    data: &mut Vec<u8>,
+    offset: usize,
+    length: usize,
+    discriminant_slice: &mut [u8],
+) -> Result<()> {
+    if length != 1 {
+        bail!("expected 1-byte discriminant for remaining accounts info");
+    }
+
+    if plan.context.whirlpool_remaining_accounts.is_empty() {
+        discriminant_slice[0] = 0;
+        data.truncate(offset + length);
+        return Ok(());
+    }
+
+    let slice_count = plan.context.whirlpool_remaining_accounts.len();
+    if slice_count > u32::MAX as usize {
+        bail!("remaining accounts slice overflow");
+    }
+
+    discriminant_slice[0] = 1;
+    data.truncate(offset + length);
+
+    let mut payload = Vec::with_capacity(1 + slice_count.saturating_mul(2));
+    payload.extend_from_slice(&(slice_count as u32).to_le_bytes());
+    for slice in &plan.context.whirlpool_remaining_accounts {
+        payload.push(slice.accounts_type.discriminant());
+        payload.push(slice.length);
+    }
+    data.extend_from_slice(&payload);
     Ok(())
 }
 

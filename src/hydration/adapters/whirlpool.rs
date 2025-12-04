@@ -9,7 +9,7 @@ use std::{
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use solana_client::{client_error::ClientError, rpc_client::RpcClient};
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
@@ -24,7 +24,7 @@ use crate::hydration::types::{
 use super::{
     build_quote_response, mul_div_price, quote_from_price, AdapterReadiness, ProtocolAdapter,
     QuoteRequest, QuoteResponse, QuoteStatus, ReadinessBlocker, ReadinessBlockerKind,
-    SwapDirection, TemplateContext,
+    SwapDirection, TemplateContext, WhirlpoolRemainingAccountsSlice, WhirlpoolRemainingAccountsType,
 };
 
 const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
@@ -355,7 +355,8 @@ impl WhirlpoolAdapter {
 
     fn decorate_template_context(&self, response: &mut QuoteResponse, state: &WhirlpoolState) {
         let mut context = self.snapshot_template_context(state);
-        let preferred_arrays = response.context.whirlpool_tick_arrays.clone();
+        let preferred_arrays_full = response.context.whirlpool_tick_arrays.clone();
+        let preferred_arrays = preferred_arrays_full.clone();
         if let Some(arrays) = self.resolve_tick_arrays(state, &response.request, &preferred_arrays)
         {
             context.whirlpool_tick_arrays = arrays;
@@ -366,6 +367,11 @@ impl WhirlpoolAdapter {
             response.request.input_mint,
             response.request.output_mint,
         );
+        let supplemental_arrays: Vec<Pubkey> = preferred_arrays_full
+            .into_iter()
+            .skip(3)
+            .collect();
+        self.attach_supplemental_tick_arrays(&mut context, &supplemental_arrays);
         response.context = context;
     }
 
@@ -482,8 +488,8 @@ impl WhirlpoolAdapter {
         state: &WhirlpoolState,
         direction: TradeDirection,
     ) -> Option<Vec<Pubkey>> {
-        self.derive_tick_arrays_for_direction(state, direction)
-            .or_else(|| self.fallback_tick_arrays_from_state(state))
+        self.fallback_tick_arrays_from_state(state)
+            .or_else(|| self.derive_tick_arrays_for_direction(state, direction))
     }
 
     fn derive_tick_arrays_for_direction(
@@ -1143,8 +1149,43 @@ impl WhirlpoolPoolHydrator {
         pool: Pubkey,
         start_tick_index: i32,
     ) -> Option<HydratedTickArray> {
-        let address = derive_tick_array_address(&pool, start_tick_index, &self.program_id);
-        self.fetch_tick_array_account(pool, Some(start_tick_index), address)
+        let primary_address = derive_tick_array_address(&pool, start_tick_index, &self.program_id);
+        let (primary_result, primary_error) =
+            self.fetch_tick_array_account_attempt(pool, Some(start_tick_index), primary_address);
+        if let Some(array) = primary_result {
+            self.clear_tick_failure(pool, start_tick_index);
+            return Some(array);
+        }
+
+        // Respect existing backoff windows before probing alternate seeds.
+        if primary_error.is_none() {
+            return None;
+        }
+
+        let legacy_address =
+            derive_legacy_tick_array_address(&pool, start_tick_index, &self.program_id);
+        if legacy_address == primary_address {
+            // Should never happen, but fall back to the standard logging path.
+            return self.fetch_tick_array_account(pool, Some(start_tick_index), primary_address);
+        }
+
+        let (legacy_result, legacy_error) =
+            self.fetch_tick_array_account_attempt(pool, Some(start_tick_index), legacy_address);
+        if let Some(array) = legacy_result {
+            self.clear_tick_failure(pool, start_tick_index);
+            return Some(array);
+        }
+
+        if legacy_error.is_none() {
+            return None;
+        }
+
+        let error = legacy_error.or(primary_error);
+        if let Some(err) = error {
+            let failures = self.record_tick_failure(pool, start_tick_index);
+            self.log_tick_fetch_error(pool, start_tick_index, &legacy_address, &err, failures);
+        }
+        None
     }
 
     fn fetch_tick_array_by_address(
@@ -1155,12 +1196,12 @@ impl WhirlpoolPoolHydrator {
         self.fetch_tick_array_account(pool, None, address)
     }
 
-    fn fetch_tick_array_account(
+    fn fetch_tick_array_account_attempt(
         &self,
         pool: Pubkey,
         expected_start: Option<i32>,
         address: Pubkey,
-    ) -> Option<HydratedTickArray> {
+    ) -> (Option<HydratedTickArray>, Option<TickArrayFetchError>) {
         if let Some(start) = expected_start {
             if let Some(wait) = self.tick_backoff_delay(pool, start) {
                 trace!(
@@ -1170,7 +1211,7 @@ impl WhirlpoolPoolHydrator {
                     wait_ms = wait.as_millis(),
                     "tick array fetch backoff active"
                 );
-                return None;
+                return (None, None);
             }
         }
 
@@ -1192,10 +1233,7 @@ impl WhirlpoolPoolHydrator {
                         }
                         let key = (pool, array.start_tick_index);
                         self.tick_array_cache.insert(key, array.clone());
-                        if let Some(expected) = expected_start {
-                            self.clear_tick_failure(pool, expected);
-                        }
-                        return Some(array);
+                        return (Some(array), None);
                     } else {
                         last_error = Some(TickArrayFetchError::UnexpectedLayout);
                         break;
@@ -1207,11 +1245,31 @@ impl WhirlpoolPoolHydrator {
             }
         }
 
+        (None, last_error)
+    }
+
+    fn fetch_tick_array_account(
+        &self,
+        pool: Pubkey,
+        expected_start: Option<i32>,
+        address: Pubkey,
+    ) -> Option<HydratedTickArray> {
+        let (result, error) = self.fetch_tick_array_account_attempt(pool, expected_start, address);
+        if let Some(array) = result {
+            if let Some(expected) = expected_start {
+                self.clear_tick_failure(pool, expected);
+            }
+            return Some(array);
+        }
+
+        let Some(error) = error else {
+            return None;
+        };
+
         if let Some(start) = expected_start {
-            let error = last_error.unwrap_or(TickArrayFetchError::AccountNotFound);
             let failures = self.record_tick_failure(pool, start);
             self.log_tick_fetch_error(pool, start, &address, &error, failures);
-        } else if let Some(error) = last_error {
+        } else {
             warn!(
                 target = "adapter::whirlpool",
                 pool = %pool,
@@ -1492,10 +1550,18 @@ const PUBKEY_BYTES: usize = 32;
 const WHIRLPOOL_REWARD_INFO_BYTES: usize = 32 + 32 + 32 + 16 + 16;
 const WHIRLPOOL_TICK_ARRAY_TICK_COUNT: usize = 88;
 const WHIRLPOOL_TICK_SERIALIZED_LEN: usize = 1 + (16 * 5) + (16 * 3);
-const MIN_TICK_ARRAY_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN
+const DYNAMIC_TICK_ARRAY_DISCRIMINATOR: [u8; ANCHOR_DISCRIMINATOR_LEN] =
+    [17, 216, 246, 142, 225, 199, 218, 56];
+const MIN_LEGACY_TICK_ARRAY_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN
     + 4
     + (WHIRLPOOL_TICK_SERIALIZED_LEN * WHIRLPOOL_TICK_ARRAY_TICK_COUNT)
     + PUBKEY_BYTES;
+const MIN_DYNAMIC_TICK_ARRAY_ACCOUNT_LEN_WITHOUT_DISC: usize = 4
+    + PUBKEY_BYTES
+    + 16 // bitmap
+    + WHIRLPOOL_TICK_ARRAY_TICK_COUNT; // minimum discriminants
+const MIN_DYNAMIC_TICK_ARRAY_ACCOUNT_LEN_WITH_DISC: usize =
+    MIN_DYNAMIC_TICK_ARRAY_ACCOUNT_LEN_WITHOUT_DISC + ANCHOR_DISCRIMINATOR_LEN;
 const WHIRLPOOL_ACCOUNT_MIN_LEN: usize = ANCHOR_DISCRIMINATOR_LEN
     + PUBKEY_BYTES // whirlpools config
     + 1 // whirlpool bump
@@ -1569,10 +1635,104 @@ fn parse_tick_array_account(
     expected_pool: Pubkey,
     data: &[u8],
 ) -> Option<HydratedTickArray> {
-    if data.len() < MIN_TICK_ARRAY_ACCOUNT_LEN {
+    if data.len() < MIN_DYNAMIC_TICK_ARRAY_ACCOUNT_LEN_WITHOUT_DISC {
         return None;
     }
 
+    if let Some(dynamic) = parse_dynamic_tick_array(address, expected_pool, data) {
+        return Some(dynamic);
+    }
+    parse_legacy_tick_array(address, expected_pool, data)
+}
+
+fn parse_dynamic_tick_array(
+    address: Pubkey,
+    expected_pool: Pubkey,
+    data: &[u8],
+) -> Option<HydratedTickArray> {
+    let has_discriminator = data.len() >= MIN_DYNAMIC_TICK_ARRAY_ACCOUNT_LEN_WITH_DISC
+        && data
+            .get(..ANCHOR_DISCRIMINATOR_LEN)
+            .map(|slice| slice == DYNAMIC_TICK_ARRAY_DISCRIMINATOR)
+            .unwrap_or(false);
+
+    if has_discriminator {
+        if let Some(array) = parse_dynamic_tick_array_with_offset(
+            address,
+            expected_pool,
+            data,
+            ANCHOR_DISCRIMINATOR_LEN,
+        ) {
+            return Some(array);
+        }
+    }
+
+    parse_dynamic_tick_array_with_offset(address, expected_pool, data, 0)
+}
+
+fn parse_dynamic_tick_array_with_offset(
+    address: Pubkey,
+    expected_pool: Pubkey,
+    data: &[u8],
+    offset: usize,
+) -> Option<HydratedTickArray> {
+    if data.len() < offset + MIN_DYNAMIC_TICK_ARRAY_ACCOUNT_LEN_WITHOUT_DISC {
+        return None;
+    }
+
+    // Dynamic Whirlpool tick arrays (introduced in recent program releases) place the
+    // whirlpool pubkey immediately after the optional anchor discriminator + start index,
+    // followed by a bitmap and a sequence of Borsh enums indicating whether each slot is
+    // initialized. We detect the layout by validating the inline whirlpool pubkey.
+    let mut cursor = offset;
+    let start_tick_index = read_i32(&mut cursor, data)?;
+    let whirlpool = read_pubkey_bytes(&mut cursor, data)?;
+    if whirlpool != expected_pool {
+        return None;
+    }
+
+    // Tick bitmap currently unused but advance cursor to keep decoding aligned.
+    let _bitmap = read_u128(&mut cursor, data)?;
+    let mut ticks = Vec::with_capacity(WHIRLPOOL_TICK_ARRAY_TICK_COUNT);
+    for _ in 0..WHIRLPOOL_TICK_ARRAY_TICK_COUNT {
+        let variant = read_u8(&mut cursor, data)?;
+        match variant {
+            0 => ticks.push(TickEntry {
+                initialized: false,
+                liquidity_net: 0,
+                liquidity_gross: 0,
+            }),
+            1 => {
+                let liquidity_net = read_i128(&mut cursor, data)?;
+                let liquidity_gross = read_u128(&mut cursor, data)?;
+                skip_bytes(&mut cursor, 16, data)?; // fee growth outside A
+                skip_bytes(&mut cursor, 16, data)?; // fee growth outside B
+                skip_bytes(&mut cursor, 16 * 3, data)?; // reward growth outside entries
+                ticks.push(TickEntry {
+                    initialized: liquidity_gross > 0,
+                    liquidity_net,
+                    liquidity_gross,
+                });
+            }
+            _ => return None,
+        }
+    }
+
+    Some(HydratedTickArray {
+        address,
+        start_tick_index,
+        ticks,
+    })
+}
+
+fn parse_legacy_tick_array(
+    address: Pubkey,
+    expected_pool: Pubkey,
+    data: &[u8],
+) -> Option<HydratedTickArray> {
+    if data.len() < MIN_LEGACY_TICK_ARRAY_ACCOUNT_LEN {
+        return None;
+    }
     let mut cursor = ANCHOR_DISCRIMINATOR_LEN;
     let start_tick_index = read_i32(&mut cursor, data)?;
     let mut ticks = Vec::with_capacity(WHIRLPOOL_TICK_ARRAY_TICK_COUNT);
@@ -1582,7 +1742,7 @@ fn parse_tick_array_account(
         let liquidity_gross = read_u128(&mut cursor, data)?;
         skip_bytes(&mut cursor, 16, data)?; // fee growth outside A
         skip_bytes(&mut cursor, 16, data)?; // fee growth outside B
-        skip_bytes(&mut cursor, 16 * 3, data)?; // reward growths outside
+        skip_bytes(&mut cursor, 16 * 3, data)?; // reward growth outside entries
         ticks.push(TickEntry {
             initialized,
             liquidity_net,
@@ -1631,6 +1791,13 @@ fn read_bool(cursor: &mut usize, data: &[u8]) -> Option<bool> {
     Some(byte != 0)
 }
 
+fn read_u8(cursor: &mut usize, data: &[u8]) -> Option<u8> {
+    let byte = *data.get(*cursor)?;
+    let next = (*cursor).checked_add(1)?;
+    *cursor = next;
+    Some(byte)
+}
+
 fn read_i128(cursor: &mut usize, data: &[u8]) -> Option<i128> {
     let end = cursor.checked_add(16)?;
     let bytes: [u8; 16] = data.get(*cursor..end)?.try_into().ok()?;
@@ -1655,6 +1822,21 @@ fn read_pubkey_bytes(cursor: &mut usize, data: &[u8]) -> Option<Pubkey> {
 }
 
 fn derive_tick_array_address(pool: &Pubkey, start_tick_index: i32, program_id: &Pubkey) -> Pubkey {
+    // Orca switched tick array seeds to use the decimal string form of the start tick index.
+    // This aligns with the Anchor instruction seeds seen in initialize_(dynamic_)tick_array.
+    let start_seed = start_tick_index.to_string();
+    Pubkey::find_program_address(
+        &[TICK_ARRAY_SEED, pool.as_ref(), start_seed.as_bytes()],
+        program_id,
+    )
+    .0
+}
+
+fn derive_legacy_tick_array_address(
+    pool: &Pubkey,
+    start_tick_index: i32,
+    program_id: &Pubkey,
+) -> Pubkey {
     let start_bytes = start_tick_index.to_le_bytes();
     Pubkey::find_program_address(&[TICK_ARRAY_SEED, pool.as_ref(), &start_bytes], program_id).0
 }

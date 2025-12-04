@@ -45,6 +45,7 @@ pub struct PlannerConfig {
     pub detection_budget: Duration,
     pub freshness_budget: Duration,
     pub cycle_notional_lamports: u64,
+    pub require_alt_ready: bool,
 }
 
 impl Default for PlannerConfig {
@@ -53,6 +54,7 @@ impl Default for PlannerConfig {
             detection_budget: Duration::from_millis(40),
             freshness_budget: Duration::from_millis(30),
             cycle_notional_lamports: DEFAULT_CYCLE_NOTIONAL_LAMPORTS,
+            require_alt_ready: true,
         }
     }
 }
@@ -76,6 +78,7 @@ pub struct FastLanePlanner {
     readiness_timeout: Duration,
     min_ready_pools: usize,
     next_buffer_sample: Instant,
+    require_alt_ready: bool,
 }
 
 impl FastLanePlanner {
@@ -92,6 +95,7 @@ impl FastLanePlanner {
         readiness_timeout: Duration,
         min_ready_pools: usize,
     ) -> Self {
+        let require_alt_ready = config.require_alt_ready;
         Self {
             builder,
             config,
@@ -111,6 +115,7 @@ impl FastLanePlanner {
             readiness_timeout,
             min_ready_pools,
             next_buffer_sample: Instant::now(),
+            require_alt_ready,
         }
     }
 
@@ -385,11 +390,11 @@ impl FastLanePlanner {
         if route_plan.legs.is_empty() {
             return None;
         }
-        if !route_plan
+        let legs_ready = route_plan
             .legs
             .iter()
-            .all(|leg| leg.template_ready && leg.alt_ready)
-        {
+            .all(|leg| leg.template_ready && (!self.require_alt_ready || leg.alt_ready));
+        if !legs_ready {
             trace!(
                 target = "fastlane",
                 route = %cycle

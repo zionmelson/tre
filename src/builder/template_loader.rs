@@ -746,6 +746,7 @@ fn encode_whirlpool_args(
     let mut amount_in = None;
     let mut amount_out = None;
     let mut sqrt_price_limit = None;
+    let mut remaining_accounts_info = None;
 
     for arg in template.args {
         match arg.name {
@@ -769,6 +770,10 @@ fn encode_whirlpool_args(
                 let literal = parse_bool(arg)?;
                 buffer.push(literal);
             }
+            "remainingAccountsInfo" | "remaining_accounts_info" => {
+                let slice = write_option_remaining_accounts_info(buffer)?;
+                remaining_accounts_info = Some(slice);
+            }
             other => {
                 return Err(anyhow!("unsupported whirlpool arg {}", other));
             }
@@ -783,6 +788,7 @@ fn encode_whirlpool_args(
         amount_in,
         amount_out,
         sqrt_price_limit,
+        remaining_accounts_info,
     })
 }
 
@@ -802,6 +808,12 @@ fn write_option_i32_none(buffer: &mut Vec<u8>) -> Result<TemplateSlice> {
 fn write_remaining_accounts_info(buffer: &mut Vec<u8>) -> Result<()> {
     buffer.extend_from_slice(&0u32.to_le_bytes());
     Ok(())
+}
+
+fn write_option_remaining_accounts_info(buffer: &mut Vec<u8>) -> Result<TemplateSlice> {
+    let offset = buffer.len();
+    buffer.push(0); // None discriminant
+    make_slice(offset, 1)
 }
 
 fn write_u128(buffer: &mut Vec<u8>, value: u128) -> Result<TemplateSlice> {

@@ -287,8 +287,8 @@ fn emit_lb_clmm_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error:
 fn emit_whirlpool_swap_templates(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let idl = load_idl("whirlpool")?;
     let program_id = idl.address.as_deref().unwrap_or(WHIRLPOOL_PROGRAM_ID);
-    let Some(ix) = idl.instructions.iter().find(|ix| ix.name == "swap") else {
-        return Err("missing swap instruction in whirlpool idl".into());
+    let Some(ix) = idl.instructions.iter().find(|ix| ix.name == "swap_v2") else {
+        return Err("missing swap_v2 instruction in whirlpool idl".into());
     };
 
     let accounts = whirlpool_accounts_with_pdas(&ix.accounts);

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -76,6 +77,7 @@ pub struct HydrationService {
     adapter_book: Arc<AdapterBook>,
     pool_store: Arc<PoolStore>,
     rpc_refresher: Arc<RpcRefresher>,
+    alt_required_for_readiness: bool,
 }
 
 impl HydrationService {
@@ -87,6 +89,7 @@ impl HydrationService {
             config.watcher.queue_drop_policy,
         ));
         let rpc_refresher = Arc::new(RpcRefresher::new(config.clone()));
+        let alt_required_for_readiness = !config.pipeline.dry_run_mode;
         Self {
             builder,
             config,
@@ -94,6 +97,7 @@ impl HydrationService {
             adapter_book,
             pool_store,
             rpc_refresher,
+            alt_required_for_readiness,
         }
     }
 
@@ -123,9 +127,19 @@ impl HydrationService {
         let adapter_book = self.adapter_book.clone();
         let pool_store = self.pool_store.clone();
         let builder = self.builder.clone();
+        let require_alt_ready = self.alt_required_for_readiness;
         thread::Builder::new()
             .name("hydration_ingest".into())
-            .spawn(move || run_adapter_ingest_loop(stop, config, adapter_book, pool_store, builder))
+            .spawn(move || {
+                run_adapter_ingest_loop(
+                    stop,
+                    config,
+                    adapter_book,
+                    pool_store,
+                    builder,
+                    require_alt_ready,
+                )
+            })
             .map_err(Into::into)
     }
 
@@ -196,6 +210,7 @@ impl HydrationService {
         });
         let sweep = Duration::from_millis(self.config.watcher.pool_stale_sweep_ms.max(50));
         let builder = self.builder.clone();
+        let require_alt_ready = self.alt_required_for_readiness;
         if ttl.is_none() {
             info!(
                 target = "hydration",
@@ -213,6 +228,7 @@ impl HydrationService {
                     ttl,
                     sweep,
                     builder,
+                    require_alt_ready,
                 )
             })
             .map_err(Into::into)
@@ -225,21 +241,60 @@ impl HydrationService {
                 target = "hydration",
                 "pool readiness timeout; no adapter blockers reported"
             );
-            return;
+        } else {
+            let total = diagnostics.len();
+            let samples = diagnostics
+                .samples(3)
+                .into_iter()
+                .map(format_blocker)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            warn!(
+                target = "hydration",
+                blocked = total,
+                samples = %samples,
+                "pool readiness blocked by adapter backoff"
+            );
         }
-        let total = diagnostics.len();
-        let samples = diagnostics
-            .samples(3)
-            .into_iter()
-            .map(format_blocker)
-            .collect::<Vec<_>>()
-            .join(" | ");
-        warn!(
-            target = "hydration",
-            blocked = total,
-            samples = %samples,
-            "pool readiness blocked by adapter backoff"
-        );
+
+        let stalled = self.sample_unready_pool_reasons(3);
+        if !stalled.is_empty() {
+            warn!(
+                target = "hydration",
+                samples = %stalled.join(" | "),
+                "pool readiness stalled; sample pools failing fast-lane checks"
+            );
+        }
+    }
+
+    fn sample_unready_pool_reasons(&self, limit: usize) -> Vec<String> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut samples = Vec::new();
+        let view = self.pool_store.view();
+        for entry in view.iter() {
+            let state = entry.value().clone();
+            if state.ready {
+                continue;
+            }
+            if let Err(reason) = evaluate_snapshot_readiness(
+                &self.builder,
+                &state.snapshot,
+                self.alt_required_for_readiness,
+            ) {
+                samples.push(format!(
+                    "{}:{} {}",
+                    state.program_id,
+                    state.pool_id,
+                    reason
+                ));
+            }
+            if samples.len() >= limit {
+                break;
+            }
+        }
+        samples
     }
 }
 
@@ -298,6 +353,7 @@ fn run_adapter_ingest_loop(
     adapter_book: Arc<AdapterBook>,
     pool_store: Arc<PoolStore>,
     builder: BuilderHandle,
+    require_alt_ready: bool,
 ) -> Result<()> {
     let client = CoreCastClient::new(config.clone())
         .context("failed to initialize CoreCast client for hydration ingest")?;
@@ -316,6 +372,7 @@ fn run_adapter_ingest_loop(
             pool_store,
             pair_allowlist,
             builder,
+            require_alt_ready,
         )
         .await
     })
@@ -328,6 +385,7 @@ async fn pump_pool_stream(
     pool_store: Arc<PoolStore>,
     allowlist: Arc<HashSet<TokenPair>>,
     builder: BuilderHandle,
+    require_alt_ready: bool,
 ) -> Result<()> {
     let mut seq = 0u64;
     let mut retry = Duration::from_millis(250);
@@ -357,7 +415,11 @@ async fn pump_pool_stream(
                                     {
                                         snapshot.quotes = Some(quotes);
                                     }
-                                    let ready = snapshot_ready_for_fastlane(&builder, &snapshot);
+                                    let ready = snapshot_ready_for_fastlane(
+                                        &builder,
+                                        &snapshot,
+                                        require_alt_ready,
+                                    );
                                     pool_store.update(snapshot, ready);
                                     telemetry::record_hydration_heartbeat(unix_timestamp_ms());
                                 }
@@ -443,6 +505,7 @@ fn run_pool_maintenance_loop(
     ttl: Option<Duration>,
     sweep: Duration,
     builder: BuilderHandle,
+    require_alt_ready: bool,
 ) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
         let Some(ttl_value) = ttl else {
@@ -463,7 +526,7 @@ fn run_pool_maintenance_loop(
                 if let Some(quotes) = adapter_book.snapshot_quotes(&mut refreshed) {
                     refreshed.quotes = Some(quotes);
                 }
-                let ready = snapshot_ready_for_fastlane(&builder, &refreshed);
+                let ready = snapshot_ready_for_fastlane(&builder, &refreshed, require_alt_ready);
                 pool_store.update(refreshed, ready);
                 telemetry::record_hydration_rpc_refresh(&protocol);
             } else {
@@ -478,24 +541,37 @@ fn run_pool_maintenance_loop(
     Ok(())
 }
 
-fn snapshot_ready_for_fastlane(builder: &BuilderHandle, snapshot: &PoolSnapshot) -> bool {
-    let pool_pubkey = match Pubkey::from_str(&snapshot.pool_id) {
-        Ok(pk) => pk,
-        Err(_) => return false,
-    };
+fn snapshot_ready_for_fastlane(
+    builder: &BuilderHandle,
+    snapshot: &PoolSnapshot,
+    require_alt_ready: bool,
+) -> bool {
+    evaluate_snapshot_readiness(builder, snapshot, require_alt_ready).is_ok()
+}
+
+fn evaluate_snapshot_readiness(
+    builder: &BuilderHandle,
+    snapshot: &PoolSnapshot,
+    require_alt_ready: bool,
+) -> Result<(), PoolReadinessFailure> {
+    let pool_pubkey = Pubkey::from_str(&snapshot.pool_id)
+        .map_err(|_| PoolReadinessFailure::InvalidPoolId)?;
 
     for direction in [
         SwapTemplateDirection::BaseIn,
         SwapTemplateDirection::BaseOut,
     ] {
         let readiness = builder.template_readiness(&pool_pubkey, direction);
-        if !(readiness.template_ready && readiness.alt_ready) {
-            return false;
+        if !readiness.template_ready {
+            return Err(PoolReadinessFailure::MissingTemplate(direction));
+        }
+        if require_alt_ready && !readiness.alt_ready {
+            return Err(PoolReadinessFailure::MissingAlt(direction));
         }
     }
 
     if snapshot.quotes.is_none() {
-        return false;
+        return Err(PoolReadinessFailure::MissingQuotes);
     }
 
     if snapshot.program_id == WHIRLPOOL_PROGRAM_ID {
@@ -504,9 +580,47 @@ fn snapshot_ready_for_fastlane(builder: &BuilderHandle, snapshot: &PoolSnapshot)
                 if extras.tick_array0.is_some()
                     && extras.tick_array1.is_some()
                     && extras.tick_array2.is_some() => {}
-            _ => return false,
+            _ => return Err(PoolReadinessFailure::MissingWhirlpoolTickArrays),
         }
     }
 
-    true
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PoolReadinessFailure {
+    InvalidPoolId,
+    MissingTemplate(SwapTemplateDirection),
+    MissingAlt(SwapTemplateDirection),
+    MissingQuotes,
+    MissingWhirlpoolTickArrays,
+}
+
+impl fmt::Display for PoolReadinessFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PoolReadinessFailure::InvalidPoolId => write!(f, "invalid-pool-pubkey"),
+            PoolReadinessFailure::MissingTemplate(direction) => write!(
+                f,
+                "missing-template direction={}",
+                format_swap_direction(*direction)
+            ),
+            PoolReadinessFailure::MissingAlt(direction) => write!(
+                f,
+                "missing-alt-table direction={}",
+                format_swap_direction(*direction)
+            ),
+            PoolReadinessFailure::MissingQuotes => write!(f, "missing-quotes"),
+            PoolReadinessFailure::MissingWhirlpoolTickArrays => {
+                write!(f, "missing-whirlpool-tick-arrays")
+            }
+        }
+    }
+}
+
+fn format_swap_direction(direction: SwapTemplateDirection) -> &'static str {
+    match direction {
+        SwapTemplateDirection::BaseIn => "base_in",
+        SwapTemplateDirection::BaseOut => "base_out",
+    }
 }

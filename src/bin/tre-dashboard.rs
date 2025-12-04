@@ -1131,11 +1131,11 @@ fn heartbeat_status(state: &DashboardState) -> (String, Color) {
         if let Some(now_ms) = current_unix_ms() {
             let age_ms = now_ms.saturating_sub(heartbeat_ms);
             let (label, color) = if age_ms <= 2_000 {
-                ("💓 live", Color::Green)
+                ("💹 live", Color::Green)
             } else if age_ms <= 5_000 {
-                ("🟡 slow", Color::Yellow)
+                ("🔄 slow", Color::Yellow)
             } else {
-                ("🪫 stalled", Color::Red)
+                ("💀 dry ash", Color::Gray)
             };
             let text = format!("{label} · {} ago", format_duration_brief(age_ms));
             return (text, color);

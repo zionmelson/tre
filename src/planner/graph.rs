@@ -33,7 +33,12 @@ struct GraphState {
 
 impl GraphState {
     fn new(pool_store: PoolStoreView, builder: BuilderHandle, config: PlannerConfig) -> Self {
-        let route_builder = RouteBuilder::new(builder, pool_store.clone(), config.freshness_budget);
+        let route_builder = RouteBuilder::new(
+            builder,
+            pool_store.clone(),
+            config.freshness_budget,
+            config.require_alt_ready,
+        );
         Self {
             pool_store,
             graph: RwLock::new(GraphManager::new()),

@@ -478,6 +478,7 @@ pub enum WhirlpoolField {
     AmountIn,
     AmountOut,
     SqrtPriceLimit,
+    RemainingAccountsInfo,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -592,11 +593,12 @@ pub struct WhirlpoolFieldLayout {
     pub amount_in: TemplateSlice,
     pub amount_out: TemplateSlice,
     pub sqrt_price_limit: Option<TemplateSlice>,
+    pub remaining_accounts_info: Option<TemplateSlice>,
 }
 
 impl WhirlpoolFieldLayout {
     fn into_patches(self) -> Vec<TemplatePatch> {
-        let mut patches = Vec::with_capacity(3);
+        let mut patches = Vec::with_capacity(4);
         patches.push(TemplatePatch {
             offset: self.amount_in.offset,
             length: self.amount_in.length,
@@ -612,6 +614,13 @@ impl WhirlpoolFieldLayout {
                 offset: slice.offset,
                 length: slice.length,
                 kind: TemplateFieldKind::Whirlpool(WhirlpoolField::SqrtPriceLimit),
+            });
+        }
+        if let Some(slice) = self.remaining_accounts_info {
+            patches.push(TemplatePatch {
+                offset: slice.offset,
+                length: slice.length,
+                kind: TemplateFieldKind::Whirlpool(WhirlpoolField::RemainingAccountsInfo),
             });
         }
         patches

@@ -444,7 +444,7 @@
       "hydration_retry_ms": 500
     },
     "whirlpool": {
-      "enabled": false,
+      "enabled": true,
       "rpc_endpoints": [
         "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
         "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
