@@ -787,7 +787,6 @@ mod tests {
             updated_at: Instant::now(),
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
-            allow_reserve_backfill: true,
             quotes: None,
             extensions: PoolUpdateExtensions::default(),
         }

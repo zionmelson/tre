@@ -13,6 +13,8 @@ pub enum QuoteStatus {
     MissingReferral,
     RateLimited,
     MissingTickArrays,
+    InsufficientBins,
+    PriceImpactExceeded,
 }
 
 mod protocols;

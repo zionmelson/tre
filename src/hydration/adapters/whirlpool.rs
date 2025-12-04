@@ -1,12 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
+    hash::Hash,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
-use solana_client::rpc_client::RpcClient;
+use dashmap::{mapref::entry::Entry, DashMap};
+use solana_client::{client_error::ClientError, rpc_client::RpcClient};
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
@@ -20,8 +22,9 @@ use crate::hydration::types::{
 };
 
 use super::{
-    build_quote_response, mul_div_price, quote_from_price, ProtocolAdapter, QuoteRequest,
-    QuoteResponse, QuoteStatus, SwapDirection, TemplateContext,
+    build_quote_response, mul_div_price, quote_from_price, AdapterReadiness, ProtocolAdapter,
+    QuoteRequest, QuoteResponse, QuoteStatus, ReadinessBlocker, ReadinessBlockerKind,
+    SwapDirection, TemplateContext,
 };
 
 const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
@@ -32,6 +35,10 @@ const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const WHIRLPOOL_DEFAULT_CU_LIMIT: u32 = 380_000;
 const WHIRLPOOL_DEFAULT_CU_PRICE: u64 = 5_000;
 const BPS_DENOMINATOR: u64 = 10_000;
+const DEFAULT_WHIRLPOOL_POOL_BACKOFF_MS: u64 = 5_000;
+const DEFAULT_WHIRLPOOL_TICK_BACKOFF_MS: u64 = 15_000;
+const DEFAULT_WHIRLPOOL_MAX_POOL_FAILURES: u32 = 5;
+const DEFAULT_WHIRLPOOL_MAX_TICK_FAILURES: u32 = 5;
 
 #[allow(clippy::assign_op_pattern, clippy::manual_div_ceil)]
 mod u256 {
@@ -53,6 +60,10 @@ pub struct WhirlpoolAdapterConfig {
     pub rpc_timeout_ms: u64,
     pub hydration_retry_ms: u64,
     pub max_swap_utilization_bps: u64,
+    pub pool_failure_backoff_ms: u64,
+    pub tick_array_backoff_ms: u64,
+    pub max_pool_failures: u32,
+    pub max_tick_array_failures: u32,
 }
 
 impl Default for WhirlpoolAdapterConfig {
@@ -64,6 +75,10 @@ impl Default for WhirlpoolAdapterConfig {
             rpc_timeout_ms: 15_000,
             hydration_retry_ms: DEFAULT_WHIRLPOOL_HYDRATION_RETRY_MS,
             max_swap_utilization_bps: WHIRLPOOL_INPUT_UTILIZATION_BPS,
+            pool_failure_backoff_ms: DEFAULT_WHIRLPOOL_POOL_BACKOFF_MS,
+            tick_array_backoff_ms: DEFAULT_WHIRLPOOL_TICK_BACKOFF_MS,
+            max_pool_failures: DEFAULT_WHIRLPOOL_MAX_POOL_FAILURES,
+            max_tick_array_failures: DEFAULT_WHIRLPOOL_MAX_TICK_FAILURES,
         }
     }
 }
@@ -802,6 +817,16 @@ impl ProtocolAdapter for WhirlpoolAdapter {
             quote_to_base,
         })
     }
+
+    fn readiness_blockers(&self) -> AdapterReadiness {
+        if let Some(hydrator) = self.hydrator.as_ref() {
+            AdapterReadiness {
+                blockers: hydrator.readiness_blockers(),
+            }
+        } else {
+            AdapterReadiness::default()
+        }
+    }
 }
 
 fn needs_hydration(extras: &WhirlpoolPoolExtras) -> bool {
@@ -847,6 +872,72 @@ struct TickEntry {
     liquidity_gross: u128,
 }
 
+#[derive(Clone, Debug)]
+struct FailureWindow {
+    failures: u32,
+    next_retry_at: Instant,
+}
+
+impl FailureWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            failures: 0,
+            next_retry_at: now,
+        }
+    }
+}
+
+fn failure_backoff_pending<K>(
+    store: &DashMap<K, FailureWindow>,
+    key: &K,
+    now: Instant,
+) -> Option<Duration>
+where
+    K: Eq + Hash,
+{
+    store
+        .get(key)
+        .and_then(|entry| entry.next_retry_at.checked_duration_since(now))
+}
+
+fn failure_clear<K>(store: &DashMap<K, FailureWindow>, key: &K)
+where
+    K: Eq + Hash,
+{
+    store.remove(key);
+}
+
+fn failure_record<K>(
+    store: &DashMap<K, FailureWindow>,
+    key: K,
+    now: Instant,
+    base_backoff: Duration,
+    max_failures: u32,
+) -> u32
+where
+    K: Eq + Hash,
+{
+    let capped_max = max_failures.max(1);
+    match store.entry(key) {
+        Entry::Occupied(mut entry) => {
+            let state = entry.get_mut();
+            state.failures = state.failures.saturating_add(1);
+            let capped = state.failures.min(capped_max);
+            let delay = base_backoff.saturating_mul(capped);
+            state.next_retry_at = now + delay;
+            state.failures
+        }
+        Entry::Vacant(entry) => {
+            let mut state = FailureWindow::new(now);
+            state.failures = 1;
+            let delay = base_backoff.saturating_mul(1);
+            state.next_retry_at = now + delay;
+            entry.insert(state);
+            1
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct InitializedTick {
     index: i32,
@@ -859,6 +950,12 @@ struct WhirlpoolPoolHydrator {
     tick_array_cache: DashMap<(Pubkey, i32), HydratedTickArray>,
     clients: Arc<Vec<Arc<RpcClient>>>,
     endpoint_count: usize,
+    pool_failures: DashMap<Pubkey, FailureWindow>,
+    tick_failures: DashMap<(Pubkey, i32), FailureWindow>,
+    pool_backoff: Duration,
+    tick_backoff: Duration,
+    max_pool_failures: u32,
+    max_tick_failures: u32,
 }
 
 impl WhirlpoolPoolHydrator {
@@ -881,8 +978,42 @@ impl WhirlpoolPoolHydrator {
         let endpoint_count = client_list.len();
         let clients = Arc::new(client_list);
         let fetch_clients = clients.clone();
+        let pool_backoff = Duration::from_millis(config.pool_failure_backoff_ms.max(1));
+        let tick_backoff = Duration::from_millis(config.tick_array_backoff_ms.max(1));
+        let max_pool_failures = config.max_pool_failures.max(1);
+        let max_tick_failures = config.max_tick_array_failures.max(1);
+        let pool_failures: DashMap<Pubkey, FailureWindow> = DashMap::new();
+        let tick_failures: DashMap<(Pubkey, i32), FailureWindow> = DashMap::new();
+        let hydrator_failures = pool_failures.clone();
         let hydrator = AsyncHydrator::new("whirlpool_pool", endpoint_count, move |pool| {
-            fetch_whirlpool_meta(program_id, fetch_clients.as_ref(), pool)
+            let now = Instant::now();
+            if let Some(wait) = failure_backoff_pending(&hydrator_failures, &pool, now) {
+                trace!(
+                    target = "adapter::whirlpool",
+                    pool = %pool,
+                    wait_ms = wait.as_millis(),
+                    "pool hydration backoff active"
+                );
+                return None;
+            }
+
+            match fetch_whirlpool_meta(program_id, fetch_clients.as_ref(), pool) {
+                Ok(meta) => {
+                    failure_clear(&hydrator_failures, &pool);
+                    Some(meta)
+                }
+                Err(error) => {
+                    let failures = failure_record(
+                        &hydrator_failures,
+                        pool,
+                        now,
+                        pool_backoff,
+                        max_pool_failures,
+                    );
+                    log_pool_fetch_error(pool, &error, failures);
+                    None
+                }
+            }
         });
 
         Some(Self {
@@ -891,6 +1022,12 @@ impl WhirlpoolPoolHydrator {
             tick_array_cache: DashMap::new(),
             clients,
             endpoint_count,
+            pool_failures,
+            tick_failures,
+            pool_backoff,
+            tick_backoff,
+            max_pool_failures,
+            max_tick_failures,
         })
     }
 
@@ -908,6 +1045,60 @@ impl WhirlpoolPoolHydrator {
             return Some(entry.clone());
         }
         self.fetch_tick_array_from_rpc(pool, start_tick_index)
+    }
+
+    fn tick_backoff_delay(&self, pool: Pubkey, start_tick_index: i32) -> Option<Duration> {
+        failure_backoff_pending(
+            &self.tick_failures,
+            &(pool, start_tick_index),
+            Instant::now(),
+        )
+    }
+
+    fn record_tick_failure(&self, pool: Pubkey, start_tick_index: i32) -> u32 {
+        failure_record(
+            &self.tick_failures,
+            (pool, start_tick_index),
+            Instant::now(),
+            self.tick_backoff,
+            self.max_tick_failures,
+        )
+    }
+
+    fn clear_tick_failure(&self, pool: Pubkey, start_tick_index: i32) {
+        failure_clear(&self.tick_failures, &(pool, start_tick_index));
+    }
+
+    fn readiness_blockers(&self) -> Vec<ReadinessBlocker> {
+        let now = Instant::now();
+        let mut blockers = Vec::new();
+        for entry in self.pool_failures.iter() {
+            let status = entry.value();
+            if let Some(delay) = status.next_retry_at.checked_duration_since(now) {
+                blockers.push(ReadinessBlocker {
+                    adapter: "whirlpool",
+                    pool: *entry.key(),
+                    kind: ReadinessBlockerKind::PoolMeta,
+                    tick_start: None,
+                    failures: status.failures,
+                    retry_in: delay,
+                });
+            }
+        }
+        for entry in self.tick_failures.iter() {
+            let status = entry.value();
+            if let Some(delay) = status.next_retry_at.checked_duration_since(now) {
+                blockers.push(ReadinessBlocker {
+                    adapter: "whirlpool",
+                    pool: entry.key().0,
+                    kind: ReadinessBlockerKind::TickArray,
+                    tick_start: Some(entry.key().1),
+                    failures: status.failures,
+                    retry_in: delay,
+                });
+            }
+        }
+        blockers
     }
 
     fn hydrate_tick_array_window(
@@ -970,6 +1161,20 @@ impl WhirlpoolPoolHydrator {
         expected_start: Option<i32>,
         address: Pubkey,
     ) -> Option<HydratedTickArray> {
+        if let Some(start) = expected_start {
+            if let Some(wait) = self.tick_backoff_delay(pool, start) {
+                trace!(
+                    target = "adapter::whirlpool",
+                    pool = %pool,
+                    start = start,
+                    wait_ms = wait.as_millis(),
+                    "tick array fetch backoff active"
+                );
+                return None;
+            }
+        }
+
+        let mut last_error: Option<TickArrayFetchError> = None;
         for client in self.clients.as_ref() {
             match client.get_account(&address) {
                 Ok(account) => {
@@ -987,28 +1192,108 @@ impl WhirlpoolPoolHydrator {
                         }
                         let key = (pool, array.start_tick_index);
                         self.tick_array_cache.insert(key, array.clone());
+                        if let Some(expected) = expected_start {
+                            self.clear_tick_failure(pool, expected);
+                        }
                         return Some(array);
                     } else {
-                        warn!(
-                            target = "adapter::whirlpool",
-                            pool = %pool,
-                            start = expected_start.unwrap_or_default(),
-                            "unexpected whirlpool tick array layout"
-                        );
+                        last_error = Some(TickArrayFetchError::UnexpectedLayout);
+                        break;
                     }
                 }
                 Err(error) => {
-                    warn!(
-                        target = "adapter::whirlpool",
-                        pool = %pool,
-                        start = expected_start.unwrap_or_default(),
-                        %error,
-                        "failed to fetch whirlpool tick array"
-                    );
+                    last_error = Some(classify_tick_array_error(&error));
                 }
             }
         }
+
+        if let Some(start) = expected_start {
+            let error = last_error.unwrap_or(TickArrayFetchError::AccountNotFound);
+            let failures = self.record_tick_failure(pool, start);
+            self.log_tick_fetch_error(pool, start, &address, &error, failures);
+        } else if let Some(error) = last_error {
+            warn!(
+                target = "adapter::whirlpool",
+                pool = %pool,
+                %address,
+                error = %error,
+                "failed to fetch whirlpool tick array"
+            );
+        }
+
         None
+    }
+
+    fn log_tick_fetch_error(
+        &self,
+        pool: Pubkey,
+        start_tick_index: i32,
+        address: &Pubkey,
+        error: &TickArrayFetchError,
+        failures: u32,
+    ) {
+        if failures == 1 {
+            warn!(
+                target = "adapter::whirlpool",
+                pool = %pool,
+                start = start_tick_index,
+                %address,
+                error = %error,
+                "failed to fetch whirlpool tick array"
+            );
+        } else {
+            debug!(
+                target = "adapter::whirlpool",
+                pool = %pool,
+                start = start_tick_index,
+                %address,
+                error = %error,
+                failures,
+                "tick array fetch still failing"
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TickArrayFetchError {
+    AccountNotFound,
+    UnexpectedLayout,
+    Rpc(String),
+}
+
+impl fmt::Display for TickArrayFetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TickArrayFetchError::AccountNotFound => write!(f, "account not found"),
+            TickArrayFetchError::UnexpectedLayout => write!(f, "unexpected account layout"),
+            TickArrayFetchError::Rpc(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FetchError {
+    AccountNotFound,
+    InvalidLayout(&'static str),
+    Rpc(String),
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FetchError::AccountNotFound => write!(f, "account not found"),
+            FetchError::InvalidLayout(entity) => write!(f, "unexpected {entity} layout"),
+            FetchError::Rpc(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+fn classify_tick_array_error(error: &ClientError) -> TickArrayFetchError {
+    if is_account_not_found(error) {
+        TickArrayFetchError::AccountNotFound
+    } else {
+        TickArrayFetchError::Rpc(error.to_string())
     }
 }
 
@@ -1016,32 +1301,51 @@ fn fetch_whirlpool_meta(
     program_id: Pubkey,
     clients: &[Arc<RpcClient>],
     pool: Pubkey,
-) -> Option<HydratedPoolMeta> {
+) -> Result<HydratedPoolMeta, FetchError> {
+    let mut last_error: Option<FetchError> = None;
     for client in clients {
         match client.get_account(&pool) {
             Ok(account) => {
                 if let Some(meta) = parse_whirlpool_account(pool, &program_id, &account.data) {
-                    return Some(meta);
+                    return Ok(meta);
                 } else {
-                    warn!(
-                        target = "adapter::whirlpool",
-                        pool = %pool,
-                        "unexpected whirlpool pool account layout"
-                    );
+                    return Err(FetchError::InvalidLayout("whirlpool pool account"));
                 }
             }
             Err(error) => {
-                warn!(
-                    target = "adapter::whirlpool",
-                    pool = %pool,
-                    %error,
-                    "failed to fetch whirlpool pool account"
-                );
+                if is_account_not_found(&error) {
+                    last_error = Some(FetchError::AccountNotFound);
+                } else {
+                    last_error = Some(FetchError::Rpc(error.to_string()));
+                }
             }
         }
     }
 
-    None
+    Err(last_error.unwrap_or(FetchError::AccountNotFound))
+}
+
+fn is_account_not_found(error: &ClientError) -> bool {
+    error.to_string().contains("AccountNotFound")
+}
+
+fn log_pool_fetch_error(pool: Pubkey, error: &FetchError, failures: u32) {
+    if failures == 1 {
+        warn!(
+            target = "adapter::whirlpool",
+            pool = %pool,
+            error = %error,
+            "failed to hydrate whirlpool pool account"
+        );
+    } else {
+        debug!(
+            target = "adapter::whirlpool",
+            pool = %pool,
+            error = %error,
+            failures,
+            "whirlpool pool hydration still failing"
+        );
+    }
 }
 
 struct WhirlpoolTickArrayCursor<'a> {
@@ -2237,7 +2541,7 @@ mod tests {
             direction: SwapDirection::ExactIn,
         };
 
-        assert!(simulate_constant_liquidity_exact_in(&state, &req).is_none());
+        assert!(simulate_constant_liquidity_exact_in(&state, &req).is_err());
     }
 
     #[test]

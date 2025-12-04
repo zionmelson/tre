@@ -72,6 +72,12 @@ Environment variables:
 - `TRE_DRY_RUN_MODE`: set to `true` to keep the planner hot while discarding bundle submissions (the `--dry-run` script flag toggles this automatically).
 - `alerts.webhook_url`: optional HTTPS endpoint that receives JSON bundle/arbitrage lifecycle events; pair with `alerts.environment` to tag messages by deployment.
 
+### ALT Reuse & Testing
+
+- `alt_manager.create_onchain` (in `config.json`) gates whether the ALT manager actually creates or extends lookup tables on Solana. Set it to `false` for dry runs so handles are allocated only from the local `alt_registry.json` snapshot—no SOL burned.
+- `alt_manager.max_tables_per_pool` enforces how many lookup tables we keep per pool in the registry. The default of `1` guarantees we never juggle multiple LUTs for the same pool between runs.
+- Seed `alt_registry.json` with the LUTs you care about (one per pool) when running with `create_onchain=false`. Any entry marked `Ready` with at least one table will be treated as reusable; entries missing a table will log a warning until you update the snapshot or re-enable on-chain creation.
+
 Submission tracking knobs live under the `submission` section of `config.json`. Use the checked-in file as the canonical reference, copy it for each deployment, and swap any sensitive values with `$ENV{VAR}` placeholders so secrets stay outside of version control.
 
 ## Bundle Payload Re-Signing

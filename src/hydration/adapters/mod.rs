@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
 pub use crate::hydration::types::QuoteStatus;
@@ -44,6 +46,49 @@ pub trait ProtocolAdapter: Send + Sync {
     }
 
     fn enrich_snapshot(&self, _snapshot: &mut PoolSnapshot) {}
+
+    fn readiness_blockers(&self) -> AdapterReadiness {
+        AdapterReadiness::default()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdapterReadiness {
+    pub blockers: Vec<ReadinessBlocker>,
+}
+
+impl AdapterReadiness {
+    pub fn is_empty(&self) -> bool {
+        self.blockers.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.blockers.len()
+    }
+
+    pub fn extend(&mut self, other: AdapterReadiness) {
+        self.blockers.extend(other.blockers);
+    }
+
+    pub fn samples(&self, limit: usize) -> Vec<ReadinessBlocker> {
+        self.blockers.iter().take(limit).copied().collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessBlockerKind {
+    PoolMeta,
+    TickArray,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReadinessBlocker {
+    pub adapter: &'static str,
+    pub pool: Pubkey,
+    pub kind: ReadinessBlockerKind,
+    pub tick_start: Option<i32>,
+    pub failures: u32,
+    pub retry_in: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

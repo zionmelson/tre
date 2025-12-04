@@ -3,13 +3,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use solana_sdk::pubkey::Pubkey;
+use tracing::info;
 
 use crate::builder::BuilderHandle;
 use crate::config::AppConfig;
 use crate::hydration::adapters::{
-    CpAmmAdapter, CpAmmAdapterConfig, LbClmmAdapter, LbClmmAdapterConfig, ProtocolAdapter,
-    QuoteRequest, QuoteResponse, RaydiumV3Adapter, RaydiumV3AdapterConfig, SwapDirection,
-    WhirlpoolAdapter, WhirlpoolAdapterConfig,
+    AdapterReadiness, CpAmmAdapter, CpAmmAdapterConfig, LbClmmAdapter, LbClmmAdapterConfig,
+    ProtocolAdapter, QuoteRequest, QuoteResponse, RaydiumV3Adapter, RaydiumV3AdapterConfig,
+    SwapDirection, WhirlpoolAdapter, WhirlpoolAdapterConfig,
 };
 use crate::hydration::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate, TradeUpdate};
 
@@ -25,33 +26,68 @@ impl AdapterBook {
         let mut adapters: HashMap<String, Arc<dyn ProtocolAdapter>> = HashMap::new();
         let mut strict_price_programs: HashSet<String> = HashSet::new();
 
-        register_adapter(
-            &mut adapters,
-            Arc::new(RaydiumV3Adapter::new(
-                raydium_config(config.as_ref()),
-                Some(builder.clone()),
-            )),
-        );
-        register_adapter(
-            &mut adapters,
-            Arc::new(CpAmmAdapter::new(
-                cp_amm_config(config.as_ref()),
-                Some(builder.clone()),
-            )),
-        );
-        register_adapter(
-            &mut adapters,
-            Arc::new(LbClmmAdapter::new(
-                lb_clmm_config(config.as_ref()),
-                Some(builder.clone()),
-            )),
-        );
-        let whirlpool_adapter = Arc::new(WhirlpoolAdapter::new(
-            whirlpool_config(config.as_ref()),
-            Some(builder),
-        ));
-        strict_price_programs.insert(whirlpool_adapter.program_id().to_string());
-        register_adapter(&mut adapters, whirlpool_adapter);
+        if config.protocol_enabled("raydium_v3") {
+            register_adapter(
+                &mut adapters,
+                Arc::new(RaydiumV3Adapter::new(
+                    raydium_config(config.as_ref()),
+                    Some(builder.clone()),
+                )),
+            );
+        } else {
+            info!(
+                target = "adapter_book",
+                protocol = "raydium_v3",
+                "protocol disabled; skipping adapter registration"
+            );
+        }
+
+        if config.protocol_enabled("cp_amm") {
+            register_adapter(
+                &mut adapters,
+                Arc::new(CpAmmAdapter::new(
+                    cp_amm_config(config.as_ref()),
+                    Some(builder.clone()),
+                )),
+            );
+        } else {
+            info!(
+                target = "adapter_book",
+                protocol = "cp_amm",
+                "protocol disabled; skipping adapter registration"
+            );
+        }
+
+        if config.protocol_enabled("lb_clmm") {
+            register_adapter(
+                &mut adapters,
+                Arc::new(LbClmmAdapter::new(
+                    lb_clmm_config(config.as_ref()),
+                    Some(builder.clone()),
+                )),
+            );
+        } else {
+            info!(
+                target = "adapter_book",
+                protocol = "lb_clmm",
+                "protocol disabled; skipping adapter registration"
+            );
+        }
+
+        if config.protocol_enabled("whirlpool") {
+            let whirlpool_adapter = Arc::new(WhirlpoolAdapter::new(
+                whirlpool_config(config.as_ref()),
+                Some(builder),
+            ));
+            strict_price_programs.insert(whirlpool_adapter.program_id().to_string());
+            register_adapter(&mut adapters, whirlpool_adapter);
+        } else {
+            info!(
+                target = "adapter_book",
+                protocol = "whirlpool",
+                "protocol disabled; skipping adapter registration"
+            );
+        }
 
         Self {
             adapters,
@@ -101,6 +137,14 @@ impl AdapterBook {
     pub fn requires_authoritative_quotes(&self, program_id: &str) -> bool {
         self.strict_price_programs.contains(program_id)
     }
+
+    pub fn readiness_diagnostics(&self) -> AdapterReadiness {
+        let mut summary = AdapterReadiness::default();
+        for adapter in self.adapters.values() {
+            summary.extend(adapter.readiness_blockers());
+        }
+        summary
+    }
 }
 
 fn register_adapter(
@@ -146,6 +190,9 @@ fn lb_clmm_config(config: &AppConfig) -> LbClmmAdapterConfig {
     if let Some(util_bps) = config.protocol_max_utilization_bps("lb_clmm") {
         adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
     }
+    if let Some(guard_bps) = config.protocol_price_impact_guard_bps("lb_clmm") {
+        adapter_config.max_price_impact_bps = guard_bps.max(1u16);
+    }
     adapter_config
 }
 
@@ -159,6 +206,18 @@ fn whirlpool_config(config: &AppConfig) -> WhirlpoolAdapterConfig {
     }
     if let Some(util_bps) = config.protocol_max_utilization_bps("whirlpool") {
         adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
+    }
+    if let Some(backoff_ms) = config.protocol_pool_backoff_ms("whirlpool") {
+        adapter_config.pool_failure_backoff_ms = backoff_ms.max(1);
+    }
+    if let Some(backoff_ms) = config.protocol_tick_array_backoff_ms("whirlpool") {
+        adapter_config.tick_array_backoff_ms = backoff_ms.max(1);
+    }
+    if let Some(max_failures) = config.protocol_max_pool_failures("whirlpool") {
+        adapter_config.max_pool_failures = max_failures.max(1);
+    }
+    if let Some(max_failures) = config.protocol_max_tick_array_failures("whirlpool") {
+        adapter_config.max_tick_array_failures = max_failures.max(1);
     }
     adapter_config
 }

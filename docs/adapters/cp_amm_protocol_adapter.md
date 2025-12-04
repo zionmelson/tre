@@ -61,7 +61,15 @@ Any upstream change in those files should be reflected here and in `docs/swaps/c
 - Convert desired output to “fee-included” units, run `Pool::get_swap_result_from_exact_output`, then ensure the required input (after adding token-program transfer fees) is ≤ `maximum_amount_in`.
 
 6. **Fees** – `FeeMode::get_fee_mode` selects protocol/LP/referral fee configuration per direction. `Pool::apply_swap_result` mutates reserves; our adapter mirrors this in simulation so `vault_a/b_balance` stay aligned.
-7. **Edge calculation** – Mid-price = `vault_b / vault_a` (direction-aware). Compare to execution price to populate `edge_bps`.
+7. **Edge calculation** – Mid-price comes from the hydrated CLMM state, not raw vault ratios. Convert `sqrt_price_x64` (already cached in `CpAmmState`) to an f64, square it, then adjust for the mint decimal delta:
+
+```
+let sqrt_price = sqrt_price_x64 as f64 / 2_f64.powi(64);
+let decimals_adjustment = 10_f64.powi((token_b_decimals as i32) - (token_a_decimals as i32));
+let mid_price = (sqrt_price * sqrt_price) * decimals_adjustment;
+```
+
+This mirrors `Pool::get_price()` in Meteora’s program and stays accurate even when most liquidity sits outside the active band. The vault-balance ratio (`vault_b / vault_a`) is only a reasonable proxy when liquidity is entirely in-range; note that explicitly so downstream consumers treat it as a diagnostic value rather than a pricing source. Compare the CLMM-derived mid-price to the execution price to populate `edge_bps`.
 
 ## Template Generation
 

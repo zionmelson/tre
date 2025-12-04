@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,7 @@ pub struct PoolState {
     pub quote_liquidity: u128,
     pub price: f64,
     pub snapshot: PoolSnapshot,
+    pub ready: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +55,7 @@ pub struct PoolStore {
     ready_state: Mutex<bool>,
     ready_notify: Condvar,
     drop_policy: QueueDropPolicy,
+    ready_count: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -95,6 +97,7 @@ impl PoolStore {
             ready_state: Mutex::new(ready_target == 0),
             ready_notify: Condvar::new(),
             drop_policy,
+            ready_count: AtomicUsize::new(0),
         }
     }
 
@@ -113,7 +116,7 @@ impl PoolStore {
         rx
     }
 
-    pub fn update(&self, snapshot: PoolSnapshot) -> PoolStateUpdate {
+    pub fn update(&self, snapshot: PoolSnapshot, ready: bool) -> PoolStateUpdate {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let last_updated = Instant::now();
         let pool_id = snapshot.pool_id.clone();
@@ -136,6 +139,12 @@ impl PoolStore {
                 }
             })
             .unwrap_or(0.0);
+        let previous_ready = self
+            .inner
+            .get(&pool_id)
+            .map(|entry| entry.value().ready)
+            .unwrap_or(false);
+        let effective_ready = ready || previous_ready;
         let state = PoolState {
             pool_id: pool_id.clone(),
             program_id: program_id.clone(),
@@ -148,6 +157,7 @@ impl PoolStore {
             quote_liquidity: snapshot.quote_post_amount,
             price,
             snapshot: snapshot.clone(),
+            ready: effective_ready,
         };
         telemetry::record_hydration_pool_snapshot(
             &program_id,
@@ -159,9 +169,14 @@ impl PoolStore {
             snapshot.base_post_amount,
             snapshot.quote_post_amount,
         );
-        self.inner.insert(pool_id.clone(), state);
+        if let Some(previous) = self.inner.insert(pool_id.clone(), state) {
+            self.update_ready_count(previous.ready, effective_ready);
+        } else if effective_ready {
+            self.ready_count.fetch_add(1, Ordering::Relaxed);
+        }
         self.maybe_notify_ready();
         self.prune_if_needed();
+        self.emit_pool_counts();
         let update = PoolStateUpdate {
             pool_id,
             program_id,
@@ -211,6 +226,9 @@ impl PoolStore {
         let mut removed = 0usize;
         for pool_id in stale_ids {
             if let Some((_, state)) = self.inner.remove(&pool_id) {
+                if state.ready {
+                    self.ready_count.fetch_sub(1, Ordering::Relaxed);
+                }
                 removed += 1;
                 let update = PoolStateUpdate {
                     pool_id: state.pool_id.clone(),
@@ -224,6 +242,9 @@ impl PoolStore {
                 };
                 self.broadcast_update(&update);
             }
+        }
+        if removed > 0 {
+            self.emit_pool_counts();
         }
         removed
     }
@@ -257,6 +278,10 @@ impl PoolStore {
             entry.snapshot.freshness = SnapshotFreshness::Stale;
             let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
             entry.generation = generation;
+            if entry.ready {
+                entry.ready = false;
+                self.ready_count.fetch_sub(1, Ordering::Relaxed);
+            }
             PoolStateUpdate {
                 pool_id: entry.pool_id.clone(),
                 program_id: entry.program_id.clone(),
@@ -269,6 +294,7 @@ impl PoolStore {
             }
         };
         self.broadcast_update(&update);
+        self.emit_pool_counts();
         true
     }
 
@@ -284,7 +310,11 @@ impl PoolStore {
                 .map(|entry| entry.key().clone());
             match victim {
                 Some(key) => {
-                    self.inner.remove(&key);
+                    if let Some((_, state)) = self.inner.remove(&key) {
+                        if state.ready {
+                            self.ready_count.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
                 }
                 None => break,
             }
@@ -327,11 +357,15 @@ impl PoolStore {
         self.inner.len()
     }
 
+    pub fn ready_len(&self) -> usize {
+        self.ready_count.load(Ordering::Relaxed)
+    }
+
     fn maybe_notify_ready(&self) {
         if self.ready_target == 0 {
             return;
         }
-        if self.len() < self.ready_target {
+        if self.ready_len() < self.ready_target {
             return;
         }
         let mut ready = self.ready_state.lock().expect("ready mutex poisoned");
@@ -340,6 +374,22 @@ impl PoolStore {
         }
         *ready = true;
         self.ready_notify.notify_all();
+    }
+
+    fn update_ready_count(&self, previous: bool, current: bool) {
+        match (previous, current) {
+            (false, true) => {
+                self.ready_count.fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                self.ready_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_pool_counts(&self) {
+        telemetry::record_hydration_pool_counts(self.ready_len(), self.len());
     }
 }
 
@@ -389,7 +439,7 @@ mod tests {
     fn update_preserves_snapshot_freshness() {
         let store = PoolStore::new();
         let snapshot = snapshot_with_freshness(SnapshotFreshness::RpcRefresh);
-        store.update(snapshot.clone());
+        store.update(snapshot.clone(), false);
 
         let state = store.latest(&snapshot.pool_id).expect("pool state");
         assert!(matches!(
@@ -402,7 +452,7 @@ mod tests {
     fn stale_mark_prevents_repeated_collection() {
         let store = PoolStore::new();
         let snapshot = snapshot_with_freshness(SnapshotFreshness::LiveCorecast);
-        store.update(snapshot.clone());
+        store.update(snapshot.clone(), false);
 
         std::thread::sleep(Duration::from_millis(2));
 
@@ -413,5 +463,24 @@ mod tests {
 
         let remaining = store.collect_stale(Duration::from_millis(1));
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn ready_count_tracks_transitions() {
+        let store = PoolStore::with_limits(usize::MAX, 0);
+        let mut snapshot = snapshot_with_freshness(SnapshotFreshness::LiveCorecast);
+        snapshot.pool_id = "ready_pool".to_string();
+
+        store.update(snapshot.clone(), true);
+        assert_eq!(store.ready_len(), 1);
+
+        store.update(snapshot.clone(), false);
+        assert_eq!(store.ready_len(), 0);
+
+        store.update(snapshot, true);
+        assert_eq!(store.ready_len(), 1);
+
+        assert!(store.mark_snapshot_stale("ready_pool"));
+        assert_eq!(store.ready_len(), 0);
     }
 }

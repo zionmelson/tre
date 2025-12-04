@@ -47,6 +47,9 @@ struct TelemetryState {
     hydration_template_cache_entries: Gauge,
     hydration_alt_ready_tables: Gauge,
     hydration_flash_routes_prepared: Gauge,
+    hydration_ready_pools: Gauge,
+    hydration_tracked_pools: Gauge,
+    hydration_heartbeat_unix_ms: Gauge,
     hydration_adapter_ingest: Family<HydrationAdapterLabels, Counter>,
     hydration_rpc_refresh_success: Family<HydrationAdapterLabels, Counter>,
     hydration_rpc_refresh_failure: Family<HydrationAdapterLabels, Counter>,
@@ -193,6 +196,27 @@ impl TelemetryState {
             "hydration_flash_routes_prepared",
             "Flash-loan routes currently pre-built by the hydration service",
             hydration_flash_routes_prepared.clone(),
+        );
+
+        let hydration_ready_pools = Gauge::default();
+        registry.register(
+            "hydration_ready_pools",
+            "Count of pools that are fully hydrated with templates/ALTs tick arrays",
+            hydration_ready_pools.clone(),
+        );
+
+        let hydration_tracked_pools = Gauge::default();
+        registry.register(
+            "hydration_tracked_pools",
+            "Total pools currently tracked by the watcher",
+            hydration_tracked_pools.clone(),
+        );
+
+        let hydration_heartbeat_unix_ms = Gauge::default();
+        registry.register(
+            "hydration_heartbeat_unix_ms",
+            "Unix timestamp (ms) of the last live hydration snapshot",
+            hydration_heartbeat_unix_ms.clone(),
         );
 
         let hydration_adapter_ingest = Family::default();
@@ -383,6 +407,9 @@ impl TelemetryState {
             hydration_template_cache_entries,
             hydration_alt_ready_tables,
             hydration_flash_routes_prepared,
+            hydration_ready_pools,
+            hydration_tracked_pools,
+            hydration_heartbeat_unix_ms,
             hydration_adapter_ingest,
             hydration_rpc_refresh_success,
             hydration_rpc_refresh_failure,
@@ -769,6 +796,25 @@ pub fn record_hydration_flash_routes(prepared_routes: u64) {
         state
             .hydration_flash_routes_prepared
             .set(clamp_u64_to_i64(prepared_routes));
+    }
+}
+
+pub fn record_hydration_pool_counts(ready_pools: usize, tracked_pools: usize) {
+    if let Some(state) = TELEMETRY.get() {
+        state
+            .hydration_ready_pools
+            .set(clamp_u64_to_i64(ready_pools as u64));
+        state
+            .hydration_tracked_pools
+            .set(clamp_u64_to_i64(tracked_pools as u64));
+    }
+}
+
+pub fn record_hydration_heartbeat(unix_ms: u64) {
+    if let Some(state) = TELEMETRY.get() {
+        state
+            .hydration_heartbeat_unix_ms
+            .set(clamp_u64_to_i64(unix_ms));
     }
 }
 

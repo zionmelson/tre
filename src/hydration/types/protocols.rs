@@ -918,8 +918,7 @@ mod whirlpool {
 pub(crate) mod test_utils {
     use super::*;
     use crate::proto::solana_messages::{
-        Currency, DexInfo, DexMarket, ParsedIdlInstruction, PoolLiquidityChangeEvent, PoolSide,
-        Program, TokenInfo,
+        Currency, DexInfo, DexMarket, ParsedIdlInstruction, PoolSide, Program, TokenInfo,
     };
 
     pub fn proto_account(address: &Pubkey) -> ProtoAccount {

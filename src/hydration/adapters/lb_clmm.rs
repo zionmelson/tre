@@ -57,6 +57,12 @@ const DEFAULT_LB_CLMM_HYDRATION_RETRY_MS: u64 = 60_000;
 const TARGETED_BIN_ARRAY_RADIUS: i64 = 4;
 const BIN_WINDOW_EDGE_BUFFER_BINS: i32 = MAX_BIN_PER_ARRAY * 2;
 const DEFAULT_MAX_BIN_WALK: usize = 800;
+const DEFAULT_MAX_PRICE_IMPACT_BPS: u16 = 500;
+const HOST_FEE_SHARE_BPS: u64 = 2_000;
+const BIN_ARRAY_BITMAP_SIZE_I32: i32 = 1024;
+const DEFAULT_BITMAP_WORDS: usize = 16; // 1024 bits
+const BITMAP_SEGMENT_WORDS: usize = 8; // 512 bits
+const BITMAP_SEGMENT_BYTES: usize = BITMAP_SEGMENT_WORDS * 8;
 const Q64_SCALE_OFFSET: u32 = 64;
 const Q64_ONE: u128 = 1u128 << Q64_SCALE_OFFSET;
 const MAX_Q64_EXPONENT: u32 = 0x80000;
@@ -82,6 +88,7 @@ pub struct LbClmmAdapterConfig {
     pub hydration_retry_ms: u64,
     pub max_swap_utilization_bps: u64,
     pub max_bin_walk: usize,
+    pub max_price_impact_bps: u16,
 }
 
 impl Default for LbClmmAdapterConfig {
@@ -95,6 +102,7 @@ impl Default for LbClmmAdapterConfig {
             hydration_retry_ms: DEFAULT_LB_CLMM_HYDRATION_RETRY_MS,
             max_swap_utilization_bps: LB_CLMM_INPUT_UTILIZATION_BPS,
             max_bin_walk: DEFAULT_MAX_BIN_WALK,
+            max_price_impact_bps: DEFAULT_MAX_PRICE_IMPACT_BPS,
         }
     }
 }
@@ -186,6 +194,11 @@ impl LbClmmAdapter {
             return;
         };
 
+        let mut active_bitmap = extras.active_bitmap.clone().map(LbClmmBinBitmap::from);
+        if let (Some(active_bin), Some(bitmap)) = (extras.active_bin_id, active_bitmap.as_mut()) {
+            bitmap.anchor_with_bin(active_bin);
+        }
+
         let state = LbClmmState {
             lb_pair: pool_pubkey,
             token_x_mint,
@@ -223,7 +236,7 @@ impl LbClmmAdapter {
             reserve_y_balance: extras.reserve_y_balance,
             volatility_bps: extras.volatility_bps,
             bin_liquidity: build_bin_liquidity_map(&extras),
-            active_bitmap: extras.active_bitmap.map(LbClmmBinBitmap::from),
+            active_bitmap,
             last_update_slot: update.slot,
             last_update_at: Instant::now(),
         };
@@ -245,7 +258,7 @@ impl LbClmmAdapter {
         let hydrator_ref = self.hydrator.as_ref();
         if !needs_hydration(&extras) {
             if let (Some(hydrator), Some(active_bin_id)) = (hydrator_ref, extras.active_bin_id) {
-                hydrator.ensure_active_window(pool, active_bin_id);
+                hydrator.ensure_window(pool, active_bin_id);
             }
             return extras;
         }
@@ -289,7 +302,7 @@ impl LbClmmAdapter {
         }
 
         if let Some(active_bin_id) = extras.active_bin_id {
-            hydrator.ensure_active_window(pool, active_bin_id);
+            hydrator.ensure_window(pool, active_bin_id);
         }
 
         extras
@@ -407,6 +420,15 @@ impl LbClmmAdapter {
         }
     }
 
+    fn refresh_window(&self, state: &LbClmmState, target_bin: Option<i32>) {
+        let Some(bin_id) = target_bin.or(state.active_bin_id) else {
+            return;
+        };
+        if let Some(hydrator) = self.hydrator.as_ref() {
+            hydrator.ensure_window(state.lb_pair, bin_id);
+        }
+    }
+
     fn clamp_request_amount(&self, state: &LbClmmState, req: &QuoteRequest) -> u64 {
         match state.resolve_reserves(&req.input_mint, &req.output_mint) {
             Some((reserve, _)) => {
@@ -443,55 +465,80 @@ impl LbClmmAdapter {
             direction: SwapDirection::ExactIn,
         };
 
-        let (expected_output, price_impact_bps) =
-            simulate_lb_clmm_exact_in(&self.config, state, &req)?;
         let fee_bps = state.taker_fee_bps();
         let template_fee_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
-        let effective_price = if probe_amount == 0 {
-            0.0
-        } else {
-            expected_output as f64 / probe_amount as f64
-        };
-
         let limit_price = state.active_bin_id.map(|id| id as i64);
-        let price_impact_limit_bps = Some(derive_price_impact_limit(
-            price_impact_bps,
-            state.volatility_bps,
-        ));
+        let mut ctx = TemplateContext::default();
+        ctx.compute_unit_limit = Some(LB_CLMM_DEFAULT_CU_LIMIT);
+        ctx.compute_unit_price = Some(LB_CLMM_DEFAULT_CU_PRICE);
+        if let Some(host_fee) = state.host_fee_account {
+            ctx.host_fee_account = Some(host_fee);
+        }
+        if let Some(extension) = state.bin_array_bitmap_extension {
+            ctx.remaining_accounts
+                .push(AccountMeta::new_readonly(extension, false));
+        }
+        self.decorate_swap_context(state, &mut ctx, input_mint, output_mint);
 
-        Some(PoolQuoteSide {
-            input_mint: input_mint.to_string(),
-            output_mint: output_mint.to_string(),
-            notional: probe_amount,
-            expected_output,
-            fee_bps,
-            template_fee_bps,
-            effective_price,
-            estimated_slippage_bps: price_impact_bps.abs(),
-            sqrt_price_limit: None,
-            min_output_amount: None,
-            limit_price,
-            price_impact_limit_bps,
-            context: {
-                let mut ctx = TemplateContext::default();
-                ctx.compute_unit_limit = Some(LB_CLMM_DEFAULT_CU_LIMIT);
-                ctx.compute_unit_price = Some(LB_CLMM_DEFAULT_CU_PRICE);
-                if let Some(host_fee) = state.host_fee_account {
-                    ctx.host_fee_account = Some(host_fee);
+        match simulate_lb_clmm_exact_in(&self.config, state, &req) {
+            Ok(simulation) => {
+                ctx.expected_fee_amount = Some(simulation.taker_fee_amount);
+                let effective_price = if probe_amount == 0 {
+                    0.0
+                } else {
+                    simulation.amount_out as f64 / probe_amount as f64
+                };
+                let price_impact_limit_bps = Some(derive_price_impact_limit(
+                    simulation.price_impact_bps,
+                    state.volatility_bps,
+                ));
+                Some(PoolQuoteSide {
+                    input_mint: input_mint.to_string(),
+                    output_mint: output_mint.to_string(),
+                    notional: probe_amount,
+                    expected_output: simulation.amount_out,
+                    fee_bps,
+                    template_fee_bps,
+                    effective_price,
+                    estimated_slippage_bps: simulation.price_impact_bps.abs(),
+                    sqrt_price_limit: None,
+                    min_output_amount: None,
+                    limit_price,
+                    price_impact_limit_bps,
+                    context: ctx,
+                    status: QuoteStatus::Ok,
+                    sqrt_price_before_x64: None,
+                    sqrt_price_after_x64: None,
+                    tick_arrays_used: Vec::new(),
+                    cache_slot: Some(slot),
+                })
+            }
+            Err(err) => {
+                if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
+                    self.refresh_window(state, err.missing_bin_id());
                 }
-                if let Some(extension) = state.bin_array_bitmap_extension {
-                    ctx.remaining_accounts
-                        .push(AccountMeta::new_readonly(extension, false));
-                }
-                self.decorate_swap_context(state, &mut ctx, input_mint, output_mint);
-                ctx
-            },
-            status: QuoteStatus::Ok,
-            sqrt_price_before_x64: None,
-            sqrt_price_after_x64: None,
-            tick_arrays_used: Vec::new(),
-            cache_slot: Some(slot),
-        })
+                Some(PoolQuoteSide {
+                    input_mint: input_mint.to_string(),
+                    output_mint: output_mint.to_string(),
+                    notional: probe_amount,
+                    expected_output: 0,
+                    fee_bps,
+                    template_fee_bps,
+                    effective_price: 0.0,
+                    estimated_slippage_bps: err.observed_slippage_bps(),
+                    sqrt_price_limit: None,
+                    min_output_amount: None,
+                    limit_price,
+                    price_impact_limit_bps: None,
+                    context: ctx,
+                    status: err.into(),
+                    sqrt_price_before_x64: None,
+                    sqrt_price_after_x64: None,
+                    tick_arrays_used: Vec::new(),
+                    cache_slot: Some(slot),
+                })
+            }
+        }
     }
 }
 
@@ -574,12 +621,23 @@ impl ProtocolAdapter for LbClmmAdapter {
             return None;
         }
         request.amount = capped;
-        let (amount_out, edge_bps) = simulate_lb_clmm_exact_in(&self.config, &state, &request)?;
-        let mut response = build_quote_response(request.clone(), amount_out);
-        response.edge_bps = edge_bps;
-        response.min_output_amount = Some(amount_out);
+        let simulation = match simulate_lb_clmm_exact_in(&self.config, &state, &request) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
+                    self.refresh_window(&state, err.missing_bin_id());
+                }
+                let mut response = build_quote_response(request, 0);
+                response.status = err.into();
+                return Some(response);
+            }
+        };
+        let mut response = build_quote_response(request.clone(), simulation.amount_out);
+        response.edge_bps = simulation.price_impact_bps;
+        response.min_output_amount = Some(simulation.amount_out);
         response.context.compute_unit_limit = Some(LB_CLMM_DEFAULT_CU_LIMIT);
         response.context.compute_unit_price = Some(LB_CLMM_DEFAULT_CU_PRICE);
+        response.context.expected_fee_amount = Some(simulation.taker_fee_amount);
         if let Some(host_fee) = state.host_fee_account {
             response.context.host_fee_account = Some(host_fee);
         }
@@ -746,6 +804,13 @@ impl LbClmmState {
         let volatility = self.volatility_bps.unwrap_or(0) as u64;
         dynamic.saturating_add(volatility).min(BPS_DENOMINATOR)
     }
+
+    fn bin_array_has_liquidity(&self, bin_id: i32) -> Option<bool> {
+        let bitmap = self.active_bitmap.as_ref()?;
+        let array_index = array_index_for_bin(bin_id);
+        let idx = i32::try_from(array_index).ok()?;
+        bitmap.bit(idx)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -757,17 +822,119 @@ pub struct LbClmmBinSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct LbClmmBinBitmap {
-    pub anchor_bin_id: i32,
-    pub bitmap: Vec<u8>,
+    anchor_bin_id: i32,
+    raw_bitmap: Vec<u8>,
+    default_bitmap: [u64; DEFAULT_BITMAP_WORDS],
+    negative_extension: Vec<[u64; BITMAP_SEGMENT_WORDS]>,
+    positive_extension: Vec<[u64; BITMAP_SEGMENT_WORDS]>,
 }
 
 impl From<LbClmmBitmapExtras> for LbClmmBinBitmap {
     fn from(value: LbClmmBitmapExtras) -> Self {
-        Self {
+        let mut bitmap = Self {
             anchor_bin_id: value.anchor_bin_id,
-            bitmap: value.bitmap,
+            raw_bitmap: value.bitmap,
+            default_bitmap: [0u64; DEFAULT_BITMAP_WORDS],
+            negative_extension: Vec::new(),
+            positive_extension: Vec::new(),
+        };
+        bitmap.rebuild_segments();
+        bitmap
+    }
+}
+
+impl LbClmmBinBitmap {
+    fn rebuild_segments(&mut self) {
+        self.default_bitmap = [0u64; DEFAULT_BITMAP_WORDS];
+        self.negative_extension.clear();
+        self.positive_extension.clear();
+
+        let default_bytes = DEFAULT_BITMAP_WORDS * 8;
+        for (idx, chunk) in self
+            .raw_bitmap
+            .get(0..default_bytes)
+            .unwrap_or(&[])
+            .chunks_exact(8)
+            .enumerate()
+        {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(chunk);
+            self.default_bitmap[idx] = u64::from_le_bytes(word);
+        }
+
+        if self.raw_bitmap.len() > default_bytes {
+            let remaining = &self.raw_bitmap[default_bytes..];
+            let half = remaining.len() / 2;
+            let (negative_bytes, positive_bytes) = remaining.split_at(half);
+            self.negative_extension = parse_extension_segments(negative_bytes);
+            self.positive_extension = parse_extension_segments(positive_bytes);
         }
     }
+
+    fn anchor_with_bin(&mut self, bin_id: i32) {
+        if let Ok(index) = i32::try_from(array_index_for_bin(bin_id)) {
+            self.anchor_bin_id = index;
+        }
+    }
+
+    fn bit(&self, array_index: i32) -> Option<bool> {
+        let relative = array_index - self.anchor_bin_id;
+        let half_window = BIN_ARRAY_BITMAP_SIZE_I32 / 2;
+        let segment_span = (BITMAP_SEGMENT_WORDS * 64) as i32;
+
+        if (-half_window..half_window).contains(&relative) {
+            let idx = (relative + half_window) as usize;
+            let word_idx = idx / 64;
+            let bit_idx = idx % 64;
+            return self
+                .default_bitmap
+                .get(word_idx)
+                .map(|word| (*word & (1u64 << bit_idx)) != 0);
+        }
+
+        if relative >= half_window {
+            let offset = relative - half_window;
+            let segment_idx = (offset / segment_span) as usize;
+            let within_segment = (offset % segment_span) as usize;
+            return self
+                .positive_extension
+                .get(segment_idx)
+                .and_then(|segment| bit_from_segment(segment, within_segment));
+        }
+
+        let offset = (-relative) - half_window;
+        if offset < 0 {
+            return None;
+        }
+        let segment_idx = (offset / segment_span) as usize;
+        let within_segment = (offset % segment_span) as usize;
+        self.negative_extension
+            .get(segment_idx)
+            .and_then(|segment| bit_from_segment(segment, within_segment))
+    }
+}
+
+fn bit_from_segment(segment: &[u64; BITMAP_SEGMENT_WORDS], bit_index: usize) -> Option<bool> {
+    let word_idx = bit_index / 64;
+    let within_word = bit_index % 64;
+    segment
+        .get(word_idx)
+        .map(|word| (*word & (1u64 << within_word)) != 0)
+}
+
+fn parse_extension_segments(bytes: &[u8]) -> Vec<[u64; BITMAP_SEGMENT_WORDS]> {
+    bytes
+        .chunks_exact(BITMAP_SEGMENT_BYTES)
+        .map(|chunk| {
+            let mut words = [0u64; BITMAP_SEGMENT_WORDS];
+            for (idx, word_bytes) in chunk.chunks_exact(8).enumerate() {
+                let mut word = [0u8; 8];
+                word.copy_from_slice(word_bytes);
+                words[idx] = u64::from_le_bytes(word);
+            }
+            words
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -808,70 +975,157 @@ struct BinSwapOutcome {
     bin_drained: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct LbClmmSimulationOutcome {
+    amount_out: u64,
+    price_impact_bps: f64,
+    taker_fee_amount: u64,
+    protocol_fee_amount: u64,
+    host_fee_amount: u64,
+    lp_fee_amount: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LbClmmSimulationError {
+    MissingState,
+    InsufficientLiquidity,
+    InsufficientBins { missing_bin_id: Option<i32> },
+    PriceImpactExceeded { observed_bps: f64 },
+}
+
+impl From<LbClmmSimulationError> for QuoteStatus {
+    fn from(value: LbClmmSimulationError) -> Self {
+        match value {
+            LbClmmSimulationError::MissingState => QuoteStatus::MissingState,
+            LbClmmSimulationError::InsufficientLiquidity => QuoteStatus::InsufficientLiquidity,
+            LbClmmSimulationError::InsufficientBins { .. } => QuoteStatus::InsufficientBins,
+            LbClmmSimulationError::PriceImpactExceeded { .. } => QuoteStatus::PriceImpactExceeded,
+        }
+    }
+}
+
+impl LbClmmSimulationError {
+    fn observed_slippage_bps(&self) -> f64 {
+        match self {
+            LbClmmSimulationError::PriceImpactExceeded { observed_bps } => observed_bps.abs(),
+            _ => 0.0,
+        }
+    }
+
+    fn missing_bin_id(&self) -> Option<i32> {
+        match self {
+            LbClmmSimulationError::InsufficientBins { missing_bin_id } => *missing_bin_id,
+            _ => None,
+        }
+    }
+}
+
 fn simulate_lb_clmm_exact_in(
     config: &LbClmmAdapterConfig,
     state: &LbClmmState,
     req: &QuoteRequest,
-) -> Option<(u64, f64)> {
+) -> Result<LbClmmSimulationOutcome, LbClmmSimulationError> {
     if req.amount == 0 {
-        return None;
+        return Err(LbClmmSimulationError::InsufficientLiquidity);
     }
 
     let swap_x_to_y = req.input_mint == state.token_x_mint;
     let fee_bps = state.taker_fee_bps();
     if fee_bps >= BPS_DENOMINATOR {
-        return None;
+        return Err(LbClmmSimulationError::MissingState);
     }
 
-    let bin_step = state.bin_step?;
-    let mut cursor = state.active_bin_id?;
+    let bin_step = state.bin_step.ok_or(LbClmmSimulationError::MissingState)?;
+    let active_bin = state
+        .active_bin_id
+        .ok_or(LbClmmSimulationError::MissingState)?;
+    if state.bin_liquidity.is_empty() {
+        return Err(LbClmmSimulationError::InsufficientBins {
+            missing_bin_id: Some(active_bin),
+        });
+    }
+
     let mut remaining_gross = u128::from(req.amount);
-    if remaining_gross == 0 {
-        return None;
-    }
-
     let mut total_out: u128 = 0;
     let mut total_net_in: u128 = 0;
-    let mut bins_walked = 0usize;
+    let mut total_fee_amount: u128 = 0;
     let mut last_price: Option<u128> = None;
+    let mut current_bin = active_bin;
+    let mut bins_wandered: usize = 0;
 
     while remaining_gross > 0 {
-        if bins_walked >= config.max_bin_walk {
-            break;
+        if bins_wandered >= config.max_bin_walk {
+            return Err(LbClmmSimulationError::InsufficientBins {
+                missing_bin_id: Some(current_bin),
+            });
         }
 
-        let snapshot = match state.bin_liquidity.get(&cursor) {
-            Some(entry) => entry,
-            None => break,
+        let snapshot = match state.bin_liquidity.get(&current_bin) {
+            Some(snapshot) => snapshot.clone(),
+            None => match state.bin_array_has_liquidity(current_bin) {
+                Some(true) => {
+                    return Err(LbClmmSimulationError::InsufficientBins {
+                        missing_bin_id: Some(current_bin),
+                    });
+                }
+                Some(false) => {
+                    bins_wandered += 1;
+                    current_bin = step_bin_id(current_bin, swap_x_to_y)
+                        .ok_or(LbClmmSimulationError::MissingState)?;
+                    continue;
+                }
+                None => {
+                    return Err(LbClmmSimulationError::InsufficientBins {
+                        missing_bin_id: Some(current_bin),
+                    });
+                }
+            },
         };
+
         let mut bin_state = LbClmmBinState::from_snapshot(&snapshot);
         if bin_state.available_out(swap_x_to_y) == 0 {
-            bins_walked += 1;
-            cursor = step_bin_id(cursor, swap_x_to_y)?;
+            bins_wandered += 1;
+            current_bin =
+                step_bin_id(current_bin, swap_x_to_y).ok_or(LbClmmSimulationError::MissingState)?;
             continue;
         }
 
-        let price = get_price_from_id(bin_state.bin_id, bin_step)?;
+        let price = get_price_from_id(bin_state.bin_id, bin_step)
+            .ok_or(LbClmmSimulationError::MissingState)?;
         last_price = Some(price);
         let outcome =
-            execute_bin_swap(&mut bin_state, price, remaining_gross, swap_x_to_y, fee_bps)?;
+            execute_bin_swap(&mut bin_state, price, remaining_gross, swap_x_to_y, fee_bps)
+                .ok_or(LbClmmSimulationError::InsufficientLiquidity)?;
         if outcome.amount_out == 0 || outcome.net_input == 0 {
             break;
         }
 
         total_out = total_out.saturating_add(outcome.amount_out);
         total_net_in = total_net_in.saturating_add(outcome.net_input);
+        total_fee_amount =
+            total_fee_amount.saturating_add(outcome.gross_input.saturating_sub(outcome.net_input));
         remaining_gross = remaining_gross.saturating_sub(outcome.gross_input);
-        bins_walked += 1;
 
-        if remaining_gross == 0 || !outcome.bin_drained {
+        bins_wandered += 1;
+        if remaining_gross == 0 {
             break;
         }
-        cursor = step_bin_id(cursor, swap_x_to_y)?;
+        if outcome.bin_drained {
+            current_bin =
+                step_bin_id(current_bin, swap_x_to_y).ok_or(LbClmmSimulationError::MissingState)?;
+            continue;
+        }
+        // Partial drain satisfied request; exit loop.
+        break;
+    }
+
+    if remaining_gross > 0 {
+        return Err(LbClmmSimulationError::InsufficientLiquidity);
     }
 
     if total_out == 0 || total_net_in == 0 {
-        return None;
+        return Err(LbClmmSimulationError::InsufficientLiquidity);
     }
 
     let trade_price = if swap_x_to_y {
@@ -880,12 +1134,37 @@ fn simulate_lb_clmm_exact_in(
         total_net_in as f64 / total_out as f64
     };
     if !trade_price.is_finite() || trade_price <= 0.0 {
-        return None;
+        return Err(LbClmmSimulationError::InsufficientLiquidity);
     }
 
-    let reference_price = reference_price_for_state(state, last_price)?;
+    let reference_price =
+        reference_price_for_state(state, last_price).ok_or(LbClmmSimulationError::MissingState)?;
     let price_impact_bps = compute_edge_bps(trade_price, reference_price);
-    Some((total_out.min(u64::MAX as u128) as u64, price_impact_bps))
+    if price_impact_bps.abs() > f64::from(config.max_price_impact_bps) {
+        return Err(LbClmmSimulationError::PriceImpactExceeded {
+            observed_bps: price_impact_bps,
+        });
+    }
+
+    let protocol_share_bps = state.protocol_fee_bps.unwrap_or(0) as u128;
+    let protocol_fee =
+        total_fee_amount.saturating_mul(protocol_share_bps) / (BPS_DENOMINATOR as u128);
+    let host_fee = if state.host_fee_account.is_some() {
+        protocol_fee.saturating_mul(HOST_FEE_SHARE_BPS as u128) / (BPS_DENOMINATOR as u128)
+    } else {
+        0
+    };
+    let lp_fee = total_fee_amount.saturating_sub(protocol_fee);
+    let net_protocol_fee = protocol_fee.saturating_sub(host_fee);
+
+    Ok(LbClmmSimulationOutcome {
+        amount_out: total_out.min(u64::MAX as u128) as u64,
+        price_impact_bps,
+        taker_fee_amount: total_fee_amount.min(u64::MAX as u128) as u64,
+        protocol_fee_amount: net_protocol_fee.min(u64::MAX as u128) as u64,
+        host_fee_amount: host_fee.min(u64::MAX as u128) as u64,
+        lp_fee_amount: lp_fee.min(u64::MAX as u128) as u64,
+    })
 }
 
 fn derive_price_impact_limit(slippage_bps: f64, volatility_bps: Option<u16>) -> u16 {
@@ -900,14 +1179,6 @@ fn derive_price_impact_limit(slippage_bps: f64, volatility_bps: Option<u16>) -> 
     let volatility = volatility_bps.unwrap_or(0) as u64;
     let total = base.saturating_add(volatility).saturating_add(headroom);
     total.min(u16::MAX as u64) as u16
-}
-
-fn step_bin_id(current: i32, swap_x_to_y: bool) -> Option<i32> {
-    if swap_x_to_y {
-        current.checked_add(1)
-    } else {
-        current.checked_sub(1)
-    }
 }
 
 fn execute_bin_swap(
@@ -1310,13 +1581,14 @@ impl LbClmmPoolHydrator {
         )
     }
 
-    fn ensure_active_window(&self, pool: Pubkey, active_bin_id: i32) {
+    fn ensure_window(&self, pool: Pubkey, target_bin_id: i32) {
         if self.extensions_pending.contains(&pool) {
             return;
         }
-        let desired = BinWindow::around(active_bin_id);
+        let desired = BinWindow::around(target_bin_id);
         if let Some(existing) = self.window_cache.get(&pool) {
-            if !existing.value().needs_refresh(active_bin_id) {
+            let entry = existing.value();
+            if entry.contains(target_bin_id) && !entry.needs_refresh(target_bin_id) {
                 return;
             }
         }
@@ -1841,6 +2113,14 @@ fn read_pubkey_bytes(data: &[u8], cursor: &mut usize) -> Option<Pubkey> {
     Some(Pubkey::new_from_array(bytes))
 }
 
+fn step_bin_id(current: i32, swap_x_to_y: bool) -> Option<i32> {
+    if swap_x_to_y {
+        current.checked_add(1)
+    } else {
+        current.checked_sub(1)
+    }
+}
+
 fn map_token_program_flag(flag: u8) -> Option<Pubkey> {
     match flag {
         0 => Some(*SPL_TOKEN_PROGRAM_PUBKEY),
@@ -1950,10 +2230,10 @@ mod tests {
         };
 
         let config = LbClmmAdapterConfig::default();
-        let (amount_out, edge_bps) =
+        let outcome =
             simulate_lb_clmm_exact_in(&config, &state, &req).expect("quote should be produced");
-        assert!(amount_out > 0 && amount_out < req.amount);
-        assert!(edge_bps.is_finite());
+        assert!(outcome.amount_out > 0 && outcome.amount_out < req.amount);
+        assert!(outcome.price_impact_bps.is_finite());
     }
 
     #[test]
@@ -1975,7 +2255,7 @@ mod tests {
             0,
             LbClmmBinSnapshot {
                 bin_id: 0,
-                liquidity_x: 50,
+                liquidity_x: 0,
                 liquidity_y: 500,
             },
         );
@@ -1983,7 +2263,7 @@ mod tests {
             -1,
             LbClmmBinSnapshot {
                 bin_id: -1,
-                liquidity_x: 100,
+                liquidity_x: 1_000_000,
                 liquidity_y: 500,
             },
         );
@@ -2012,9 +2292,10 @@ mod tests {
             last_update_at: Instant::now(),
         };
 
-        let config = LbClmmAdapterConfig::default();
+        let mut config = LbClmmAdapterConfig::default();
+        config.max_price_impact_bps = u16::MAX;
         let result = simulate_lb_clmm_exact_in(&config, &state, &req);
-        let (amount_out, _) = result.expect("quote produced");
+        let amount_out = result.expect("quote produced").amount_out;
         assert!(amount_out > 0, "should aggregate liquidity from lower bins");
     }
 
@@ -2087,6 +2368,24 @@ mod tests {
         assert_eq!(extras.bitmap.len(), BITMAP_EXTENSION_ACCOUNT_LEN - 32);
         assert_eq!(extras.bitmap[0], 0);
         assert_eq!(extras.bitmap[1], 1);
+    }
+
+    #[test]
+    fn bitmap_alignment_tracks_active_array() {
+        let word_idx = (BIN_ARRAY_BITMAP_SIZE_I32 / 2 / 64) as usize;
+        let byte_offset = word_idx * 8;
+        let mut bytes = vec![0u8; BIN_ARRAY_BITMAP_BYTES];
+        bytes[byte_offset] = 1; // mark anchor array occupied
+
+        let mut bitmap = LbClmmBinBitmap::from(LbClmmBitmapExtras {
+            anchor_bin_id: 0,
+            bitmap: bytes,
+        });
+        bitmap.anchor_with_bin(0);
+
+        let mut state = default_state();
+        state.active_bitmap = Some(bitmap);
+        assert_eq!(state.bin_array_has_liquidity(0), Some(true));
     }
 
     #[test]

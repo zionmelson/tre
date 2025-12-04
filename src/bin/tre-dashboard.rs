@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode};
@@ -17,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use ratatui::Frame;
 use ratatui::Terminal;
 use tokio::sync::{watch, Mutex};
@@ -37,6 +37,10 @@ const POOL_BASE_LIQUIDITY_METRIC: &str = "hydration_pool_base_liquidity";
 const POOL_QUOTE_LIQUIDITY_METRIC: &str = "hydration_pool_quote_liquidity";
 const POOL_PRICE_SCALE: f64 = 1_000_000.0;
 const MAX_METRIC_ROWS: usize = 32;
+const DEFAULT_READY_POOL_TARGET: usize = 32;
+const READY_POOLS_METRIC: &str = "hydration_ready_pools";
+const TRACKED_POOLS_METRIC: &str = "hydration_tracked_pools";
+const HYDRATION_HEARTBEAT_METRIC: &str = "hydration_heartbeat_unix_ms";
 
 #[derive(Clone)]
 struct DashboardState {
@@ -46,6 +50,10 @@ struct DashboardState {
     pools: Vec<PoolRow>,
     hydration_metrics: Vec<MetricRow>,
     watcher_metrics: Vec<MetricRow>,
+    ready_pools: Option<u64>,
+    tracked_pools: Option<u64>,
+    ready_pool_target: usize,
+    hydration_heartbeat_unix_ms: Option<u64>,
 }
 
 impl Default for DashboardState {
@@ -57,6 +65,10 @@ impl Default for DashboardState {
             pools: Vec::new(),
             hydration_metrics: Vec::new(),
             watcher_metrics: Vec::new(),
+            ready_pools: None,
+            tracked_pools: None,
+            ready_pool_target: DEFAULT_READY_POOL_TARGET,
+            hydration_heartbeat_unix_ms: None,
         }
     }
 }
@@ -322,7 +334,11 @@ async fn main() -> Result<()> {
     let mut resolver = Arc::new(SymbolResolver::default());
     match AppConfig::load(&config.config_path) {
         Ok(app_config) => {
+            let ready_target = app_config.watcher.min_ready_pools.max(1);
             let app_config = Arc::new(app_config);
+            store
+                .update(|state| state.ready_pool_target = ready_target)
+                .await;
             resolver = Arc::new(SymbolResolver::from_config(&app_config));
         }
         Err(err) => {
@@ -356,6 +372,9 @@ async fn run_metrics_scraper(config: DashboardConfig, store: DashboardStore) {
                         state.pools = snapshot.pools;
                         state.hydration_metrics = snapshot.hydration_metrics;
                         state.watcher_metrics = snapshot.watcher_metrics;
+                        state.ready_pools = snapshot.ready_pools;
+                        state.tracked_pools = snapshot.tracked_pools;
+                        state.hydration_heartbeat_unix_ms = snapshot.hydration_heartbeat_unix_ms;
                         state.metrics_url = metrics_url;
                         state.last_error = None;
                     })
@@ -376,6 +395,9 @@ struct MetricsSnapshot {
     hydration_metrics: Vec<MetricRow>,
     watcher_metrics: Vec<MetricRow>,
     pools: Vec<PoolRow>,
+    ready_pools: Option<u64>,
+    tracked_pools: Option<u64>,
+    hydration_heartbeat_unix_ms: Option<u64>,
 }
 
 async fn fetch_snapshot(client: &reqwest::Client, url: &str) -> Result<MetricsSnapshot> {
@@ -474,6 +496,9 @@ fn parse_metrics(body: &str) -> MetricsSnapshot {
     let mut pool_quote_liquidity: HashMap<PoolKey, f64> = HashMap::new();
     let mut hydration_metrics = Vec::new();
     let mut watcher_metrics = Vec::new();
+    let mut ready_pools = None;
+    let mut tracked_pools = None;
+    let mut hydration_heartbeat_unix_ms = None;
 
     for line in body.lines() {
         let trimmed = line.trim();
@@ -502,15 +527,30 @@ fn parse_metrics(body: &str) -> MetricsSnapshot {
                         pool_quote_liquidity.insert(key, sample.value);
                     }
                 }
-                _ => match categorize_metric(sample.name.as_str()) {
-                    Some(MetricCategory::Hydration) => {
-                        hydration_metrics.push(MetricRow::from_sample(&sample));
+                _ => {
+                    match sample.name.as_str() {
+                        READY_POOLS_METRIC => {
+                            ready_pools = Some(sample.value.max(0.0).floor() as u64);
+                        }
+                        TRACKED_POOLS_METRIC => {
+                            tracked_pools = Some(sample.value.max(0.0).floor() as u64);
+                        }
+                        HYDRATION_HEARTBEAT_METRIC => {
+                            hydration_heartbeat_unix_ms =
+                                Some(sample.value.max(0.0).floor() as u64);
+                        }
+                        _ => {}
                     }
-                    Some(MetricCategory::Watcher) => {
-                        watcher_metrics.push(MetricRow::from_sample(&sample));
+                    match categorize_metric(sample.name.as_str()) {
+                        Some(MetricCategory::Hydration) => {
+                            hydration_metrics.push(MetricRow::from_sample(&sample));
+                        }
+                        Some(MetricCategory::Watcher) => {
+                            watcher_metrics.push(MetricRow::from_sample(&sample));
+                        }
+                        None => {}
                     }
-                    None => {}
-                },
+                }
             }
         }
     }
@@ -529,6 +569,9 @@ fn parse_metrics(body: &str) -> MetricsSnapshot {
         hydration_metrics,
         watcher_metrics,
         pools,
+        ready_pools,
+        tracked_pools,
+        hydration_heartbeat_unix_ms,
     }
 }
 
@@ -635,9 +678,9 @@ fn sort_metric_rows(rows: &mut Vec<MetricRow>) {
 fn draw_ui(f: &mut Frame, state: &DashboardState, resolver: &SymbolResolver, ui_state: &UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+        .constraints([Constraint::Length(6), Constraint::Min(0)].as_ref())
         .split(f.size());
-    draw_tabs(f, chunks[0], ui_state.page);
+    draw_header(f, chunks[0], state, ui_state.page);
 
     match ui_state.page {
         DashboardPage::Metrics => draw_metrics_page(f, chunks[1], state),
@@ -855,6 +898,23 @@ fn draw_tokens_page(
     f.render_widget(table, inner);
 }
 
+fn draw_header(f: &mut Frame, area: Rect, state: &DashboardState, page: DashboardPage) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Length(3)].as_ref())
+        .split(area);
+
+    draw_tabs(f, rows[0], page);
+
+    let status_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
+        .split(rows[1]);
+
+    draw_hydration_gauge(f, status_chunks[0], state);
+    draw_heartbeat_indicator(f, status_chunks[1], state);
+}
+
 fn render_protocol_tables(
     f: &mut Frame,
     area: Rect,
@@ -1012,6 +1072,93 @@ fn draw_tabs(f: &mut Frame, area: Rect, page: DashboardPage) {
         .block(block);
 
     f.render_widget(tabs, area);
+}
+
+fn draw_hydration_gauge(f: &mut Frame, area: Rect, state: &DashboardState) {
+    let target_usize = state.ready_pool_target.max(1);
+    let target = target_usize as f64;
+    if let (Some(ready), Some(tracked)) = (state.ready_pools, state.tracked_pools) {
+        let ready_usize = ready as usize;
+        let ratio = (ready_usize as f64 / target).min(1.0);
+        let (emoji, color) = if ready_usize >= target_usize {
+            ("💹", Color::Green)
+        } else {
+            ("🫩", Color::Yellow)
+        };
+        let label_text = format!("{emoji} Fastlane Ready Pools");
+        let value_text = format!("{ready}/{target_usize} ready | {tracked} tracked");
+        let gauge = Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title(label_text))
+            .gauge_style(Style::default().fg(color))
+            .label(Span::raw(value_text))
+            .ratio(ratio);
+        f.render_widget(gauge, area);
+        return;
+    }
+
+    let hydrated = state.pools.iter().filter(|pool| pool.hydrated).count();
+    let ratio = (hydrated as f64 / target).min(1.0);
+    let (emoji, color) = if hydrated >= target_usize {
+        ("💹", Color::Green)
+    } else {
+        ("🫩", Color::Yellow)
+    };
+    let label_text = format!("{emoji} Hydrated Pools");
+    let value_text = format!("{hydrated}/{target_usize}");
+
+    let gauge = Gauge::default()
+        .block(Block::default().borders(Borders::ALL).title(label_text))
+        .gauge_style(Style::default().fg(color))
+        .label(Span::raw(value_text))
+        .ratio(ratio);
+
+    f.render_widget(gauge, area);
+}
+
+fn draw_heartbeat_indicator(f: &mut Frame, area: Rect, state: &DashboardState) {
+    let (text, color) = heartbeat_status(state);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Hydration heartbeat");
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(color))
+        .block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn heartbeat_status(state: &DashboardState) -> (String, Color) {
+    if let Some(heartbeat_ms) = state.hydration_heartbeat_unix_ms {
+        if let Some(now_ms) = current_unix_ms() {
+            let age_ms = now_ms.saturating_sub(heartbeat_ms);
+            let (label, color) = if age_ms <= 2_000 {
+                ("💓 live", Color::Green)
+            } else if age_ms <= 5_000 {
+                ("🟡 slow", Color::Yellow)
+            } else {
+                ("🪫 stalled", Color::Red)
+            };
+            let text = format!("{label} · {} ago", format_duration_brief(age_ms));
+            return (text, color);
+        }
+    }
+    ("listening for heartbeat".to_string(), Color::DarkGray)
+}
+
+fn current_unix_ms() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|dur| dur.as_millis() as u64)
+}
+
+fn format_duration_brief(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    }
 }
 
 fn protocol_label(program_id: &str) -> String {

@@ -55,6 +55,8 @@ pub struct AppConfig {
     pub pipeline: PipelineConfig,
     #[serde(default)]
     pub watcher: WatcherConfig,
+    #[serde(default)]
+    pub alt_manager: AltManagerConfig,
     #[serde(default, deserialize_with = "deserialize_optional_path")]
     pub bam_validator_csv: Option<PathBuf>,
     #[serde(skip)]
@@ -119,6 +121,13 @@ impl AppConfig {
         }
     }
 
+    pub fn protocol_enabled(&self, protocol: &str) -> bool {
+        self.protocols
+            .get(protocol)
+            .map(|entry| entry.enabled)
+            .unwrap_or(true)
+    }
+
     pub fn protocol_rpc_endpoints(&self, protocol: &str) -> Vec<String> {
         self.protocols
             .get(protocol)
@@ -137,6 +146,36 @@ impl AppConfig {
         self.protocols
             .get(protocol)
             .and_then(|entry| entry.max_utilization_bps)
+    }
+
+    pub fn protocol_price_impact_guard_bps(&self, protocol: &str) -> Option<u16> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.max_price_impact_bps)
+    }
+
+    pub fn protocol_pool_backoff_ms(&self, protocol: &str) -> Option<u64> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.pool_failure_backoff_ms)
+    }
+
+    pub fn protocol_tick_array_backoff_ms(&self, protocol: &str) -> Option<u64> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.tick_array_backoff_ms)
+    }
+
+    pub fn protocol_max_pool_failures(&self, protocol: &str) -> Option<u32> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.max_pool_failures)
+    }
+
+    pub fn protocol_max_tick_array_failures(&self, protocol: &str) -> Option<u32> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.max_tick_array_failures)
     }
 
     pub fn protocol_borrow_pct(&self, protocol: &str) -> f64 {
@@ -192,6 +231,10 @@ impl AppConfig {
         ensure!(
             !self.flash_loans.is_empty(),
             "flash_loans must contain at least one Solend reserve entry"
+        );
+        ensure!(
+            self.alt_manager.max_tables_per_pool > 0,
+            "alt_manager.max_tables_per_pool must be greater than zero"
         );
         Ok(())
     }
@@ -474,19 +517,35 @@ pub struct WatcherConfig {
     pub max_tracked_pools: usize,
     pub min_ready_pools: usize,
     pub initial_ready_timeout_ms: u64,
-    pub pool_stale_ttl_ms: u64,
+    pub pool_stale_ttl_ms: Option<u64>,
     pub pool_stale_sweep_ms: u64,
     pub queue_capacity: usize,
     pub queue_drop_policy: QueueDropPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AltManagerConfig {
+    pub create_onchain: bool,
+    pub max_tables_per_pool: usize,
+}
+
+impl Default for AltManagerConfig {
+    fn default() -> Self {
+        Self {
+            create_onchain: true,
+            max_tables_per_pool: 1,
+        }
+    }
 }
 
 impl Default for WatcherConfig {
     fn default() -> Self {
         Self {
             max_tracked_pools: 256,
-            min_ready_pools: 32,
+            min_ready_pools: 3,
             initial_ready_timeout_ms: 5_000,
-            pool_stale_ttl_ms: 250,
+            pool_stale_ttl_ms: None,
             pool_stale_sweep_ms: 250,
             queue_capacity: 1_024,
             queue_drop_policy: QueueDropPolicy::DropNewest,
@@ -519,8 +578,11 @@ pub struct SubmissionTrackingConfig {
     pub status_poll_timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ProtocolConfig {
+    #[serde(default = "ProtocolConfig::default_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub rpc_endpoints: Vec<String>,
     #[serde(default)]
@@ -528,7 +590,40 @@ pub struct ProtocolConfig {
     #[serde(default)]
     pub max_utilization_bps: Option<u64>,
     #[serde(default)]
+    pub max_price_impact_bps: Option<u16>,
+    #[serde(default)]
+    pub pool_failure_backoff_ms: Option<u64>,
+    #[serde(default)]
+    pub tick_array_backoff_ms: Option<u64>,
+    #[serde(default)]
+    pub max_pool_failures: Option<u32>,
+    #[serde(default)]
+    pub max_tick_array_failures: Option<u32>,
+    #[serde(default)]
     pub borrow_pct: Option<f64>,
+}
+
+impl ProtocolConfig {
+    fn default_enabled() -> bool {
+        true
+    }
+}
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rpc_endpoints: Vec::new(),
+            hydration_retry_ms: None,
+            max_utilization_bps: None,
+            max_price_impact_bps: None,
+            pool_failure_backoff_ms: None,
+            tick_array_backoff_ms: None,
+            max_pool_failures: None,
+            max_tick_array_failures: None,
+            borrow_pct: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

@@ -23,7 +23,7 @@ use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::hydration::template_cache::AltHandleId;
@@ -33,7 +33,6 @@ const ALT_REGISTRY_PATH_ENV: &str = "TRE_ALT_REGISTRY";
 const ALT_REGISTRY_DEFAULT_FILE: &str = "alt_registry.json";
 const MAX_ALT_ACCOUNTS: usize = 256;
 const ALT_EXTEND_CHUNK: usize = 32;
-const ALT_TABLE_HISTORY: usize = 2;
 const ALT_WORKER_BACKOFF_MS: u64 = 750;
 const ALT_WORKER_THREAD_NAME: &str = "alt_lookup_worker";
 const ALT_WORKER_MAX_THREADS: usize = 4;
@@ -54,6 +53,8 @@ struct AltManagerState {
     pending_jobs: AtomicU64,
     registry_path: PathBuf,
     persist_lock: Mutex<()>,
+    create_onchain: bool,
+    max_tables_per_pool: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +122,8 @@ impl AltManager {
 
         let (job_tx, job_rx) = unbounded();
         let registry_path = registry_file_path();
+        let create_onchain = config.alt_manager.create_onchain;
+        let max_tables_per_pool = config.alt_manager.max_tables_per_pool;
         let state = Arc::new(AltManagerState {
             refresh_count: AtomicU64::new(0),
             last_refresh_unix_ms: AtomicU64::new(now_millis()),
@@ -131,6 +134,8 @@ impl AltManager {
             pending_jobs: AtomicU64::new(0),
             registry_path,
             persist_lock: Mutex::new(()),
+            create_onchain,
+            max_tables_per_pool,
         });
 
         let restored_entries = match state.load_registry_from_disk() {
@@ -141,13 +146,23 @@ impl AltManager {
             }
         };
 
-        for (pool, handle) in restored_entries {
-            if let Err(err) = state.enqueue_job(AltJob::Ensure { pool, handle }) {
-                warn!(pool = %pool, error = ?err, "failed to requeue ALT ensure job after restore");
+        if state.create_onchain {
+            for (pool, handle) in &restored_entries {
+                if let Err(err) = state.enqueue_job(AltJob::Ensure {
+                    pool: *pool,
+                    handle: *handle,
+                }) {
+                    warn!(pool = %pool, error = ?err, "failed to requeue ALT ensure job after restore");
+                }
             }
+            AltWorker::spawn_many(state.clone(), job_rx, rpc_urls, payer);
+        } else {
+            info!(
+                pending = restored_entries.len(),
+                "ALT manager running in reuse-only mode; on-chain creation disabled"
+            );
+            drop(job_rx);
         }
-
-        AltWorker::spawn_many(state.clone(), job_rx, rpc_urls, payer);
 
         Ok(Self { state })
     }
@@ -185,6 +200,10 @@ impl AltManager {
 
         if let Some(mut entry) = self.state.registry.get_mut(&pool) {
             if entry.accounts != normalized {
+                if !self.state.create_onchain {
+                    debug!(pool = %pool, "ALT accounts changed but creation disabled; reusing existing table");
+                    return Some(entry.handle);
+                }
                 entry.accounts = normalized.clone();
                 entry.version = entry.version.wrapping_add(1);
                 entry.status = AltStatus::Pending;
@@ -247,6 +266,10 @@ impl AltManager {
     }
 
     fn queue_job(&self, job: AltJob) {
+        if !self.state.create_onchain {
+            debug!(job = ?job, "ALT manager skipped job enqueue; on-chain creation disabled");
+            return;
+        }
         if let Err(err) = self.state.enqueue_job(job) {
             warn!(error = ?err, "failed to enqueue ALT worker job");
         }
@@ -544,7 +567,7 @@ impl AltWorker {
         if let Some(mut entry) = self.state.registry.get_mut(&pool) {
             if entry.version == version {
                 entry.tables.push_front(table);
-                while entry.tables.len() > ALT_TABLE_HISTORY {
+                while entry.tables.len() > self.state.max_tables_per_pool {
                     entry.tables.pop_back();
                 }
                 entry.status = AltStatus::Ready;
@@ -612,8 +635,11 @@ impl AltManagerState {
                     }
                 }
             }
+            while tables.len() > self.max_tables_per_pool {
+                tables.pop_back();
+            }
             let handle = AltHandleId(record.handle);
-            let entry = AltEntry {
+            let mut entry = AltEntry {
                 handle,
                 pool,
                 accounts,
@@ -624,12 +650,20 @@ impl AltManagerState {
                 last_updated_unix_ms: record.last_updated_unix_ms,
                 last_updated: Instant::now(),
             };
-            let needs_requeue = entry.status != AltStatus::Ready
+            if !self.create_onchain && !entry.tables.is_empty() {
+                entry.status = AltStatus::Ready;
+                entry.last_error = None;
+            }
+            let mut needs_requeue = entry.status != AltStatus::Ready
                 || entry
                     .tables
                     .front()
                     .map(|table| table.addresses != entry.accounts)
                     .unwrap_or(true);
+            if needs_requeue && !self.create_onchain {
+                warn!(pool = %pool, "ALT registry entry stale but creation disabled; manual intervention required");
+                needs_requeue = false;
+            }
             self.handle_index.insert(handle, pool);
             self.registry.insert(pool, entry);
             max_handle = max_handle.max(record.handle);

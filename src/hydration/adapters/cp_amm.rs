@@ -12,7 +12,7 @@ use spl_token_2022::extension::{
     transfer_fee::{TransferFee, TransferFeeConfig},
     BaseStateWithExtensions, StateWithExtensionsOwned,
 };
-use spl_token_2022::state::Mint;
+use spl_token_2022::state::Mint as SplToken2022Mint;
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
@@ -38,6 +38,7 @@ const SPL_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpP
 const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
+const Q64_FACTOR: f64 = 18_446_744_073_709_551_616.0;
 
 const DEFAULT_CP_AMM_HYDRATION_RETRY_MS: u64 = 60_000;
 
@@ -85,6 +86,7 @@ pub struct CpAmmAdapter {
     config: CpAmmAdapterConfig,
     hydrator: Option<CpAmmPoolHydrator>,
     transfer_fee_cache: Option<TokenTransferFeeHydrator>,
+    mint_metadata_cache: Option<MintMetadataHydrator>,
     template_builder: Option<BuilderHandle>,
     registered_templates: DashMap<Pubkey, RegisteredTemplateSignature>,
 }
@@ -102,6 +104,7 @@ impl CpAmmAdapter {
             Pubkey::from_str(CP_AMM_PROGRAM_ID).expect("static cp_amm program id should be valid");
         let hydrator = CpAmmPoolHydrator::new(&config);
         let transfer_fee_cache = TokenTransferFeeHydrator::new(&config);
+        let mint_metadata_cache = MintMetadataHydrator::new(&config);
         if let Some(hydrator) = hydrator.as_ref() {
             info!(
                 target = "adapter::cp_amm",
@@ -120,6 +123,7 @@ impl CpAmmAdapter {
             config,
             hydrator,
             transfer_fee_cache,
+            mint_metadata_cache,
             template_builder,
             registered_templates: DashMap::new(),
         }
@@ -203,6 +207,8 @@ impl CpAmmAdapter {
                 .token_b_program
                 .as_ref()
                 .and_then(|value| parse_pubkey(value)),
+            token_a_decimals: None,
+            token_b_decimals: None,
             amp: extras.amp,
             lp_fee_bps: extras.lp_fee_bps,
             protocol_fee_bps: extras.protocol_fee_bps,
@@ -225,6 +231,7 @@ impl CpAmmAdapter {
         };
 
         self.attach_transfer_fees(&mut state);
+        self.attach_mint_metadata(&mut state);
 
         trace!(
             target = "adapter::cp_amm",
@@ -363,6 +370,15 @@ impl CpAmmAdapter {
             self.resolve_transfer_fee(state.token_b_mint, state.token_b_program);
     }
 
+    fn attach_mint_metadata(&self, state: &mut CpAmmState) {
+        if state.token_a_decimals.is_none() {
+            state.token_a_decimals = self.resolve_mint_decimals(state.token_a_mint);
+        }
+        if state.token_b_decimals.is_none() {
+            state.token_b_decimals = self.resolve_mint_decimals(state.token_b_mint);
+        }
+    }
+
     fn resolve_transfer_fee(
         &self,
         mint: Pubkey,
@@ -376,6 +392,13 @@ impl CpAmmAdapter {
             return None;
         }
         cache.hydrate(mint).and_then(|meta| meta.fee)
+    }
+
+    fn resolve_mint_decimals(&self, mint: Pubkey) -> Option<u8> {
+        let Some(cache) = self.mint_metadata_cache.as_ref() else {
+            return None;
+        };
+        cache.hydrate(mint).map(|meta| meta.decimals)
     }
 
     fn decorate_template_context(
@@ -474,13 +497,16 @@ impl CpAmmAdapter {
         let simulation = simulate_cp_amm_exact_in(state, &req, true)?;
         let expected_output = simulation.output_amount;
         let executed_input = simulation.executed_input_amount;
+        let direction = if base_to_quote {
+            TradeDirection::AToB
+        } else {
+            TradeDirection::BToA
+        };
         let fee_bps = state.total_fee_bps();
         let template_fee_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
-        let effective_price = if executed_input == 0 {
-            0.0
-        } else {
-            expected_output as f64 / executed_input as f64
-        };
+        let effective_price =
+            scaled_execution_price(state, direction, expected_output, executed_input)
+                .unwrap_or(0.0);
 
         let mut context = TemplateContext {
             compute_unit_limit: Some(CP_AMM_DEFAULT_CU_LIMIT),
@@ -775,6 +801,28 @@ fn compute_edge_from_prices(mid_price: f64, execution_price: f64) -> f64 {
     ((execution_price / mid_price) - 1.0) * BPS_DENOMINATOR as f64
 }
 
+fn scaled_execution_price(
+    state: &CpAmmState,
+    direction: TradeDirection,
+    output_amount: u64,
+    executed_input_amount: u64,
+) -> Option<f64> {
+    if executed_input_amount == 0 || output_amount == 0 {
+        return None;
+    }
+    let base_ratio = output_amount as f64 / executed_input_amount as f64;
+    if !base_ratio.is_finite() || base_ratio <= 0.0 {
+        return None;
+    }
+    let scale = state.price_scale(direction);
+    let scaled = base_ratio * scale;
+    if scaled.is_finite() && scaled > 0.0 {
+        Some(scaled)
+    } else {
+        None
+    }
+}
+
 fn simulate_cp_amm_exact_in(
     state: &CpAmmState,
     req: &QuoteRequest,
@@ -816,11 +864,8 @@ fn simulate_cp_amm_exact_in(
     let slippage = compute_slippage_bps(reserve_in, reserve_out, pool_consumed, step.amount_out)
         .unwrap_or(0.0);
     let mid_price = direction_mid_price(state, direction)?;
-    let execution_price = if executed_input_amount == 0 {
-        return None;
-    } else {
-        output_amount as f64 / executed_input_amount as f64
-    };
+    let execution_price =
+        scaled_execution_price(state, direction, output_amount, executed_input_amount)?;
     let edge_bps = compute_edge_from_prices(mid_price, execution_price);
 
     Some(SimulatedSwapQuote {
@@ -868,11 +913,8 @@ fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<S
     let slippage = compute_slippage_bps(reserve_in, reserve_out, pool_consumed, step.amount_out)
         .unwrap_or(0.0);
     let mid_price = direction_mid_price(state, direction)?;
-    let execution_price = if executed_input_amount == 0 {
-        return None;
-    } else {
-        output_amount as f64 / executed_input_amount as f64
-    };
+    let execution_price =
+        scaled_execution_price(state, direction, output_amount, executed_input_amount)?;
     let edge_bps = compute_edge_from_prices(mid_price, execution_price);
 
     Some(SimulatedSwapQuote {
@@ -1311,10 +1353,125 @@ fn fetch_token_transfer_fee_meta(
 }
 
 fn parse_transfer_fee_extension(data: &[u8], epoch: u64) -> Option<TokenTransferFee> {
-    let state = StateWithExtensionsOwned::<Mint>::unpack(data.to_vec()).ok()?;
+    let state = StateWithExtensionsOwned::<SplToken2022Mint>::unpack(data.to_vec()).ok()?;
     let config = state.get_extension::<TransferFeeConfig>().ok()?;
     let fee = *config.get_epoch_fee(epoch);
     Some(TokenTransferFee::new(fee))
+}
+
+#[derive(Clone, Debug)]
+struct MintMetadata {
+    decimals: u8,
+    hydrated_at: Instant,
+}
+
+struct MintMetadataHydrator {
+    hydrator: AsyncHydrator<Pubkey, MintMetadata>,
+    retry_backoff: Duration,
+    last_attempts: DashMap<Pubkey, Instant>,
+}
+
+impl MintMetadataHydrator {
+    fn new(config: &CpAmmAdapterConfig) -> Option<Self> {
+        if config.rpc_endpoints.is_empty() {
+            return None;
+        }
+
+        let timeout = Duration::from_millis(config.rpc_timeout_ms.max(100));
+        let client_list: Vec<Arc<RpcClient>> = config
+            .rpc_endpoints
+            .iter()
+            .map(|url| Arc::new(RpcClient::new_with_timeout(url.clone(), timeout)))
+            .collect();
+
+        if client_list.is_empty() {
+            return None;
+        }
+
+        let endpoint_count = client_list.len();
+        let clients = Arc::new(client_list);
+        let fetch_clients = clients.clone();
+        let hydrator = AsyncHydrator::new("mint_meta", endpoint_count, move |mint| {
+            fetch_mint_metadata(fetch_clients.as_ref(), mint)
+        });
+
+        Some(Self {
+            hydrator,
+            retry_backoff: Duration::from_millis(config.hydration_retry_ms.max(1)),
+            last_attempts: DashMap::new(),
+        })
+    }
+
+    fn hydrate(&self, mint: Pubkey) -> Option<MintMetadata> {
+        if let Some(meta) = self.hydrator.cached(&mint) {
+            if meta.hydrated_at.elapsed() >= self.retry_backoff {
+                if self.should_schedule(mint) {
+                    self.hydrator.schedule(mint);
+                }
+            }
+            return Some(meta);
+        }
+        if self.should_schedule(mint) {
+            self.hydrator.schedule(mint);
+        }
+        None
+    }
+
+    fn should_schedule(&self, mint: Pubkey) -> bool {
+        let now = Instant::now();
+        if let Some(last) = self.last_attempts.get(&mint) {
+            if now.duration_since(*last.value()) < self.retry_backoff {
+                return false;
+            }
+        }
+        self.last_attempts.insert(mint, now);
+        true
+    }
+}
+
+fn fetch_mint_metadata(clients: &[Arc<RpcClient>], mint: Pubkey) -> Option<MintMetadata> {
+    for client in clients {
+        match client.get_account(&mint) {
+            Ok(account) => {
+                let owner = account.owner;
+                if let Some(decimals) = parse_mint_decimals(&owner, &account.data) {
+                    return Some(MintMetadata {
+                        decimals,
+                        hydrated_at: Instant::now(),
+                    });
+                } else {
+                    warn!(
+                        target = "adapter::cp_amm",
+                        mint = %mint,
+                        program = %owner,
+                        "unsupported mint program for metadata hydration"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    target = "adapter::cp_amm",
+                    mint = %mint,
+                    %error,
+                    "failed to fetch mint account for metadata"
+                );
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_mint_decimals(owner: &Pubkey, data: &[u8]) -> Option<u8> {
+    if owner == &*SPL_TOKEN_PROGRAM_PUBKEY {
+        return data.get(44).copied();
+    }
+    if owner == &*SPL_TOKEN_2022_PROGRAM_PUBKEY {
+        return StateWithExtensionsOwned::<SplToken2022Mint>::unpack(data.to_vec())
+            .ok()
+            .map(|mint| mint.base.decimals);
+    }
+    None
 }
 
 const POOL_FEES_STRUCT_LEN: usize = 160;
@@ -1398,6 +1555,8 @@ pub struct CpAmmState {
     pub token_b_mint: Pubkey,
     pub token_a_program: Option<Pubkey>,
     pub token_b_program: Option<Pubkey>,
+    pub token_a_decimals: Option<u8>,
+    pub token_b_decimals: Option<u8>,
     pub token_a_transfer_fee: Option<TokenTransferFee>,
     pub token_b_transfer_fee: Option<TokenTransferFee>,
     pub amp: Option<u64>,
@@ -1418,10 +1577,42 @@ pub struct CpAmmState {
 
 impl CpAmmState {
     pub fn mid_price(&self) -> Option<f64> {
-        if self.vault_a_balance == 0 {
-            return None;
+        if let Some(sqrt_price_x64) = self.sqrt_price_x64 {
+            let sqrt_price = sqrt_price_x64 as f64 / Q64_FACTOR;
+            if sqrt_price.is_finite() && sqrt_price > 0.0 {
+                let mut price = sqrt_price * sqrt_price;
+                price *= self.decimals_scale();
+                if price.is_finite() && price > 0.0 {
+                    return Some(price);
+                }
+            }
         }
-        Some(self.vault_b_balance as f64 / self.vault_a_balance as f64)
+        if self.vault_a_balance == 0 {
+            None
+        } else {
+            Some(self.vault_b_balance as f64 / self.vault_a_balance as f64)
+        }
+    }
+
+    fn decimals_scale(&self) -> f64 {
+        match (self.token_a_decimals, self.token_b_decimals) {
+            (Some(a), Some(b)) => 10_f64.powi((b as i32) - (a as i32)),
+            _ => 1.0,
+        }
+    }
+
+    fn price_scale(&self, direction: TradeDirection) -> f64 {
+        let base = self.decimals_scale();
+        match direction {
+            TradeDirection::AToB => base,
+            TradeDirection::BToA => {
+                if base == 0.0 {
+                    1.0
+                } else {
+                    1.0 / base
+                }
+            }
+        }
     }
 
     fn resolve_reserves(&self, input_mint: &Pubkey, output_mint: &Pubkey) -> Option<(u128, u128)> {
@@ -1742,6 +1933,8 @@ mod tests {
             token_b_mint: mint_b,
             token_a_program: None,
             token_b_program: None,
+            token_a_decimals: None,
+            token_b_decimals: None,
             token_a_transfer_fee: None,
             token_b_transfer_fee: None,
             amp: None,
@@ -1788,6 +1981,8 @@ mod tests {
             token_b_mint: mint_b,
             token_a_program: None,
             token_b_program: None,
+            token_a_decimals: None,
+            token_b_decimals: None,
             token_a_transfer_fee: None,
             token_b_transfer_fee: None,
             amp: None,
@@ -1845,6 +2040,8 @@ mod tests {
             token_b_mint: mint_b,
             token_a_program: None,
             token_b_program: None,
+            token_a_decimals: None,
+            token_b_decimals: None,
             token_a_transfer_fee: Some(fixture_transfer_fee(150, 5_000)),
             token_b_transfer_fee: Some(fixture_transfer_fee(100, 3_000)),
             amp: None,
@@ -1898,6 +2095,8 @@ mod tests {
             token_b_mint: mint_b,
             token_a_program: None,
             token_b_program: None,
+            token_a_decimals: None,
+            token_b_decimals: None,
             token_a_transfer_fee: None,
             token_b_transfer_fee: None,
             amp: None,
@@ -1924,6 +2123,126 @@ mod tests {
     }
 
     #[test]
+    fn mid_price_prefers_sqrt_price_with_decimals() {
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let sqrt_price = 2_f64.sqrt();
+        let sqrt_price_x64 = (sqrt_price * Q64_FACTOR).round() as u128;
+
+        let state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            token_a_decimals: Some(6),
+            token_b_decimals: Some(6),
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            amp: None,
+            lp_fee_bps: None,
+            protocol_fee_bps: None,
+            referral_bps: None,
+            referral_token_account: None,
+            sqrt_price_x64: Some(sqrt_price_x64),
+            liquidity: Some(9_000_000_000),
+            sqrt_min_price_x64: Some(1_u128 << 60),
+            sqrt_max_price_x64: Some(1_u128 << 70),
+            vault_a_balance: 1_000_000,
+            vault_b_balance: 2_000_000,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+            last_hydrated_at: Some(Instant::now()),
+        };
+
+        let price = state.mid_price().expect("mid price should compute");
+        assert!((price - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mid_price_applies_decimal_adjustment() {
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let sqrt_price_x64 = (1_f64 * Q64_FACTOR).round() as u128;
+
+        let state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            token_a_decimals: Some(9),
+            token_b_decimals: Some(6),
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            amp: None,
+            lp_fee_bps: None,
+            protocol_fee_bps: None,
+            referral_bps: None,
+            referral_token_account: None,
+            sqrt_price_x64: Some(sqrt_price_x64),
+            liquidity: Some(9_000_000_000),
+            sqrt_min_price_x64: Some(1_u128 << 60),
+            sqrt_max_price_x64: Some(1_u128 << 70),
+            vault_a_balance: 1_000,
+            vault_b_balance: 1_000,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+            last_hydrated_at: Some(Instant::now()),
+        };
+
+        let price = state.mid_price().expect("mid price should compute");
+        assert!((price - 0.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mid_price_falls_back_to_vault_ratio() {
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+
+        let state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            token_a_decimals: Some(6),
+            token_b_decimals: Some(6),
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            amp: None,
+            lp_fee_bps: None,
+            protocol_fee_bps: None,
+            referral_bps: None,
+            referral_token_account: None,
+            sqrt_price_x64: None,
+            liquidity: None,
+            sqrt_min_price_x64: None,
+            sqrt_max_price_x64: None,
+            vault_a_balance: 500,
+            vault_b_balance: 1_000,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+            last_hydrated_at: None,
+        };
+
+        let price = state.mid_price().expect("mid price should fall back");
+        assert!((price - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn bidirectional_quotes_generate_snapshot_sides() {
         let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default(), None);
         let pool = Pubkey::new_unique();
@@ -1939,6 +2258,8 @@ mod tests {
             token_b_mint: mint_b,
             token_a_program: None,
             token_b_program: None,
+            token_a_decimals: None,
+            token_b_decimals: None,
             token_a_transfer_fee: None,
             token_b_transfer_fee: None,
             amp: None,

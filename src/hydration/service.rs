@@ -1,26 +1,29 @@
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
+use solana_sdk::pubkey::Pubkey;
 use tokio::runtime::Builder as TokioRuntime;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use super::{
+    adapters::{AdapterReadiness, ReadinessBlocker, ReadinessBlockerKind},
     AdapterBook, AltManagerStats, FlashLoanPlanner, PoolStateEvent, PoolStateUpdate, PoolStore,
     PoolStoreView, RpcRefresher, TemplateCache, TemplateCacheStats,
 };
-use crate::builder::BuilderHandle;
+use crate::builder::{templates::SwapTemplateDirection, BuilderHandle};
 use crate::config::AppConfig;
 use crate::core::RingProducer;
 use crate::corecast::CoreCastClient;
-use crate::hydration::types::PoolUpdate;
+use crate::hydration::types::{PoolSnapshot, PoolUpdate, WHIRLPOOL_PROGRAM_ID};
 use crate::telemetry;
 use crate::token_pair::TokenPair;
 
@@ -119,9 +122,10 @@ impl HydrationService {
         let config = self.config.clone();
         let adapter_book = self.adapter_book.clone();
         let pool_store = self.pool_store.clone();
+        let builder = self.builder.clone();
         thread::Builder::new()
             .name("hydration_ingest".into())
-            .spawn(move || run_adapter_ingest_loop(stop, config, adapter_book, pool_store))
+            .spawn(move || run_adapter_ingest_loop(stop, config, adapter_book, pool_store, builder))
             .map_err(Into::into)
     }
 
@@ -149,8 +153,17 @@ impl HydrationService {
         self.pool_store.view()
     }
 
+    pub fn readiness_diagnostics(&self) -> AdapterReadiness {
+        self.adapter_book.readiness_diagnostics()
+    }
+
     pub fn wait_for_pool_readiness(&self, timeout: Duration) -> bool {
-        self.pool_store.wait_until_ready(timeout)
+        if self.pool_store.wait_until_ready(timeout) {
+            true
+        } else {
+            self.log_readiness_blockers();
+            false
+        }
     }
 
     pub fn spawn_watcher_metrics(
@@ -160,9 +173,10 @@ impl HydrationService {
         let updates = self
             .pool_store
             .subscribe(self.config.watcher.queue_capacity.max(1));
+        let pool_store = self.pool_store.clone();
         thread::Builder::new()
             .name("watcher_metrics".into())
-            .spawn(move || run_watcher_metrics_loop(stop, updates))
+            .spawn(move || run_watcher_metrics_loop(stop, pool_store, updates))
             .map_err(Into::into)
     }
 
@@ -173,14 +187,77 @@ impl HydrationService {
         let pool_store = self.pool_store.clone();
         let adapter_book = self.adapter_book.clone();
         let refresher = self.rpc_refresher.clone();
-        let ttl = Duration::from_millis(self.config.watcher.pool_stale_ttl_ms.max(1));
+        let ttl = self.config.watcher.pool_stale_ttl_ms.and_then(|ms| {
+            if ms > 0 {
+                Some(Duration::from_millis(ms))
+            } else {
+                None
+            }
+        });
         let sweep = Duration::from_millis(self.config.watcher.pool_stale_sweep_ms.max(50));
+        let builder = self.builder.clone();
+        if ttl.is_none() {
+            info!(
+                target = "hydration",
+                "pool stale TTL disabled; readiness will stay latched until explicit failures"
+            );
+        }
         thread::Builder::new()
             .name("hydration_pool_maintenance".into())
             .spawn(move || {
-                run_pool_maintenance_loop(stop, pool_store, adapter_book, refresher, ttl, sweep)
+                run_pool_maintenance_loop(
+                    stop,
+                    pool_store,
+                    adapter_book,
+                    refresher,
+                    ttl,
+                    sweep,
+                    builder,
+                )
             })
             .map_err(Into::into)
+    }
+
+    pub(crate) fn log_readiness_blockers(&self) {
+        let diagnostics = self.readiness_diagnostics();
+        if diagnostics.is_empty() {
+            warn!(
+                target = "hydration",
+                "pool readiness timeout; no adapter blockers reported"
+            );
+            return;
+        }
+        let total = diagnostics.len();
+        let samples = diagnostics
+            .samples(3)
+            .into_iter()
+            .map(format_blocker)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        warn!(
+            target = "hydration",
+            blocked = total,
+            samples = %samples,
+            "pool readiness blocked by adapter backoff"
+        );
+    }
+}
+
+fn format_blocker(blocker: ReadinessBlocker) -> String {
+    let retry_ms = blocker.retry_in.as_millis() as u64;
+    match blocker.kind {
+        ReadinessBlockerKind::PoolMeta => format!(
+            "{}:{} failures={} retry_in_ms={}",
+            blocker.adapter, blocker.pool, blocker.failures, retry_ms
+        ),
+        ReadinessBlockerKind::TickArray => format!(
+            "{}:{} tick={} failures={} retry_in_ms={}",
+            blocker.adapter,
+            blocker.pool,
+            blocker.tick_start.unwrap_or_default(),
+            blocker.failures,
+            retry_ms
+        ),
     }
 }
 
@@ -220,6 +297,7 @@ fn run_adapter_ingest_loop(
     config: Arc<AppConfig>,
     adapter_book: Arc<AdapterBook>,
     pool_store: Arc<PoolStore>,
+    builder: BuilderHandle,
 ) -> Result<()> {
     let client = CoreCastClient::new(config.clone())
         .context("failed to initialize CoreCast client for hydration ingest")?;
@@ -231,7 +309,15 @@ fn run_adapter_ingest_loop(
         .context("failed to build hydration ingest runtime")?;
 
     runtime.block_on(async move {
-        pump_pool_stream(stop, client, adapter_book, pool_store, pair_allowlist).await
+        pump_pool_stream(
+            stop,
+            client,
+            adapter_book,
+            pool_store,
+            pair_allowlist,
+            builder,
+        )
+        .await
     })
 }
 
@@ -241,6 +327,7 @@ async fn pump_pool_stream(
     adapter_book: Arc<AdapterBook>,
     pool_store: Arc<PoolStore>,
     allowlist: Arc<HashSet<TokenPair>>,
+    builder: BuilderHandle,
 ) -> Result<()> {
     let mut seq = 0u64;
     let mut retry = Duration::from_millis(250);
@@ -270,7 +357,9 @@ async fn pump_pool_stream(
                                     {
                                         snapshot.quotes = Some(quotes);
                                     }
-                                    pool_store.update(snapshot);
+                                    let ready = snapshot_ready_for_fastlane(&builder, &snapshot);
+                                    pool_store.update(snapshot, ready);
+                                    telemetry::record_hydration_heartbeat(unix_timestamp_ms());
                                 }
                             } else {
                                 debug!(target = "hydration", "dropped malformed pool update");
@@ -312,8 +401,16 @@ async fn pump_pool_stream(
     Ok(())
 }
 
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 fn run_watcher_metrics_loop(
     stop: Arc<AtomicBool>,
+    pool_store: Arc<PoolStore>,
     updates: Receiver<PoolStateUpdate>,
 ) -> Result<()> {
     let capacity = updates.capacity().unwrap_or(0);
@@ -333,6 +430,7 @@ fn run_watcher_metrics_loop(
             Err(RecvTimeoutError::Disconnected) => break,
         }
         telemetry::record_hydration_queue_depth(updates.len(), capacity);
+        telemetry::record_hydration_pool_counts(pool_store.ready_len(), pool_store.len());
     }
     Ok(())
 }
@@ -342,11 +440,16 @@ fn run_pool_maintenance_loop(
     pool_store: Arc<PoolStore>,
     adapter_book: Arc<AdapterBook>,
     refresher: Arc<RpcRefresher>,
-    ttl: Duration,
+    ttl: Option<Duration>,
     sweep: Duration,
+    builder: BuilderHandle,
 ) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        let stale = pool_store.collect_stale(ttl);
+        let Some(ttl_value) = ttl else {
+            thread::sleep(sweep);
+            continue;
+        };
+        let stale = pool_store.collect_stale(ttl_value);
         if stale.is_empty() {
             thread::sleep(sweep);
             continue;
@@ -360,7 +463,8 @@ fn run_pool_maintenance_loop(
                 if let Some(quotes) = adapter_book.snapshot_quotes(&mut refreshed) {
                     refreshed.quotes = Some(quotes);
                 }
-                pool_store.update(refreshed);
+                let ready = snapshot_ready_for_fastlane(&builder, &refreshed);
+                pool_store.update(refreshed, ready);
                 telemetry::record_hydration_rpc_refresh(&protocol);
             } else {
                 telemetry::record_hydration_rpc_refresh_failure(&protocol);
@@ -372,4 +476,37 @@ fn run_pool_maintenance_loop(
         thread::sleep(sweep);
     }
     Ok(())
+}
+
+fn snapshot_ready_for_fastlane(builder: &BuilderHandle, snapshot: &PoolSnapshot) -> bool {
+    let pool_pubkey = match Pubkey::from_str(&snapshot.pool_id) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+
+    for direction in [
+        SwapTemplateDirection::BaseIn,
+        SwapTemplateDirection::BaseOut,
+    ] {
+        let readiness = builder.template_readiness(&pool_pubkey, direction);
+        if !(readiness.template_ready && readiness.alt_ready) {
+            return false;
+        }
+    }
+
+    if snapshot.quotes.is_none() {
+        return false;
+    }
+
+    if snapshot.program_id == WHIRLPOOL_PROGRAM_ID {
+        match snapshot.extensions.whirlpool.as_ref() {
+            Some(extras)
+                if extras.tick_array0.is_some()
+                    && extras.tick_array1.is_some()
+                    && extras.tick_array2.is_some() => {}
+            _ => return false,
+        }
+    }
+
+    true
 }

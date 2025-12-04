@@ -72,17 +72,20 @@ impl ExecutorRuntime {
         if pool_store.wait_until_ready(ready_timeout) {
             info!(
                 target = "hydration",
-                pools = pool_store.len(),
+                ready_pools = pool_store.ready_len(),
+                tracked_pools = pool_store.len(),
                 "pool store ready; planner lanes may begin"
             );
         } else {
             warn!(
                 target = "hydration",
                 timeout_ms = config.watcher.initial_ready_timeout_ms,
-                ready_pools = pool_store.len(),
+                ready_pools = pool_store.ready_len(),
+                tracked_pools = pool_store.len(),
                 min_ready = config.watcher.min_ready_pools,
                 "timed out waiting for initial pool hydration"
             );
+            hydration_service.log_readiness_blockers();
         }
 
         if hydration_only {

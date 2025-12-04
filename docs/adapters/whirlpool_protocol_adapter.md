@@ -35,7 +35,7 @@ These sources drive both the adapter specification and the regression test vecto
 - **Whirlpool IDL** – `idls/pools/whirlpool.json` is treated as the single source for account layouts and instruction schemas; codegen (via `anchor-client` or `idl-codegen`) should be refreshed whenever the upstream npm tag changes.
 - **Orca program sources** – `swap_math.rs`, `swap_manager.rs`, and the v2 instruction modules govern math correctness and account ordering; the adapter must cite these for parity tests.
 - **Internal swap guide** – `docs/swaps/whirlpool-swaps.md` documents runner expectations (ATA ownership, CPI stack, compute budgeting) and remains the consumer-facing contract for template outputs.
-- **Config overrides** – `config.json` supplies mint decimal overrides, tick-array prefetch counts, or pool-specific toggles (e.g., ignoring Token-2022 pools on early rollouts).
+- **Config overrides** – `config.json` supplies mint decimal overrides, tick-array prefetch counts, rate-limit knobs (e.g., `pool_failure_backoff_ms`, `tick_array_backoff_ms`, `max_pool_failures`, `max_tick_array_failures` under `protocols.whirlpool`), or pool-specific toggles (such as ignoring Token-2022 pools on early rollouts).
 
 ## API Shape
 

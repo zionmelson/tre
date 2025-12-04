@@ -192,7 +192,8 @@ impl FastLanePlanner {
             warn!(
                 target = "fastlane",
                 timeout_ms = self.readiness_timeout.as_millis(),
-                ready_pools = self.pool_store.len(),
+                ready_pools = self.pool_store.ready_len(),
+                tracked_pools = self.pool_store.len(),
                 min_ready = self.min_ready_pools,
                 "still waiting for initial pool hydration"
             );
