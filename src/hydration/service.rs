@@ -283,12 +283,7 @@ impl HydrationService {
                 &state.snapshot,
                 self.alt_required_for_readiness,
             ) {
-                samples.push(format!(
-                    "{}:{} {}",
-                    state.program_id,
-                    state.pool_id,
-                    reason
-                ));
+                samples.push(format!("{}:{} {}", state.program_id, state.pool_id, reason));
             }
             if samples.len() >= limit {
                 break;
@@ -554,8 +549,8 @@ fn evaluate_snapshot_readiness(
     snapshot: &PoolSnapshot,
     require_alt_ready: bool,
 ) -> Result<(), PoolReadinessFailure> {
-    let pool_pubkey = Pubkey::from_str(&snapshot.pool_id)
-        .map_err(|_| PoolReadinessFailure::InvalidPoolId)?;
+    let pool_pubkey =
+        Pubkey::from_str(&snapshot.pool_id).map_err(|_| PoolReadinessFailure::InvalidPoolId)?;
 
     for direction in [
         SwapTemplateDirection::BaseIn,

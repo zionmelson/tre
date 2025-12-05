@@ -421,19 +421,47 @@ fn apply_whirlpool_pool_accounts(
         .accounts
         .oracle
         .ok_or_else(|| anyhow!("whirlpool pool {} missing oracle", pool_meta.pool_id))?;
+    let token_program_a = pool_meta.accounts.token_program_a.ok_or_else(|| {
+        anyhow!(
+            "whirlpool pool {} missing token_program_a",
+            pool_meta.pool_id
+        )
+    })?;
+    let token_program_b = pool_meta.accounts.token_program_b.ok_or_else(|| {
+        anyhow!(
+            "whirlpool pool {} missing token_program_b",
+            pool_meta.pool_id
+        )
+    })?;
+    let token_program_any = token_program_a;
 
     for (spec, meta) in specs.iter().zip(accounts.iter_mut()) {
         match spec.name {
-            "whirlpool" => {
+            name if whirlpool_account_name_is(name, &["whirlpool"]) => {
                 meta.pubkey = pool_meta.pool_id;
             }
-            "tokenVaultA" => {
+            name if whirlpool_account_name_is(name, &["tokenVaultA", "token_vault_a"]) => {
                 meta.pubkey = vault_a;
             }
-            "tokenVaultB" => {
+            name if whirlpool_account_name_is(name, &["tokenVaultB", "token_vault_b"]) => {
                 meta.pubkey = vault_b;
             }
-            "oracle" => {
+            name if whirlpool_account_name_is(name, &["tokenMintA", "token_mint_a"]) => {
+                meta.pubkey = pool_meta.accounts.token_mint_a;
+            }
+            name if whirlpool_account_name_is(name, &["tokenMintB", "token_mint_b"]) => {
+                meta.pubkey = pool_meta.accounts.token_mint_b;
+            }
+            name if whirlpool_account_name_is(name, &["tokenProgramA", "token_program_a"]) => {
+                meta.pubkey = token_program_a;
+            }
+            name if whirlpool_account_name_is(name, &["tokenProgramB", "token_program_b"]) => {
+                meta.pubkey = token_program_b;
+            }
+            name if whirlpool_account_name_is(name, &["tokenProgram", "token_program"]) => {
+                meta.pubkey = token_program_any;
+            }
+            name if whirlpool_account_name_is(name, &["oracle"]) => {
                 meta.pubkey = oracle;
             }
             _ => {}
@@ -441,6 +469,10 @@ fn apply_whirlpool_pool_accounts(
     }
 
     Ok(())
+}
+
+fn whirlpool_account_name_is(name: &str, variants: &[&str]) -> bool {
+    variants.iter().any(|candidate| *candidate == name)
 }
 
 fn build_lb_clmm_params(
@@ -745,6 +777,7 @@ fn encode_whirlpool_args(
 ) -> Result<WhirlpoolFieldLayout> {
     let mut amount_in = None;
     let mut amount_out = None;
+    let mut amount_specified_is_input = None;
     let mut sqrt_price_limit = None;
     let mut remaining_accounts_info = None;
 
@@ -763,8 +796,9 @@ fn encode_whirlpool_args(
                 sqrt_price_limit = Some(write_u128(buffer, value)?);
             }
             "amountSpecifiedIsInput" | "amount_specified_is_input" => {
-                let is_input = matches!(template.direction, SwapTemplateDirection::BaseIn);
-                write_bool(buffer, is_input)?;
+                let literal = parse_bool(arg)? != 0;
+                let slice = write_bool(buffer, literal)?;
+                amount_specified_is_input = Some(slice);
             }
             "aToB" | "a_to_b" => {
                 let literal = parse_bool(arg)?;
@@ -783,10 +817,13 @@ fn encode_whirlpool_args(
     let amount_in = amount_in.ok_or_else(|| anyhow!("whirlpool template missing amount arg"))?;
     let amount_out =
         amount_out.ok_or_else(|| anyhow!("whirlpool template missing otherAmountThreshold arg"))?;
+    let amount_specified_is_input = amount_specified_is_input
+        .ok_or_else(|| anyhow!("whirlpool template missing amountSpecifiedIsInput arg"))?;
 
     Ok(WhirlpoolFieldLayout {
         amount_in,
         amount_out,
+        amount_specified_is_input,
         sqrt_price_limit,
         remaining_accounts_info,
     })
@@ -822,9 +859,10 @@ fn write_u128(buffer: &mut Vec<u8>, value: u128) -> Result<TemplateSlice> {
     make_slice(offset, 16)
 }
 
-fn write_bool(buffer: &mut Vec<u8>, value: bool) -> Result<()> {
+fn write_bool(buffer: &mut Vec<u8>, value: bool) -> Result<TemplateSlice> {
+    let offset = buffer.len();
     buffer.push(value as u8);
-    Ok(())
+    make_slice(offset, 1)
 }
 
 fn encode_arg(arg: &ArgSpec, buffer: &mut Vec<u8>) -> Result<TemplateSlice> {

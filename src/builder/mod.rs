@@ -396,6 +396,8 @@ pub struct WhirlpoolPoolAccounts {
     pub token_mint_b: Pubkey,
     pub token_vault_a: Option<Pubkey>,
     pub token_vault_b: Option<Pubkey>,
+    pub token_program_a: Option<Pubkey>,
+    pub token_program_b: Option<Pubkey>,
     pub oracle: Option<Pubkey>,
 }
 
@@ -407,6 +409,9 @@ impl WhirlpoolPoolAccounts {
             && self.token_mint_b != ZERO
             && self.token_vault_a.is_some()
             && self.token_vault_b.is_some()
+            && self.token_program_a.is_some()
+            && self.token_program_b.is_some()
+            && self.oracle.is_some()
     }
 }
 

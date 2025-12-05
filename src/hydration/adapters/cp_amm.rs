@@ -8,16 +8,16 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use spl_token_2022::extension::{
-    transfer_fee::{TransferFee, TransferFeeConfig},
-    BaseStateWithExtensions, StateWithExtensionsOwned,
-};
+use spl_token_2022::extension::StateWithExtensionsOwned;
 use spl_token_2022::state::Mint as SplToken2022Mint;
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
 use super::hydration::AsyncHydrator;
 use crate::builder::{BuilderHandle, CpAmmPoolAccounts, CpAmmPoolMeta};
+use crate::hydration::token_fees::{
+    apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
+};
 use crate::hydration::types::{
     CpAmmPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
     CP_AMM_INPUT_UTILIZATION_BPS,
@@ -103,7 +103,11 @@ impl CpAmmAdapter {
         let program_id =
             Pubkey::from_str(CP_AMM_PROGRAM_ID).expect("static cp_amm program id should be valid");
         let hydrator = CpAmmPoolHydrator::new(&config);
-        let transfer_fee_cache = TokenTransferFeeHydrator::new(&config);
+        let transfer_fee_cache = TokenTransferFeeHydrator::new(
+            &config.rpc_endpoints,
+            config.rpc_timeout_ms,
+            config.hydration_retry_ms,
+        );
         let mint_metadata_cache = MintMetadataHydrator::new(&config);
         if let Some(hydrator) = hydrator.as_ref() {
             info!(
@@ -391,7 +395,7 @@ impl CpAmmAdapter {
         if program_id != *SPL_TOKEN_2022_PROGRAM_PUBKEY {
             return None;
         }
-        cache.hydrate(mint).and_then(|meta| meta.fee)
+        cache.hydrate(mint)
     }
 
     fn resolve_mint_decimals(&self, mint: Pubkey) -> Option<u8> {
@@ -535,6 +539,7 @@ impl CpAmmAdapter {
             min_output_amount: Some(expected_output),
             limit_price: None,
             price_impact_limit_bps: None,
+            amount_specified_is_input: true,
             context,
             status: QuoteStatus::Ok,
             sqrt_price_before_x64: None,
@@ -729,43 +734,6 @@ struct SimulatedSwapQuote {
     pub amount_leftover: u64,
     pub edge_bps: f64,
     pub slippage_bps: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct TokenTransferFee {
-    fee: TransferFee,
-}
-
-impl TokenTransferFee {
-    fn new(fee: TransferFee) -> Self {
-        Self { fee }
-    }
-
-    fn post_fee_amount(&self, pre_fee_amount: u64) -> Option<(u64, u64)> {
-        let fee_amount = self.fee.calculate_fee(pre_fee_amount)?;
-        let net = pre_fee_amount.checked_sub(fee_amount)?;
-        Some((net, fee_amount))
-    }
-
-    fn pre_fee_amount(&self, post_fee_amount: u64) -> Option<(u64, u64)> {
-        let gross = self.fee.calculate_pre_fee_amount(post_fee_amount)?;
-        let fee_amount = gross.checked_sub(post_fee_amount)?;
-        Some((gross, fee_amount))
-    }
-}
-
-fn apply_post_fee_amount(amount: u64, fee: Option<TokenTransferFee>) -> Option<(u64, u64)> {
-    match fee {
-        Some(fee) => fee.post_fee_amount(amount),
-        None => Some((amount, 0)),
-    }
-}
-
-fn apply_pre_fee_amount(amount: u64, fee: Option<TokenTransferFee>) -> Option<(u64, u64)> {
-    match fee {
-        Some(fee) => fee.pre_fee_amount(amount),
-        None => Some((amount, 0)),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1235,128 +1203,6 @@ fn fetch_cp_amm_meta(clients: &[Arc<RpcClient>], pool: Pubkey) -> Option<Hydrate
     }
 
     None
-}
-
-#[derive(Clone, Debug)]
-struct TransferFeeMeta {
-    fee: Option<TokenTransferFee>,
-    hydrated_at: Instant,
-}
-
-struct TokenTransferFeeHydrator {
-    hydrator: AsyncHydrator<Pubkey, TransferFeeMeta>,
-    retry_backoff: Duration,
-    last_attempts: DashMap<Pubkey, Instant>,
-}
-
-impl TokenTransferFeeHydrator {
-    fn new(config: &CpAmmAdapterConfig) -> Option<Self> {
-        if config.rpc_endpoints.is_empty() {
-            return None;
-        }
-
-        let timeout = Duration::from_millis(config.rpc_timeout_ms.max(100));
-        let client_list: Vec<Arc<RpcClient>> = config
-            .rpc_endpoints
-            .iter()
-            .map(|url| Arc::new(RpcClient::new_with_timeout(url.clone(), timeout)))
-            .collect();
-
-        if client_list.is_empty() {
-            return None;
-        }
-
-        let endpoint_count = client_list.len();
-        let clients = Arc::new(client_list);
-        let fetch_clients = clients.clone();
-        let hydrator = AsyncHydrator::new("token_fee", endpoint_count, move |mint| {
-            fetch_token_transfer_fee_meta(fetch_clients.as_ref(), mint)
-        });
-
-        Some(Self {
-            hydrator,
-            retry_backoff: Duration::from_millis(config.hydration_retry_ms.max(1)),
-            last_attempts: DashMap::new(),
-        })
-    }
-
-    fn hydrate(&self, mint: Pubkey) -> Option<TransferFeeMeta> {
-        if let Some(meta) = self.hydrator.cached(&mint) {
-            if meta.hydrated_at.elapsed() >= self.retry_backoff {
-                if self.should_schedule(mint) {
-                    self.hydrator.schedule(mint);
-                }
-            }
-            return Some(meta);
-        }
-        if self.should_schedule(mint) {
-            self.hydrator.schedule(mint);
-        }
-        None
-    }
-
-    fn should_schedule(&self, mint: Pubkey) -> bool {
-        let now = Instant::now();
-        if let Some(last) = self.last_attempts.get(&mint) {
-            if now.duration_since(*last.value()) < self.retry_backoff {
-                return false;
-            }
-        }
-        self.last_attempts.insert(mint, now);
-        true
-    }
-}
-
-fn fetch_token_transfer_fee_meta(
-    clients: &[Arc<RpcClient>],
-    mint: Pubkey,
-) -> Option<TransferFeeMeta> {
-    for client in clients {
-        match client.get_account(&mint) {
-            Ok(account) => {
-                if account.owner != *SPL_TOKEN_2022_PROGRAM_PUBKEY {
-                    return Some(TransferFeeMeta {
-                        fee: None,
-                        hydrated_at: Instant::now(),
-                    });
-                }
-                match client.get_epoch_info() {
-                    Ok(epoch_info) => {
-                        let fee = parse_transfer_fee_extension(&account.data, epoch_info.epoch);
-                        return Some(TransferFeeMeta {
-                            fee,
-                            hydrated_at: Instant::now(),
-                        });
-                    }
-                    Err(error) => {
-                        warn!(
-                            target = "adapter::cp_amm",
-                            mint = %mint,
-                            %error,
-                            "failed to fetch epoch info for token fee metadata"
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                warn!(
-                    target = "adapter::cp_amm",
-                    mint = %mint,
-                    %error,
-                    "failed to fetch mint account for token fee metadata"
-                );
-            }
-        }
-    }
-
-    None
-}
-
-fn parse_transfer_fee_extension(data: &[u8], epoch: u64) -> Option<TokenTransferFee> {
-    let state = StateWithExtensionsOwned::<SplToken2022Mint>::unpack(data.to_vec()).ok()?;
-    let config = state.get_extension::<TransferFeeConfig>().ok()?;
-    let fee = *config.get_epoch_fee(epoch);
-    Some(TokenTransferFee::new(fee))
 }
 
 #[derive(Clone, Debug)]
@@ -1856,6 +1702,7 @@ mod tests {
     use super::*;
     use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness};
     use spl_pod::primitives::{PodU16, PodU64};
+    use spl_token_2022::extension::transfer_fee::TransferFee;
 
     fn fixture_transfer_fee(bps: u16, max_fee: u64) -> TokenTransferFee {
         let fee = TransferFee {

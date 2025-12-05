@@ -12,6 +12,8 @@ use {
     std::future::Future,
 };
 
+pub use spl_type_length_value::state::TlvStateBorrowed;
+
 /// Type representing the output of an account fetching function, for easy
 /// chaining between APIs
 pub type AccountDataResult = Result<Option<Vec<u8>>, AccountFetchError>;

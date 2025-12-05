@@ -21,7 +21,8 @@ mod protocols;
 
 pub use protocols::{
     CpAmmPoolExtras, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras,
-    LbClmmPoolExtras, RaydiumV3PoolExtras, WhirlpoolPoolExtras, CP_AMM_INPUT_UTILIZATION_BPS,
+    LbClmmPoolExtras, RaydiumV3PoolExtras, WhirlpoolAdaptiveFeeConstants, WhirlpoolAdaptiveFeeInfo,
+    WhirlpoolAdaptiveFeeVariables, WhirlpoolPoolExtras, CP_AMM_INPUT_UTILIZATION_BPS,
     CP_AMM_PROGRAM_ID, LB_CLMM_INPUT_UTILIZATION_BPS, LB_CLMM_PROGRAM_ID,
     RAYDIUM_V3_INPUT_UTILIZATION_BPS, RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_INPUT_UTILIZATION_BPS,
     WHIRLPOOL_PROGRAM_ID,
@@ -151,6 +152,7 @@ pub struct PoolQuoteSide {
     pub min_output_amount: Option<u64>,
     pub limit_price: Option<i64>,
     pub price_impact_limit_bps: Option<u16>,
+    pub amount_specified_is_input: bool,
     pub context: TemplateContext,
     pub status: QuoteStatus,
     pub sqrt_price_before_x64: Option<u128>,

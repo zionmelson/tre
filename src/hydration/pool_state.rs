@@ -139,12 +139,7 @@ impl PoolStore {
                 }
             })
             .unwrap_or(0.0);
-        let previous_ready = self
-            .inner
-            .get(&pool_id)
-            .map(|entry| entry.value().ready)
-            .unwrap_or(false);
-        let effective_ready = ready || previous_ready;
+        let effective_ready = ready;
         let state = PoolState {
             pool_id: pool_id.clone(),
             program_id: program_id.clone(),

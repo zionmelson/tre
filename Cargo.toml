@@ -53,6 +53,8 @@ solend = { path = "solend" }
 ratatui = "0.26"
 crossterm = "0.27"
 spl-token-2022 = "8"
+spl-transfer-hook-interface = "0.10"
+spl-tlv-account-resolution = "0.10"
 
 [build-dependencies]
 prost-build = "0.13"

@@ -7,6 +7,8 @@ pub mod pool_state;
 pub mod rpc_refresh;
 pub mod service;
 pub mod template_cache;
+pub mod token_fees;
+pub mod transfer_hooks;
 pub mod types;
 
 pub use adapter_book::AdapterBook;

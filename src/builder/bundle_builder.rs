@@ -41,7 +41,9 @@ static JITO_DONT_FRONT_ACCOUNT: Lazy<Pubkey> = Lazy::new(|| {
 
 const CP_AMM_HOST_FEE_INDEX: usize = 11;
 const LB_CLMM_HOST_FEE_INDEX: usize = 9;
-const DEFAULT_SLIPPAGE_TOLERANCE_BPS: u16 = 5;
+// When no adapter- or route-specified tolerance is available, fall back to 50 bps so
+// Stage2 remains aligned with the planner's default 0.5% guard.
+const DEFAULT_SLIPPAGE_TOLERANCE_BPS: u16 = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleInstructionPlan {
@@ -50,7 +52,9 @@ pub struct BundleInstructionPlan {
     pub input_mint: String,
     pub output_mint: String,
     pub amount_in: u64,
+    pub input_amount: u64,
     pub expected_output_amount: u64,
+    pub amount_specified_is_input: bool,
     pub fee_bps: u16,
     pub template_fee_bps: u16,
     pub direction: SwapTemplateDirection,
@@ -574,6 +578,12 @@ fn hydrate_whirlpool_accounts(
     let oracle = pool_accounts
         .oracle
         .ok_or_else(|| anyhow!("template for pool {} missing oracle", plan.pool_id))?;
+    let token_program_a = pool_accounts
+        .token_program_a
+        .ok_or_else(|| anyhow!("template for pool {} missing token_program_a", plan.pool_id))?;
+    let token_program_b = pool_accounts
+        .token_program_b
+        .ok_or_else(|| anyhow!("template for pool {} missing token_program_b", plan.pool_id))?;
     let whirlpool_account = if pool_accounts.whirlpool == Pubkey::default() {
         template.key.pool_id
     } else {
@@ -604,34 +614,61 @@ fn hydrate_whirlpool_accounts(
         }
 
         match spec.name {
-            "tokenAuthority" => {
+            name if whirlpool_account_name_is(name, &["tokenAuthority", "token_authority"]) => {
                 meta.pubkey = authority;
             }
-            "whirlpool" => {
+            name if whirlpool_account_name_is(name, &["whirlpool"]) => {
                 meta.pubkey = whirlpool_account;
             }
-            "tokenOwnerAccountA" => {
+            name if whirlpool_account_name_is(
+                name,
+                &["tokenOwnerAccountA", "token_owner_account_a"],
+            ) =>
+            {
                 meta.pubkey = owner_account_a;
             }
-            "tokenOwnerAccountB" => {
+            name if whirlpool_account_name_is(
+                name,
+                &["tokenOwnerAccountB", "token_owner_account_b"],
+            ) =>
+            {
                 meta.pubkey = owner_account_b;
             }
-            "tokenVaultA" => {
+            name if whirlpool_account_name_is(name, &["tokenVaultA", "token_vault_a"]) => {
                 meta.pubkey = vault_a;
             }
-            "tokenVaultB" => {
+            name if whirlpool_account_name_is(name, &["tokenVaultB", "token_vault_b"]) => {
                 meta.pubkey = vault_b;
             }
-            "oracle" => {
+            name if whirlpool_account_name_is(name, &["tokenMintA", "token_mint_a"]) => {
+                meta.pubkey = pool_accounts.token_mint_a;
+            }
+            name if whirlpool_account_name_is(name, &["tokenMintB", "token_mint_b"]) => {
+                meta.pubkey = pool_accounts.token_mint_b;
+            }
+            name if whirlpool_account_name_is(name, &["tokenProgramA", "token_program_a"]) => {
+                meta.pubkey = token_program_a;
+            }
+            name if whirlpool_account_name_is(name, &["tokenProgramB", "token_program_b"]) => {
+                meta.pubkey = token_program_b;
+            }
+            name if whirlpool_account_name_is(name, &["tokenProgram", "token_program"]) => {
+                let program = match spec.mint_role {
+                    Some(SwapMintRole::Mint1) => token_program_b,
+                    _ => token_program_a,
+                };
+                meta.pubkey = program;
+            }
+            name if whirlpool_account_name_is(name, &["oracle"]) => {
                 meta.pubkey = oracle;
             }
-            "tickArray0" => {
+            name if whirlpool_account_name_is(name, &["tickArray0", "tick_array_0"]) => {
                 meta.pubkey = tick_array0;
             }
-            "tickArray1" => {
+            name if whirlpool_account_name_is(name, &["tickArray1", "tick_array_1"]) => {
                 meta.pubkey = tick_array1;
             }
-            "tickArray2" => {
+            name if whirlpool_account_name_is(name, &["tickArray2", "tick_array_2"]) => {
                 meta.pubkey = tick_array2;
             }
             _ => {}
@@ -639,6 +676,10 @@ fn hydrate_whirlpool_accounts(
     }
 
     Ok(())
+}
+
+fn whirlpool_account_name_is(name: &str, variants: &[&str]) -> bool {
+    variants.iter().any(|candidate| *candidate == name)
 }
 
 fn config_token_account(
@@ -655,7 +696,11 @@ fn config_token_account(
     })
 }
 
-fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut Vec<u8>) -> Result<()> {
+fn apply_patch(
+    plan: &BundleInstructionPlan,
+    patch: &TemplatePatch,
+    data: &mut Vec<u8>,
+) -> Result<()> {
     let offset = patch.offset as usize;
     let length = patch.length as usize;
     if offset + length > data.len() {
@@ -706,12 +751,18 @@ fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut V
         },
 
         TemplateFieldKind::Whirlpool(field) => match field {
-            WhirlpoolField::AmountIn => write_u128(plan.amount_in as u128, slice),
+            WhirlpoolField::AmountIn => write_u128(plan.input_amount as u128, slice),
             WhirlpoolField::AmountOut => {
-                let threshold = plan
-                    .min_output_amount
-                    .unwrap_or_else(|| guarded_expected_output(plan));
+                let threshold = if plan.amount_specified_is_input {
+                    plan.min_output_amount
+                        .unwrap_or_else(|| guarded_expected_output(plan))
+                } else {
+                    plan.min_output_amount.unwrap_or_else(|| plan.amount_in)
+                };
                 write_u128(threshold as u128, slice)
+            }
+            WhirlpoolField::AmountSpecifiedIsInput => {
+                write_bool_flag(plan.amount_specified_is_input, slice)?;
             }
             WhirlpoolField::SqrtPriceLimit => {
                 if let Some(limit) = plan.sqrt_price_limit {
@@ -719,7 +770,7 @@ fn apply_patch(plan: &BundleInstructionPlan, patch: &TemplatePatch, data: &mut V
                 }
             }
             WhirlpoolField::RemainingAccountsInfo => {
-                encode_whirlpool_remaining_accounts(plan, data, offset, length, slice)?;
+                encode_whirlpool_remaining_accounts(plan, data, offset, length)?;
             }
         },
         TemplateFieldKind::Custom(_) => {}
@@ -733,15 +784,22 @@ fn encode_whirlpool_remaining_accounts(
     data: &mut Vec<u8>,
     offset: usize,
     length: usize,
-    discriminant_slice: &mut [u8],
 ) -> Result<()> {
     if length != 1 {
         bail!("expected 1-byte discriminant for remaining accounts info");
     }
 
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| anyhow!("remaining accounts slice overflow"))?;
+    if end > data.len() {
+        bail!("template patch out of bounds for remaining accounts info");
+    }
+    let discriminant_slice = &mut data[offset..end];
+
     if plan.context.whirlpool_remaining_accounts.is_empty() {
         discriminant_slice[0] = 0;
-        data.truncate(offset + length);
+        data.truncate(end);
         return Ok(());
     }
 
@@ -751,7 +809,7 @@ fn encode_whirlpool_remaining_accounts(
     }
 
     discriminant_slice[0] = 1;
-    data.truncate(offset + length);
+    data.truncate(end);
 
     let mut payload = Vec::with_capacity(1 + slice_count.saturating_mul(2));
     payload.extend_from_slice(&(slice_count as u32).to_le_bytes());
@@ -767,6 +825,17 @@ fn write_u128(value: u128, dst: &mut [u8]) {
     let bytes = value.to_le_bytes();
     let len = dst.len().min(bytes.len());
     dst[..len].copy_from_slice(&bytes[..len]);
+}
+
+fn write_bool_flag(value: bool, dst: &mut [u8]) -> Result<()> {
+    if dst.len() != 1 {
+        bail!(
+            "unexpected bool encoding length {}, expected 1 byte",
+            dst.len()
+        );
+    }
+    dst[0] = value as u8;
+    Ok(())
 }
 
 fn write_i128(value: i128, dst: &mut [u8]) {
@@ -974,6 +1043,7 @@ mod tests {
     use super::*;
     use crate::builder::templates::{AccountSpec, SwapMintRole};
     use crate::config::AppConfig;
+    use crate::template::{WhirlpoolRemainingAccountsSlice, WhirlpoolRemainingAccountsType};
     use serde_json::json;
     use solana_sdk::instruction::AccountMeta;
     use std::convert::TryInto;
@@ -992,7 +1062,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 42,
+            input_amount: 42,
             expected_output_amount: 84,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1030,6 +1102,187 @@ mod tests {
     }
 
     #[test]
+    fn encodes_whirlpool_remaining_accounts_payload() {
+        let context = TemplateContext {
+            whirlpool_remaining_accounts: vec![
+                WhirlpoolRemainingAccountsSlice {
+                    accounts_type: WhirlpoolRemainingAccountsType::SupplementalTickArrays,
+                    length: 2,
+                },
+                WhirlpoolRemainingAccountsSlice {
+                    accounts_type: WhirlpoolRemainingAccountsType::TransferHookA,
+                    length: 1,
+                },
+            ],
+            ..TemplateContext::default()
+        };
+        let plan = basic_plan(context);
+        let offset = 2usize;
+        let length = 1usize;
+        let mut data = vec![0u8; offset + length];
+
+        encode_whirlpool_remaining_accounts(&plan, &mut data, offset, length)
+            .expect("encode remaining accounts");
+
+        assert_eq!(data[offset], 1);
+        let payload = &data[offset + length..];
+        assert_eq!(
+            payload.len(),
+            4 + plan.context.whirlpool_remaining_accounts.len() * 2
+        );
+        let slice_count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        assert_eq!(slice_count, 2);
+        assert_eq!(
+            payload[4],
+            WhirlpoolRemainingAccountsType::SupplementalTickArrays.discriminant()
+        );
+        assert_eq!(payload[5], 2);
+        assert_eq!(
+            payload[6],
+            WhirlpoolRemainingAccountsType::TransferHookA.discriminant()
+        );
+        assert_eq!(payload[7], 1);
+    }
+
+    #[test]
+    fn encode_whirlpool_remaining_accounts_sets_none_discriminant() {
+        let plan = basic_plan(TemplateContext::default());
+        let offset = 3usize;
+        let length = 1usize;
+        let mut data = vec![0u8; offset + length];
+
+        encode_whirlpool_remaining_accounts(&plan, &mut data, offset, length)
+            .expect("encode remaining accounts none");
+
+        assert_eq!(data.len(), offset + length);
+        assert_eq!(data[offset], 0);
+    }
+
+    #[test]
+    fn whirlpool_exact_out_plan_encodes_parameters() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let specs = whirlpool_account_specs();
+        let accounts = specs
+            .iter()
+            .map(|spec| {
+                if spec.is_writable {
+                    AccountMeta::new(Pubkey::default(), spec.is_signer)
+                } else {
+                    AccountMeta::new_readonly(Pubkey::default(), spec.is_signer)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let token_mint_a = Pubkey::new_unique();
+        let token_mint_b = Pubkey::new_unique();
+
+        let template = InstructionTemplate {
+            key: TemplateCacheKey::new(pool, SwapTemplateDirection::BaseIn),
+            program_id,
+            discriminator: [0u8; 8],
+            accounts: StdArc::from(accounts),
+            data: StdArc::new(vec![0u8; 24]),
+            patches: StdArc::from(vec![
+                TemplatePatch {
+                    offset: 0,
+                    length: 8,
+                    kind: TemplateFieldKind::Whirlpool(WhirlpoolField::AmountIn),
+                },
+                TemplatePatch {
+                    offset: 8,
+                    length: 8,
+                    kind: TemplateFieldKind::Whirlpool(WhirlpoolField::AmountOut),
+                },
+                TemplatePatch {
+                    offset: 16,
+                    length: 1,
+                    kind: TemplateFieldKind::Whirlpool(WhirlpoolField::AmountSpecifiedIsInput),
+                },
+            ]),
+            cu_budget: 0,
+            tlv_bytes: 0,
+            template_hash: [0u8; 32],
+            alt_handle: None,
+            metadata: TemplateMetadata::Whirlpool {
+                account_specs: specs,
+                pool_accounts: Some(WhirlpoolPoolAccounts {
+                    whirlpool: pool,
+                    token_mint_a,
+                    token_mint_b,
+                    token_vault_a: Some(Pubkey::new_unique()),
+                    token_vault_b: Some(Pubkey::new_unique()),
+                    token_program_a: Some(Pubkey::new_unique()),
+                    token_program_b: Some(Pubkey::new_unique()),
+                    oracle: Some(Pubkey::new_unique()),
+                }),
+            },
+            hydrated_at: Instant::now(),
+        };
+        cache.insert(template);
+
+        let owner_account_a = Pubkey::new_unique();
+        let owner_account_b = Pubkey::new_unique();
+        let mut context = TemplateContext::default();
+        context.payer = Some(Pubkey::new_unique());
+        context.input_token_account = Some(owner_account_a);
+        context.output_token_account = Some(owner_account_b);
+        context.whirlpool_tick_arrays = vec![
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: token_mint_a.to_string(),
+            output_mint: token_mint_b.to_string(),
+            amount_in: 150,
+            input_amount: 200,
+            expected_output_amount: 150,
+            amount_specified_is_input: false,
+            fee_bps: 10,
+            template_fee_bps: 10,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: Some(140),
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context,
+            lookup_table: None,
+        };
+
+        let payer = Pubkey::new_unique();
+        let token_atas = HashMap::new();
+        let bundle = build_bundle(
+            1,
+            payer,
+            &cache,
+            &token_atas,
+            Hash::default(),
+            &[],
+            &[plan.clone()],
+            &[],
+        )
+        .expect("bundle");
+
+        assert_eq!(bundle.instructions.len(), 1);
+        let data = &bundle.instructions[0].data;
+        assert!(data.len() >= 17);
+        let amount_in_bytes: [u8; 8] = data[0..8].try_into().expect("amount in slice");
+        let amount_out_bytes: [u8; 8] = data[8..16].try_into().expect("amount out slice");
+        assert_eq!(u64::from_le_bytes(amount_in_bytes), plan.input_amount);
+        assert_eq!(
+            u64::from_le_bytes(amount_out_bytes),
+            plan.min_output_amount.unwrap()
+        );
+        assert_eq!(data[16], 0u8, "amount_specified_is_input flag should be false");
+    }
+
+    #[test]
     fn deduplicates_lookup_tables() {
         let cache = TemplateCache::new(test_config());
         let pool = Pubkey::new_unique();
@@ -1055,7 +1308,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 2,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1069,6 +1324,7 @@ mod tests {
         };
         let mut plan_b = plan_a.clone();
         plan_b.amount_in = 3;
+        plan_b.input_amount = 3;
 
         let payer = Pubkey::new_unique();
         let token_atas = HashMap::new();
@@ -1098,7 +1354,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 2,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1141,7 +1399,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 1,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1184,7 +1444,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 2,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1248,7 +1510,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 2,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1314,7 +1578,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 2,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1377,7 +1643,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 10,
+            input_amount: 10,
             expected_output_amount,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1437,7 +1705,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 10,
+            input_amount: 10,
             expected_output_amount: 1_000_000,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1487,7 +1757,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 1,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1537,7 +1809,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 1,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1593,7 +1867,9 @@ mod tests {
             input_mint: "mintA".into(),
             output_mint: "mintB".into(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 2,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1659,7 +1935,9 @@ mod tests {
             input_mint: pool_accounts.mint0.to_string(),
             output_mint: pool_accounts.mint1.to_string(),
             amount_in: 10,
+            input_amount: 10,
             expected_output_amount: 20,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1742,7 +2020,9 @@ mod tests {
             input_mint: pool_accounts.mint0.to_string(),
             output_mint: pool_accounts.mint1.to_string(),
             amount_in: 10,
+            input_amount: 10,
             expected_output_amount: 20,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1785,12 +2065,18 @@ mod tests {
         let vault_a = Pubkey::new_unique();
         let vault_b = Pubkey::new_unique();
         let oracle = Pubkey::new_unique();
+        let token_mint_a = Pubkey::new_unique();
+        let token_mint_b = Pubkey::new_unique();
+        let token_program_a = Pubkey::new_unique();
+        let token_program_b = Pubkey::new_unique();
         let pool_accounts = WhirlpoolPoolAccounts {
             whirlpool: pool,
-            token_mint_a: Pubkey::new_unique(),
-            token_mint_b: Pubkey::new_unique(),
+            token_mint_a,
+            token_mint_b,
             token_vault_a: Some(vault_a),
             token_vault_b: Some(vault_b),
+            token_program_a: Some(token_program_a),
+            token_program_b: Some(token_program_b),
             oracle: Some(oracle),
         };
 
@@ -1815,7 +2101,9 @@ mod tests {
             input_mint: pool_accounts.token_mint_a.to_string(),
             output_mint: pool_accounts.token_mint_b.to_string(),
             amount_in: 1,
+            input_amount: 1,
             expected_output_amount: 1,
+            amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
@@ -1855,6 +2143,18 @@ mod tests {
 
         let oracle_idx = find_account_index(specs, "oracle");
         assert_eq!(hydrated[oracle_idx].pubkey, oracle);
+
+        let mint_a_idx = find_account_index(specs, "tokenMintA");
+        let mint_b_idx = find_account_index(specs, "tokenMintB");
+        assert_eq!(hydrated[mint_a_idx].pubkey, token_mint_a);
+        assert_eq!(hydrated[mint_b_idx].pubkey, token_mint_b);
+
+        let program_a_idx = find_account_index(specs, "tokenProgramA");
+        let program_b_idx = find_account_index(specs, "tokenProgramB");
+        assert_eq!(hydrated[program_a_idx].pubkey, token_program_a);
+        assert_eq!(hydrated[program_b_idx].pubkey, token_program_b);
+        let shared_program_idx = find_account_index(specs, "tokenProgram");
+        assert_eq!(hydrated[shared_program_idx].pubkey, token_program_a);
 
         let tick0_idx = find_account_index(specs, "tickArray0");
         let tick1_idx = find_account_index(specs, "tickArray1");
@@ -1952,6 +2252,29 @@ mod tests {
             hydrated_at: Instant::now(),
         };
         cache.insert(template);
+    }
+
+    fn basic_plan(context: TemplateContext) -> BundleInstructionPlan {
+        BundleInstructionPlan {
+            pool_id: Pubkey::new_unique().to_string(),
+            program_id: Pubkey::new_unique().to_string(),
+            input_mint: "mintA".into(),
+            output_mint: "mintB".into(),
+            amount_in: 0,
+            input_amount: 0,
+            expected_output_amount: 0,
+            amount_specified_is_input: true,
+            fee_bps: 0,
+            template_fee_bps: 0,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context,
+            lookup_table: None,
+        }
     }
 
     fn insert_whirlpool_template(
@@ -2106,6 +2429,24 @@ mod tests {
                         mint_role: None,
                     },
                     AccountSpec {
+                        name: "tokenProgramA",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint0),
+                    },
+                    AccountSpec {
+                        name: "tokenProgramB",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint1),
+                    },
+                    AccountSpec {
                         name: "tokenAuthority",
                         is_signer: true,
                         is_writable: false,
@@ -2122,6 +2463,24 @@ mod tests {
                         address: None,
                         pda: None,
                         mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "tokenMintA",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint0),
+                    },
+                    AccountSpec {
+                        name: "tokenMintB",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: Some(SwapMintRole::Mint1),
                     },
                     AccountSpec {
                         name: "tokenOwnerAccountA",

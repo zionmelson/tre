@@ -712,6 +712,7 @@ impl RaydiumV3Adapter {
             min_output_amount: None,
             limit_price: None,
             price_impact_limit_bps: None,
+            amount_specified_is_input: true,
             context: {
                 let mut context = TemplateContext {
                     compute_unit_limit: Some(RAYDIUM_DEFAULT_CU_LIMIT),

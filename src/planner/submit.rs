@@ -133,8 +133,10 @@ fn bundle_instruction_plan_from(ix: &PlannedInstruction) -> BundleInstructionPla
         program_id: ix.program_id.clone(),
         input_mint: ix.input_mint.clone(),
         output_mint: ix.output_mint.clone(),
-        amount_in: ix.amount,
+        amount_in: ix.amount_specified,
+        input_amount: ix.input_amount,
         expected_output_amount: ix.estimated_output_amount,
+        amount_specified_is_input: ix.amount_specified_is_input,
         fee_bps: u16::try_from(ix.fee_bps).unwrap_or(u16::MAX),
         template_fee_bps: ix.template_fee_bps,
         direction: match ix.direction {
@@ -326,7 +328,7 @@ fn build_multi_leg_bundle(
             pool = %ix.pool_id,
             input = %ix.input_mint,
             output = %ix.output_mint,
-            amount = ix.amount,
+            amount = ix.input_amount,
             lookup_table = ix
                 .lookup_table
                 .as_ref()
@@ -407,12 +409,23 @@ impl<'a> InstructionPlanner<'a> {
         let mut instructions = Vec::with_capacity(route.legs.len());
         for leg in &route.legs {
             self.ensure_leg_ready(leg)?;
+            let mut context = leg.context.clone();
+            if context.slippage_tolerance_bps.is_none() {
+                context.slippage_tolerance_bps = derive_slippage_tolerance_bps(leg);
+            }
+            let amount_specified = if leg.amount_specified_is_input {
+                leg.input_amount
+            } else {
+                leg.estimated_output_amount
+            };
             instructions.push(PlannedInstruction {
                 pool_id: leg.pool_id.clone(),
                 program_id: leg.program_id.clone(),
                 input_mint: leg.input_mint.clone(),
                 output_mint: leg.output_mint.clone(),
-                amount: leg.input_amount,
+                input_amount: leg.input_amount,
+                amount_specified,
+                amount_specified_is_input: leg.amount_specified_is_input,
                 estimated_output_amount: leg.estimated_output_amount,
                 fee_bps: leg.fee_bps,
                 template_fee_bps: leg.template_fee_bps,
@@ -422,7 +435,7 @@ impl<'a> InstructionPlanner<'a> {
                 min_output_amount: leg.min_output_amount,
                 limit_price: leg.limit_price,
                 price_impact_limit_bps: leg.price_impact_limit_bps,
-                context: leg.context.clone(),
+                context,
             });
         }
 
@@ -544,7 +557,7 @@ impl<'a> InstructionPlanner<'a> {
             return Ok(None);
         }
 
-        let mut borrow_amount = first_swap.amount;
+        let mut borrow_amount = first_swap.input_amount;
         if borrow_amount == 0 {
             return Ok(None);
         }
@@ -624,6 +637,33 @@ impl<'a> InstructionPlanner<'a> {
             );
         }
     }
+}
+
+fn derive_slippage_tolerance_bps(leg: &RouteLegPlan) -> Option<u16> {
+    if let Some(min_output) = leg.min_output_amount {
+        let estimated = leg.estimated_output_amount;
+        if estimated > 0 {
+            let slip = estimated.saturating_sub(min_output);
+            let numerator = u128::from(slip).saturating_mul(10_000);
+            let denom = u128::from(estimated);
+            if denom > 0 {
+                let mut bps = numerator / denom;
+                if numerator % denom != 0 {
+                    bps = bps.saturating_add(1);
+                }
+                let capped = bps.min(u128::from(u16::MAX));
+                return Some(capped as u16);
+            }
+        }
+    }
+
+    let estimate = leg.estimated_slippage_bps;
+    if estimate.is_finite() && estimate >= 0.0 {
+        let ceil = estimate.ceil().min(f64::from(u16::MAX)).max(0.0) as u16;
+        return Some(ceil);
+    }
+
+    None
 }
 
 fn build_tip_funding_plan(
@@ -882,6 +922,7 @@ mod tests {
                     input_amount: 100,
                     available_input_liquidity: 100,
                     estimated_output_amount: 200,
+                    amount_specified_is_input: true,
                     effective_price: 2.0,
                     fee_bps: 30,
                     template_fee_bps: 30,
@@ -903,6 +944,7 @@ mod tests {
                     input_amount: 200,
                     available_input_liquidity: 200,
                     estimated_output_amount: 190,
+                    amount_specified_is_input: true,
                     effective_price: 0.95,
                     fee_bps: 30,
                     template_fee_bps: 30,
@@ -924,8 +966,10 @@ mod tests {
         let planner = InstructionPlanner::new(None);
         let planned = planner.plan(&route, 0, None).expect("instructions");
         assert_eq!(planned.swap_instructions.len(), 2);
-        assert_eq!(planned.swap_instructions[0].amount, 100);
-        assert_eq!(planned.swap_instructions[1].amount, 200);
+        assert!(planned
+            .swap_instructions
+            .iter()
+            .all(|ix| ix.amount_specified_is_input));
         assert_eq!(planned.swap_instructions[1].output_mint, "C");
         assert!(planned
             .swap_instructions
@@ -934,6 +978,101 @@ mod tests {
         assert!(planned.prefix_instructions.is_empty());
         assert!(planned.suffix_instructions.is_empty());
         assert!(planned.flash_loan_plan.is_none());
+        assert_eq!(
+            planned.swap_instructions[0].context.slippage_tolerance_bps,
+            Some(5)
+        );
+        assert_eq!(
+            planned.swap_instructions[1].context.slippage_tolerance_bps,
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn planner_handles_exact_out_leg() {
+        let leg = RouteLegPlan {
+            pool_id: "pool-exact-out".into(),
+            program_id: "prog".into(),
+            input_mint: "A".into(),
+            output_mint: "B".into(),
+            input_amount: 200,
+            available_input_liquidity: 1_000,
+            estimated_output_amount: 150,
+            amount_specified_is_input: false,
+            effective_price: 0.75,
+            fee_bps: 25,
+            template_fee_bps: 20,
+            estimated_slippage_bps: 3.0,
+            direction: PoolQuoteDirection::BaseToQuote,
+            sqrt_price_limit: None,
+            min_output_amount: Some(140),
+            limit_price: None,
+            price_impact_limit_bps: None,
+            context: TemplateContext::default(),
+            template_ready: true,
+            alt_ready: true,
+        };
+
+        let route = RoutePlan {
+            start_mint: "A".into(),
+            end_mint: "B".into(),
+            legs: vec![leg.clone()],
+            estimated_final_output_amount: Some(leg.estimated_output_amount),
+            flash_loan_permitted: false,
+        };
+
+        let planner = InstructionPlanner::new(None);
+        let planned = planner.plan(&route, 0, None).expect("instructions");
+        assert_eq!(planned.swap_instructions.len(), 1);
+        let ix = &planned.swap_instructions[0];
+        assert!(!ix.amount_specified_is_input);
+        assert_eq!(ix.amount_specified, leg.estimated_output_amount);
+        assert_eq!(ix.input_amount, leg.input_amount);
+
+        let bundle_plan = super::bundle_instruction_plan_from(ix);
+        assert!(!bundle_plan.amount_specified_is_input);
+        assert_eq!(bundle_plan.amount_in, leg.estimated_output_amount);
+    }
+
+    #[test]
+    fn planner_derives_slippage_from_min_output() {
+        let route = RoutePlan {
+            start_mint: "A".into(),
+            end_mint: "A".into(),
+            legs: vec![RouteLegPlan {
+                pool_id: "pool-ab".into(),
+                program_id: "prog".into(),
+                input_mint: "A".into(),
+                output_mint: "B".into(),
+                input_amount: 100,
+                available_input_liquidity: 100,
+                estimated_output_amount: 1_000_000,
+                amount_specified_is_input: true,
+                effective_price: 1.0,
+                fee_bps: 30,
+                template_fee_bps: 30,
+                estimated_slippage_bps: 1.0,
+                direction: PoolQuoteDirection::BaseToQuote,
+                sqrt_price_limit: None,
+                min_output_amount: Some(950_000),
+                limit_price: None,
+                price_impact_limit_bps: None,
+                context: TemplateContext::default(),
+                template_ready: true,
+                alt_ready: true,
+            }],
+            estimated_final_output_amount: Some(950_000),
+            flash_loan_permitted: false,
+        };
+
+        let planner = InstructionPlanner::new(None);
+        let planned = planner.plan(&route, 0, None).expect("instructions");
+        assert_eq!(planned.swap_instructions.len(), 1);
+        assert_eq!(planned.swap_instructions[0].input_amount, 100);
+        assert_eq!(
+            planned.swap_instructions[0].context.slippage_tolerance_bps,
+            Some(500)
+        );
     }
 
     #[test]
@@ -968,6 +1107,7 @@ mod tests {
             input_amount: 1_000_000,
             available_input_liquidity: 1_000_000,
             estimated_output_amount: 999_000,
+            amount_specified_is_input: true,
             effective_price: 1.0,
             fee_bps: 30,
             template_fee_bps: 30,

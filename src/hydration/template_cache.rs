@@ -477,6 +477,7 @@ pub enum LbClmmField {
 pub enum WhirlpoolField {
     AmountIn,
     AmountOut,
+    AmountSpecifiedIsInput,
     SqrtPriceLimit,
     RemainingAccountsInfo,
 }
@@ -592,13 +593,14 @@ impl LbClmmFieldLayout {
 pub struct WhirlpoolFieldLayout {
     pub amount_in: TemplateSlice,
     pub amount_out: TemplateSlice,
+    pub amount_specified_is_input: TemplateSlice,
     pub sqrt_price_limit: Option<TemplateSlice>,
     pub remaining_accounts_info: Option<TemplateSlice>,
 }
 
 impl WhirlpoolFieldLayout {
     fn into_patches(self) -> Vec<TemplatePatch> {
-        let mut patches = Vec::with_capacity(4);
+        let mut patches = Vec::with_capacity(5);
         patches.push(TemplatePatch {
             offset: self.amount_in.offset,
             length: self.amount_in.length,
@@ -608,6 +610,11 @@ impl WhirlpoolFieldLayout {
             offset: self.amount_out.offset,
             length: self.amount_out.length,
             kind: TemplateFieldKind::Whirlpool(WhirlpoolField::AmountOut),
+        });
+        patches.push(TemplatePatch {
+            offset: self.amount_specified_is_input.offset,
+            length: self.amount_specified_is_input.length,
+            kind: TemplateFieldKind::Whirlpool(WhirlpoolField::AmountSpecifiedIsInput),
         });
         if let Some(slice) = self.sqrt_price_limit {
             patches.push(TemplatePatch {

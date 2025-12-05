@@ -11,6 +11,8 @@ mod lb_clmm;
 mod raydium_v3;
 mod whirlpool;
 
+pub(crate) use hydration::AsyncHydrator;
+
 pub use crate::template::TemplateContext;
 pub use cp_amm::{CpAmmAdapter, CpAmmAdapterConfig, CpAmmState};
 pub use lb_clmm::{LbClmmAdapter, LbClmmAdapterConfig, LbClmmState};
@@ -25,6 +27,10 @@ pub trait ProtocolAdapter: Send + Sync {
 
     fn supports(&self, program_id: &Pubkey) -> bool {
         self.program_id() == *program_id
+    }
+
+    fn prefer_exact_out_quotes(&self) -> bool {
+        false
     }
 
     fn ingest_pool_update(&self, update: &PoolUpdate);

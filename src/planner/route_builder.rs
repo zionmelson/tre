@@ -4,7 +4,7 @@ use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::builder::{templates::SwapTemplateDirection, BuilderHandle};
-use crate::hydration::types::{PoolQuoteDirection, PoolSnapshot};
+use crate::hydration::types::{PoolQuoteDirection, PoolQuoteSide, PoolSnapshot};
 use crate::hydration::PoolStoreView;
 use crate::planner::graph_manager::{PathLeg, PoolPath};
 use crate::planner::types::{RouteLegPlan, RoutePlan};
@@ -58,7 +58,8 @@ impl RouteBuilder {
             max_slot = max_slot.max(snapshot.slot);
             min_generation = min_generation.min(state.generation);
 
-            let (direction, price, available_input_liquidity) = price_for_leg(&snapshot, leg)?;
+            let (direction, price, available_input_liquidity, quote_side) =
+                price_for_leg(&snapshot, leg)?;
             let pool_key = Pubkey::from_str(&leg.pool_id).ok()?;
             let template_direction = match direction {
                 PoolQuoteDirection::BaseToQuote => SwapTemplateDirection::BaseIn,
@@ -78,8 +79,51 @@ impl RouteBuilder {
             if estimated_output == 0 {
                 estimated_output = 1;
             }
-            let min_output = estimated_output
+            let mut min_output = estimated_output
                 .saturating_sub((estimated_output * DEFAULT_LEG_SLIPPAGE_BPS) / 10_000);
+
+            let amount_specified_is_input = quote_side
+                .map(|side| side.amount_specified_is_input)
+                .unwrap_or(true);
+            if let Some(side) = quote_side {
+                if side.notional > 0 && side.expected_output > 0 && current_amount > 0 {
+                    let scaled = u128::from(side.expected_output)
+                        .saturating_mul(u128::from(current_amount))
+                        / u128::from(side.notional);
+                    if scaled > 0 {
+                        estimated_output = scaled.min(u128::from(u64::MAX)) as u64;
+                    }
+                }
+                if estimated_output == 0 {
+                    estimated_output = 1;
+                }
+                if let (Some(side_min), expected) = (side.min_output_amount, side.expected_output) {
+                    if expected > 0 {
+                        let scaled = u128::from(side_min)
+                            .saturating_mul(u128::from(estimated_output))
+                            / u128::from(expected);
+                        min_output = scaled.min(u128::from(u64::MAX)) as u64;
+                    }
+                }
+            }
+
+            let fee_bps = quote_side
+                .map(|side| side.fee_bps)
+                .unwrap_or(DEFAULT_LEG_FEE_BPS);
+            let template_fee_bps = quote_side
+                .map(|side| side.template_fee_bps)
+                .unwrap_or(DEFAULT_LEG_FEE_BPS as u16);
+            let estimated_slippage_bps = quote_side
+                .map(|side| side.estimated_slippage_bps)
+                .unwrap_or(DEFAULT_LEG_SLIPPAGE_BPS as f64);
+            let sqrt_price_limit = quote_side.and_then(|side| side.sqrt_price_limit);
+            let limit_price = quote_side.and_then(|side| side.limit_price);
+            let price_impact_limit_bps = quote_side.and_then(|side| side.price_impact_limit_bps);
+            let mut context = quote_side
+                .map(|side| side.context.clone())
+                .unwrap_or_else(TemplateContext::default);
+            context.template_ready = readiness.template_ready;
+            context.alt_ready = readiness.alt_ready;
 
             legs.push(RouteLegPlan {
                 pool_id: leg.pool_id.clone(),
@@ -89,16 +133,17 @@ impl RouteBuilder {
                 input_amount: current_amount,
                 available_input_liquidity,
                 estimated_output_amount: estimated_output,
+                amount_specified_is_input,
                 effective_price: price,
-                fee_bps: DEFAULT_LEG_FEE_BPS,
-                template_fee_bps: DEFAULT_LEG_FEE_BPS as u16,
-                estimated_slippage_bps: DEFAULT_LEG_SLIPPAGE_BPS as f64,
+                fee_bps,
+                template_fee_bps,
+                estimated_slippage_bps,
                 direction,
-                sqrt_price_limit: None,
+                sqrt_price_limit,
                 min_output_amount: Some(min_output),
-                limit_price: None,
-                price_impact_limit_bps: None,
-                context: TemplateContext::default(),
+                limit_price,
+                price_impact_limit_bps,
+                context,
                 template_ready: readiness.template_ready,
                 alt_ready: readiness.alt_ready,
             });
@@ -129,7 +174,10 @@ impl RouteBuilder {
     }
 }
 
-fn price_for_leg(snapshot: &PoolSnapshot, leg: &PathLeg) -> Option<(PoolQuoteDirection, f64, u64)> {
+fn price_for_leg<'a>(
+    snapshot: &'a PoolSnapshot,
+    leg: &PathLeg,
+) -> Option<(PoolQuoteDirection, f64, u64, Option<&'a PoolQuoteSide>)> {
     let direction =
         if leg.input_mint == snapshot.base_mint && leg.output_mint == snapshot.quote_mint {
             PoolQuoteDirection::BaseToQuote
@@ -139,21 +187,19 @@ fn price_for_leg(snapshot: &PoolSnapshot, leg: &PathLeg) -> Option<(PoolQuoteDir
             return None;
         };
 
-    let (price, available_input_liquidity) = if let Some(side) = snapshot.quote(direction) {
+    if let Some(side) = snapshot.quote(direction) {
         if let Some(price) = side.price() {
-            (price, side.notional)
-        } else {
-            (0.0, 0)
+            if price > 0.0 {
+                return Some((direction, price, side.notional, Some(side)));
+            }
         }
-    } else if let Some(price) = snapshot.price_for_mints(&leg.input_mint, &leg.output_mint) {
-        (price, 0)
-    } else {
-        (0.0, 0)
-    };
-
-    if price <= 0.0 {
-        return None;
     }
 
-    Some((direction, price, available_input_liquidity))
+    if let Some(price) = snapshot.price_for_mints(&leg.input_mint, &leg.output_mint) {
+        if price > 0.0 {
+            return Some((direction, price, 0, None));
+        }
+    }
+
+    None
 }

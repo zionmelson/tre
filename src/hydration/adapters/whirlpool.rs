@@ -16,15 +16,23 @@ use uint::construct_uint;
 use super::hydration::AsyncHydrator;
 
 use crate::builder::{BuilderHandle, WhirlpoolPoolAccounts, WhirlpoolPoolMeta};
+use crate::hydration::token_fees::{
+    apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
+};
+use crate::hydration::transfer_hooks::{TransferHookAccountContext, TransferHookAccountsResolver};
 use crate::hydration::types::{
-    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, WhirlpoolPoolExtras,
-    WHIRLPOOL_INPUT_UTILIZATION_BPS,
+    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
+    WhirlpoolAdaptiveFeeConstants, WhirlpoolAdaptiveFeeInfo, WhirlpoolAdaptiveFeeVariables,
+    WhirlpoolPoolExtras, WHIRLPOOL_INPUT_UTILIZATION_BPS,
+};
+use crate::template::{
+    TemplateContext, WhirlpoolRemainingAccountsSlice, WhirlpoolRemainingAccountsType,
 };
 
 use super::{
     build_quote_response, mul_div_price, quote_from_price, AdapterReadiness, ProtocolAdapter,
     QuoteRequest, QuoteResponse, QuoteStatus, ReadinessBlocker, ReadinessBlockerKind,
-    SwapDirection, TemplateContext, WhirlpoolRemainingAccountsSlice, WhirlpoolRemainingAccountsType,
+    SwapDirection,
 };
 
 const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
@@ -39,6 +47,9 @@ const DEFAULT_WHIRLPOOL_POOL_BACKOFF_MS: u64 = 5_000;
 const DEFAULT_WHIRLPOOL_TICK_BACKOFF_MS: u64 = 15_000;
 const DEFAULT_WHIRLPOOL_MAX_POOL_FAILURES: u32 = 5;
 const DEFAULT_WHIRLPOOL_MAX_TICK_FAILURES: u32 = 5;
+const SPL_TOKEN_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const MEMO_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 #[allow(clippy::assign_op_pattern, clippy::manual_div_ceil)]
 mod u256 {
@@ -64,6 +75,7 @@ pub struct WhirlpoolAdapterConfig {
     pub tick_array_backoff_ms: u64,
     pub max_pool_failures: u32,
     pub max_tick_array_failures: u32,
+    pub prefer_exact_out_quotes: bool,
 }
 
 impl Default for WhirlpoolAdapterConfig {
@@ -79,6 +91,7 @@ impl Default for WhirlpoolAdapterConfig {
             tick_array_backoff_ms: DEFAULT_WHIRLPOOL_TICK_BACKOFF_MS,
             max_pool_failures: DEFAULT_WHIRLPOOL_MAX_POOL_FAILURES,
             max_tick_array_failures: DEFAULT_WHIRLPOOL_MAX_TICK_FAILURES,
+            prefer_exact_out_quotes: false,
         }
     }
 }
@@ -88,6 +101,8 @@ pub struct WhirlpoolAdapter {
     state: DashMap<Pubkey, WhirlpoolState>,
     config: WhirlpoolAdapterConfig,
     hydrator: Option<WhirlpoolPoolHydrator>,
+    transfer_fee_cache: Option<TokenTransferFeeHydrator>,
+    transfer_hook_resolver: Option<TransferHookAccountsResolver>,
     template_builder: Option<BuilderHandle>,
     registered_templates: DashMap<Pubkey, WhirlpoolRegistration>,
 }
@@ -102,6 +117,13 @@ impl WhirlpoolAdapter {
         let program_id = Pubkey::from_str(WHIRLPOOL_PROGRAM_ID)
             .expect("static Whirlpool program id should be valid");
         let hydrator = WhirlpoolPoolHydrator::new(&config, program_id);
+        let transfer_fee_cache = TokenTransferFeeHydrator::new(
+            &config.rpc_endpoints,
+            config.rpc_timeout_ms,
+            config.hydration_retry_ms,
+        );
+        let transfer_hook_resolver =
+            TransferHookAccountsResolver::new(&config.rpc_endpoints, config.rpc_timeout_ms);
         if let Some(hydrator) = hydrator.as_ref() {
             info!(
                 target = "adapter::whirlpool",
@@ -119,6 +141,8 @@ impl WhirlpoolAdapter {
             state: DashMap::new(),
             config,
             hydrator,
+            transfer_fee_cache,
+            transfer_hook_resolver,
             template_builder,
             registered_templates: DashMap::new(),
         }
@@ -190,7 +214,7 @@ impl WhirlpoolAdapter {
             _ => (None, None),
         };
 
-        let state = WhirlpoolState {
+        let mut state = WhirlpoolState {
             whirlpool: pool_pubkey,
             token_mint_a,
             token_mint_b,
@@ -200,6 +224,14 @@ impl WhirlpoolAdapter {
                 .and_then(|value| parse_pubkey(value)),
             token_vault_b: extras
                 .token_vault_b
+                .as_ref()
+                .and_then(|value| parse_pubkey(value)),
+            token_program_a: extras
+                .token_program_a
+                .as_ref()
+                .and_then(|value| parse_pubkey(value)),
+            token_program_b: extras
+                .token_program_b
                 .as_ref()
                 .and_then(|value| parse_pubkey(value)),
             reserve_a,
@@ -223,9 +255,17 @@ impl WhirlpoolAdapter {
                 .tick_array2
                 .as_ref()
                 .and_then(|value| parse_pubkey(value)),
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            transfer_hook_program_a: None,
+            transfer_hook_program_b: None,
+            trade_enable_timestamp: extras.trade_enable_timestamp,
+            adaptive_fee: extras.adaptive_fee,
             last_update_slot: update.slot,
             last_update_at: Instant::now(),
         };
+
+        self.attach_transfer_metadata(&mut state);
 
         trace!(
             target = "adapter::whirlpool",
@@ -243,10 +283,6 @@ impl WhirlpoolAdapter {
     }
 
     fn enrich_extras(&self, pool: Pubkey, mut extras: WhirlpoolPoolExtras) -> WhirlpoolPoolExtras {
-        if !needs_hydration(&extras) {
-            return extras;
-        }
-
         let Some(hydrator) = self.hydrator.as_ref() else {
             return extras;
         };
@@ -264,6 +300,12 @@ impl WhirlpoolAdapter {
             extras.token_vault_b = extras
                 .token_vault_b
                 .or_else(|| Some(meta.token_vault_b.to_string()));
+            extras.token_program_a = extras
+                .token_program_a
+                .or_else(|| Some(meta.token_program_a.to_string()));
+            extras.token_program_b = extras
+                .token_program_b
+                .or_else(|| Some(meta.token_program_b.to_string()));
             extras.tick_spacing = extras.tick_spacing.or(Some(meta.tick_spacing));
             extras.liquidity = extras.liquidity.or(Some(meta.liquidity));
             extras.sqrt_price_x64 = extras.sqrt_price_x64.or(Some(meta.sqrt_price_x64));
@@ -271,6 +313,12 @@ impl WhirlpoolAdapter {
             extras.fee_rate = extras.fee_rate.or(Some(meta.fee_rate));
             extras.protocol_fee_rate = extras.protocol_fee_rate.or(Some(meta.protocol_fee_rate));
             extras.oracle = extras.oracle.or_else(|| Some(meta.oracle.to_string()));
+            extras.trade_enable_timestamp = extras
+                .trade_enable_timestamp
+                .or(meta.trade_enable_timestamp);
+            if extras.adaptive_fee.is_none() {
+                extras.adaptive_fee = meta.adaptive_fee;
+            }
         }
 
         extras
@@ -315,6 +363,8 @@ impl WhirlpoolAdapter {
             token_mint_b: state.token_mint_b,
             token_vault_a: state.token_vault_a,
             token_vault_b: state.token_vault_b,
+            token_program_a: state.token_program_a,
+            token_program_b: state.token_program_b,
             oracle: state.oracle,
         };
 
@@ -330,8 +380,18 @@ impl WhirlpoolAdapter {
             .insert(state.whirlpool, WhirlpoolRegistration { alt_accounts });
     }
 
+    fn attach_transfer_metadata(&self, state: &mut WhirlpoolState) {
+        let Some(cache) = self.transfer_fee_cache.as_ref() else {
+            return;
+        };
+        state.token_a_transfer_fee = cache.hydrate(state.token_mint_a);
+        state.token_b_transfer_fee = cache.hydrate(state.token_mint_b);
+        state.transfer_hook_program_a = cache.transfer_hook_program(state.token_mint_a);
+        state.transfer_hook_program_b = cache.transfer_hook_program(state.token_mint_b);
+    }
+
     fn static_alt_accounts(state: &WhirlpoolState) -> Vec<Pubkey> {
-        let mut accounts = Vec::with_capacity(6);
+        let mut accounts = Vec::with_capacity(9);
         accounts.push(state.whirlpool);
         accounts.push(state.token_mint_a);
         accounts.push(state.token_mint_b);
@@ -344,6 +404,9 @@ impl WhirlpoolAdapter {
         if let Some(pk) = state.oracle {
             accounts.push(pk);
         }
+        accounts.push(Self::resolve_token_program(state.token_program_a));
+        accounts.push(Self::resolve_token_program(state.token_program_b));
+        accounts.push(MEMO_PROGRAM_ID);
         Self::dedup_pubkeys(&mut accounts);
         accounts
     }
@@ -353,13 +416,20 @@ impl WhirlpoolAdapter {
         accounts.retain(|pk| seen.insert(*pk));
     }
 
+    fn resolve_token_program(program: Option<Pubkey>) -> Pubkey {
+        program.unwrap_or(SPL_TOKEN_PROGRAM_ID)
+    }
+
     fn decorate_template_context(&self, response: &mut QuoteResponse, state: &WhirlpoolState) {
         let mut context = self.snapshot_template_context(state);
-        let preferred_arrays_full = response.context.whirlpool_tick_arrays.clone();
+        let mut preferred_arrays_full = response.context.whirlpool_tick_arrays.clone();
+        self.ensure_extended_tick_arrays(state, &response.request, &mut preferred_arrays_full);
         let preferred_arrays = preferred_arrays_full.clone();
         if let Some(arrays) = self.resolve_tick_arrays(state, &response.request, &preferred_arrays)
         {
             context.whirlpool_tick_arrays = arrays;
+        } else if context.whirlpool_tick_arrays.is_empty() && !preferred_arrays.is_empty() {
+            context.whirlpool_tick_arrays = preferred_arrays.into_iter().take(3).collect();
         }
         self.attach_owner_accounts(
             state,
@@ -367,12 +437,153 @@ impl WhirlpoolAdapter {
             response.request.input_mint,
             response.request.output_mint,
         );
-        let supplemental_arrays: Vec<Pubkey> = preferred_arrays_full
-            .into_iter()
-            .skip(3)
-            .collect();
+        self.attach_transfer_hook_accounts(state, &mut context, &response.request);
+        let supplemental_arrays: Vec<Pubkey> = preferred_arrays_full.into_iter().skip(3).collect();
         self.attach_supplemental_tick_arrays(&mut context, &supplemental_arrays);
         response.context = context;
+    }
+
+    fn ensure_extended_tick_arrays(
+        &self,
+        state: &WhirlpoolState,
+        req: &QuoteRequest,
+        preferred: &mut Vec<Pubkey>,
+    ) {
+        const MAX_EXTENDED: usize = 5;
+        Self::dedup_pubkeys(preferred);
+        if preferred.len() >= MAX_EXTENDED {
+            preferred.truncate(MAX_EXTENDED);
+            return;
+        }
+        let Some(direction) = resolve_direction(state, req) else {
+            return;
+        };
+        if let Some((primary, supplemental)) = self.derive_tick_array_window(state, direction) {
+            Self::merge_unique_pubkeys(preferred, &primary);
+            Self::merge_unique_pubkeys(preferred, &supplemental);
+        }
+        if preferred.len() > MAX_EXTENDED {
+            preferred.truncate(MAX_EXTENDED);
+        }
+    }
+
+    fn attach_transfer_hook_accounts(
+        &self,
+        state: &WhirlpoolState,
+        context: &mut TemplateContext,
+        request: &QuoteRequest,
+    ) {
+        let Some(resolver) = self.transfer_hook_resolver.as_ref() else {
+            return;
+        };
+        let (input_contexts, input_slice) = self.collect_transfer_hook_accounts(
+            resolver,
+            state,
+            context,
+            request.input_mint,
+            WhirlpoolRemainingAccountsType::TransferHookInput,
+        );
+        let (output_contexts, output_slice) = self.collect_transfer_hook_accounts(
+            resolver,
+            state,
+            context,
+            request.output_mint,
+            WhirlpoolRemainingAccountsType::TransferHookOutput,
+        );
+
+        if let Some((accounts, slice)) = input_contexts.zip(input_slice) {
+            context.remaining_accounts.extend(accounts);
+            context.whirlpool_remaining_accounts.push(slice);
+        }
+        if let Some((accounts, slice)) = output_contexts.zip(output_slice) {
+            context.remaining_accounts.extend(accounts);
+            context.whirlpool_remaining_accounts.push(slice);
+        }
+    }
+
+    fn collect_transfer_hook_accounts(
+        &self,
+        resolver: &TransferHookAccountsResolver,
+        state: &WhirlpoolState,
+        context: &TemplateContext,
+        mint: Pubkey,
+        accounts_type: WhirlpoolRemainingAccountsType,
+    ) -> (
+        Option<Vec<AccountMeta>>,
+        Option<WhirlpoolRemainingAccountsSlice>,
+    ) {
+        let program_id = match state.transfer_hook_program_for_mint(mint) {
+            Some(id) => id,
+            None => return (None, None),
+        };
+        let hook_context =
+            match self.transfer_hook_account_context(state, context, mint, accounts_type) {
+                Some(ctx) => ctx,
+                None => return (None, None),
+            };
+        self.transfer_hook_contexts(resolver, program_id, mint, hook_context, accounts_type)
+    }
+
+    fn transfer_hook_contexts(
+        &self,
+        resolver: &TransferHookAccountsResolver,
+        program_id: Pubkey,
+        mint: Pubkey,
+        hook_context: TransferHookAccountContext,
+        accounts_type: WhirlpoolRemainingAccountsType,
+    ) -> (
+        Option<Vec<AccountMeta>>,
+        Option<WhirlpoolRemainingAccountsSlice>,
+    ) {
+        let contexts = [hook_context];
+        let Some(accounts) = resolver.resolve_accounts(program_id, mint, &contexts) else {
+            return (None, None);
+        };
+        let slice = WhirlpoolRemainingAccountsSlice {
+            accounts_type,
+            length: accounts.len().min(u8::MAX as usize) as u8,
+        };
+        (Some(accounts), Some(slice))
+    }
+
+    fn transfer_hook_account_context(
+        &self,
+        state: &WhirlpoolState,
+        context: &TemplateContext,
+        mint: Pubkey,
+        accounts_type: WhirlpoolRemainingAccountsType,
+    ) -> Option<TransferHookAccountContext> {
+        match accounts_type {
+            WhirlpoolRemainingAccountsType::TransferHookInput => {
+                let source = context.input_token_account?;
+                let destination = state.vault_for_mint(mint)?;
+                let authority = context.payer?;
+                Some(TransferHookAccountContext {
+                    source,
+                    destination,
+                    authority,
+                })
+            }
+            WhirlpoolRemainingAccountsType::TransferHookOutput => {
+                let source = state.vault_for_mint(mint)?;
+                let destination = context.output_token_account?;
+                Some(TransferHookAccountContext {
+                    source,
+                    destination,
+                    authority: state.whirlpool,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn merge_unique_pubkeys(target: &mut Vec<Pubkey>, source: &[Pubkey]) {
+        let mut seen: HashSet<Pubkey> = target.iter().copied().collect();
+        for pk in source {
+            if seen.insert(*pk) {
+                target.push(*pk);
+            }
+        }
     }
 
     fn resolve_tick_arrays(
@@ -450,6 +661,70 @@ impl WhirlpoolAdapter {
         }
     }
 
+    fn attach_supplemental_tick_arrays(
+        &self,
+        context: &mut TemplateContext,
+        supplemental_arrays: &[Pubkey],
+    ) {
+        const MAX_PER_SLICE: usize = 3;
+        const SLICE_TYPES: [WhirlpoolRemainingAccountsType; 3] = [
+            WhirlpoolRemainingAccountsType::SupplementalTickArrays,
+            WhirlpoolRemainingAccountsType::SupplementalTickArraysOne,
+            WhirlpoolRemainingAccountsType::SupplementalTickArraysTwo,
+        ];
+
+        if supplemental_arrays.is_empty() {
+            return;
+        }
+
+        let mut seen = HashSet::with_capacity(
+            context.whirlpool_tick_arrays.len() + context.remaining_accounts.len(),
+        );
+        for pk in &context.whirlpool_tick_arrays {
+            seen.insert(*pk);
+        }
+        for meta in &context.remaining_accounts {
+            seen.insert(meta.pubkey);
+        }
+
+        let max_accounts = MAX_PER_SLICE * SLICE_TYPES.len();
+        let mut extras = Vec::with_capacity(supplemental_arrays.len().min(max_accounts));
+        for pk in supplemental_arrays.iter().copied() {
+            if pk == Pubkey::default() {
+                continue;
+            }
+            if seen.insert(pk) {
+                extras.push(pk);
+                if extras.len() == max_accounts {
+                    break;
+                }
+            }
+        }
+
+        if extras.is_empty() {
+            return;
+        }
+
+        context.remaining_accounts.extend(
+            extras
+                .iter()
+                .copied()
+                .map(|pk| AccountMeta::new_readonly(pk, false)),
+        );
+
+        for (index, chunk) in extras.chunks(MAX_PER_SLICE).enumerate() {
+            if index >= SLICE_TYPES.len() {
+                break;
+            }
+            context
+                .whirlpool_remaining_accounts
+                .push(WhirlpoolRemainingAccountsSlice {
+                    accounts_type: SLICE_TYPES[index],
+                    length: chunk.len() as u8,
+                });
+        }
+    }
+
     fn snapshot_template_context(&self, _state: &WhirlpoolState) -> TemplateContext {
         let context = TemplateContext {
             compute_unit_limit: Some(WHIRLPOOL_DEFAULT_CU_LIMIT),
@@ -497,6 +772,15 @@ impl WhirlpoolAdapter {
         state: &WhirlpoolState,
         direction: TradeDirection,
     ) -> Option<Vec<Pubkey>> {
+        self.derive_tick_array_window(state, direction)
+            .map(|(primary, _)| primary)
+    }
+
+    fn derive_tick_array_window(
+        &self,
+        state: &WhirlpoolState,
+        direction: TradeDirection,
+    ) -> Option<(Vec<Pubkey>, Vec<Pubkey>)> {
         let tick_spacing = state.tick_spacing?;
         let current_tick = state.tick_current_index?;
         let mut span = tick_array_span(tick_spacing)?;
@@ -507,28 +791,45 @@ impl WhirlpoolAdapter {
             span = span.abs();
         }
         let anchor = active_tick_array_start(tick_spacing, current_tick)?;
-        let offsets = match direction {
-            TradeDirection::AToB => [0, -1, -2],
-            TradeDirection::BToA => [0, 1, 2],
+        let (primary_offsets, supplemental_offsets) = match direction {
+            TradeDirection::AToB => ([0, -1, -2], [1, 2]),
+            TradeDirection::BToA => ([0, 1, 2], [-1, -2]),
         };
 
-        let mut arrays = Vec::with_capacity(3);
-        for multiplier in offsets {
-            let step = span.checked_mul(multiplier)?;
-            let start = match multiplier {
-                0 => anchor,
-                _ => anchor.checked_add(step)?,
-            };
+        let mut primary = Vec::with_capacity(primary_offsets.len());
+        for offset in primary_offsets {
+            let start = Self::compute_tick_array_start(anchor, span, offset)?;
             if start < math::MIN_TICK || start > math::MAX_TICK {
                 return None;
             }
-            arrays.push(derive_tick_array_address(
+            primary.push(derive_tick_array_address(
                 &state.whirlpool,
                 start,
                 &self.program_id,
             ));
         }
-        Some(arrays)
+
+        let mut supplemental = Vec::with_capacity(supplemental_offsets.len());
+        for offset in supplemental_offsets {
+            let Some(start) = Self::compute_tick_array_start(anchor, span, offset) else {
+                continue;
+            };
+            if start < math::MIN_TICK || start > math::MAX_TICK {
+                continue;
+            }
+            supplemental.push(derive_tick_array_address(
+                &state.whirlpool,
+                start,
+                &self.program_id,
+            ));
+        }
+
+        Some((primary, supplemental))
+    }
+
+    fn compute_tick_array_start(anchor: i32, span: i32, offset: i32) -> Option<i32> {
+        let step = span.checked_mul(offset)?;
+        anchor.checked_add(step)
     }
 
     fn tick_arrays_for_request(
@@ -555,6 +856,7 @@ impl WhirlpoolAdapter {
         input_mint: Pubkey,
         output_mint: Pubkey,
         probe_amount: u64,
+        amount_specified_is_input: bool,
     ) -> Option<PoolQuoteSide> {
         if probe_amount == 0 || input_mint == output_mint {
             return None;
@@ -576,30 +878,45 @@ impl WhirlpoolAdapter {
             output_mint,
             amount: probe_amount,
             slot,
-            direction: SwapDirection::ExactIn,
+            direction: if amount_specified_is_input {
+                SwapDirection::ExactIn
+            } else {
+                SwapDirection::ExactOut
+            },
         };
 
         let direction = resolve_direction(state, &req)?;
         let mut preferred_arrays = Vec::new();
-        let simulation =
-            simulate_authoritative_exact_in(self.hydrator.as_ref(), state, &req, probe_amount)
-                .ok()?;
-        let sqrt_price_limit = Some(simulation.sqrt_price_after);
+        let (simulation, notional) = if amount_specified_is_input {
+            match simulate_authoritative_exact_in(
+                self.hydrator.as_ref(),
+                state,
+                &req,
+                probe_amount,
+            ) {
+                Ok(sim) => (sim, probe_amount),
+                Err(SimulationError::MissingState | SimulationError::MissingTickArrays) => {
+                    let sim = simulate_constant_liquidity_exact_in(state, &req).ok()?;
+                    (sim, probe_amount)
+                }
+                Err(SimulationError::InsufficientLiquidity) => return None,
+            }
+        } else {
+            let (required_input, sim) =
+                find_input_for_exact_out(self.hydrator.as_ref(), state, &req, probe_amount)
+                    .ok()?;
+            (sim, required_input)
+        };
         if !simulation.tick_arrays.is_empty() {
             preferred_arrays = simulation.tick_arrays.clone();
         }
         let expected_output = simulation.amount_out;
-        let slippage_bps = simulation.edge_bps;
-
-        if expected_output == 0 {
+        if expected_output == 0 || simulation.consumed_input == 0 {
             return None;
         }
-
-        let effective_price = if probe_amount == 0 {
-            0.0
-        } else {
-            expected_output as f64 / simulation.consumed_input as f64
-        };
+        let effective_price = simulation.amount_out as f64 / simulation.consumed_input as f64;
+        let slippage_bps = simulation.edge_bps;
+        let sqrt_price_limit = Some(simulation.sqrt_price_after);
 
         let fee_bps = whirlpool_trade_fee_bps(state);
         let template_fee_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
@@ -615,7 +932,7 @@ impl WhirlpoolAdapter {
         Some(PoolQuoteSide {
             input_mint: input_mint.to_string(),
             output_mint: output_mint.to_string(),
-            notional: probe_amount,
+            notional,
             expected_output,
             fee_bps,
             template_fee_bps,
@@ -625,6 +942,7 @@ impl WhirlpoolAdapter {
             min_output_amount: Some(expected_output),
             limit_price: None,
             price_impact_limit_bps: None,
+            amount_specified_is_input,
             context,
             status: QuoteStatus::Ok,
             sqrt_price_before_x64: simulation.sqrt_price_before,
@@ -642,6 +960,10 @@ impl ProtocolAdapter for WhirlpoolAdapter {
 
     fn program_id(&self) -> Pubkey {
         self.program_id
+    }
+
+    fn prefer_exact_out_quotes(&self) -> bool {
+        self.config.prefer_exact_out_quotes
     }
 
     fn ingest_pool_update(&self, update: &PoolUpdate) {
@@ -711,12 +1033,29 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         }
         request.amount = capped_amount;
 
-        match simulate_best_exact_in(self.hydrator.as_ref(), &state, &request, request.amount) {
+        let input_fee = state.transfer_fee_for_mint(request.input_mint);
+        let output_fee = state.transfer_fee_for_mint(request.output_mint);
+        let Some((net_budget, _)) = apply_post_fee_amount(request.amount, input_fee) else {
+            return None;
+        };
+        if net_budget == 0 {
+            return None;
+        }
+
+        match simulate_best_exact_in(self.hydrator.as_ref(), &state, &request, net_budget) {
             Ok(simulation) => {
-                let mut response = build_quote_response(request, simulation.amount_out);
+                let (net_output_amount, _) =
+                    apply_post_fee_amount(simulation.amount_out, output_fee)
+                        .unwrap_or((simulation.amount_out, 0));
+                let (executed_input_amount, _) =
+                    apply_pre_fee_amount(simulation.consumed_input, input_fee)
+                        .unwrap_or((simulation.consumed_input, 0));
+                let mut response = build_quote_response(request, net_output_amount);
+                response.amount_in = executed_input_amount;
                 response.edge_bps = simulation.edge_bps;
                 response.sqrt_price_limit = Some(simulation.sqrt_price_after);
-                response.min_output_amount = Some(simulation.amount_out);
+                response.min_output_amount = Some(net_output_amount);
+                response.context.expected_fee_amount = Some(simulation.fee_amount);
                 if !simulation.tick_arrays.is_empty() {
                     response.context.whirlpool_tick_arrays = simulation.tick_arrays.clone();
                 }
@@ -728,9 +1067,11 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                 let price = state.mid_price()?;
                 let amount_out =
                     quote_from_price(&request, &state.token_mint_a, &state.token_mint_b, price)?;
-                let mut fallback = build_quote_response(request, amount_out);
+                let (net_fallback_out, _) =
+                    apply_post_fee_amount(amount_out, output_fee).unwrap_or((amount_out, 0));
+                let mut fallback = build_quote_response(request, net_fallback_out);
                 fallback.status = status;
-                fallback.min_output_amount = Some(amount_out);
+                fallback.min_output_amount = Some(net_fallback_out);
                 self.decorate_template_context(&mut fallback, &state);
                 Some(fallback)
             }
@@ -751,7 +1092,15 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         if request.amount == 0 {
             return None;
         }
-        match find_input_for_exact_out(self.hydrator.as_ref(), &state, &request, request.amount) {
+        let input_fee = state.transfer_fee_for_mint(request.input_mint);
+        let output_fee = state.transfer_fee_for_mint(request.output_mint);
+        let Some((target_out, _)) = apply_pre_fee_amount(request.amount, output_fee) else {
+            return None;
+        };
+        if target_out == 0 {
+            return None;
+        }
+        match find_input_for_exact_out(self.hydrator.as_ref(), &state, &request, target_out) {
             Ok((amount_in, simulation)) => {
                 let mut response = QuoteResponse {
                     amount_in,
@@ -763,6 +1112,16 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                     request,
                     context: TemplateContext::default(),
                 };
+                let (executed_input_amount, _) =
+                    apply_pre_fee_amount(simulation.consumed_input, input_fee)
+                        .unwrap_or((simulation.consumed_input, 0));
+                let (net_output_amount, _) =
+                    apply_post_fee_amount(simulation.amount_out, output_fee)
+                        .unwrap_or((simulation.amount_out, 0));
+                response.amount_in = executed_input_amount;
+                response.amount_out = net_output_amount;
+                response.min_output_amount = Some(net_output_amount);
+                response.context.expected_fee_amount = Some(simulation.fee_amount);
                 if !simulation.tick_arrays.is_empty() {
                     response.context.whirlpool_tick_arrays = simulation.tick_arrays.clone();
                 }
@@ -772,9 +1131,13 @@ impl ProtocolAdapter for WhirlpoolAdapter {
             Err(err) => {
                 let status: QuoteStatus = err.into();
                 let amount_in = quote_exact_out_from_price(&request, &state)?;
+                let (executed_input_amount, _) =
+                    apply_pre_fee_amount(amount_in, input_fee).unwrap_or((amount_in, 0));
+                let (net_amount_out, _) = apply_post_fee_amount(request.amount, output_fee)
+                    .unwrap_or((request.amount, 0));
                 let mut response = QuoteResponse {
-                    amount_in,
-                    amount_out: request.amount,
+                    amount_in: executed_input_amount,
+                    amount_out: net_amount_out,
                     edge_bps: 0.0,
                     sqrt_price_limit: None,
                     min_output_amount: None,
@@ -782,6 +1145,7 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                     request,
                     context: TemplateContext::default(),
                 };
+                response.min_output_amount = Some(net_amount_out);
                 self.decorate_template_context(&mut response, &state);
                 Some(response)
             }
@@ -798,25 +1162,83 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         }
 
         let utilization = self.config.max_swap_utilization_bps;
-        let base_probe = snapshot_probe_amount(snapshot.base_post_amount, utilization)?;
-        let quote_probe = snapshot_probe_amount(snapshot.quote_post_amount, utilization)?;
+        let base_probe = snapshot_probe_amount(snapshot.base_post_amount, utilization);
+        let quote_probe = snapshot_probe_amount(snapshot.quote_post_amount, utilization);
+        let prefer_exact_out = self.config.prefer_exact_out_quotes;
 
-        let base_to_quote = self.build_snapshot_side(
-            &state,
-            pool_pubkey,
-            snapshot.slot,
-            base_mint,
-            quote_mint,
-            base_probe,
-        )?;
-        let quote_to_base = self.build_snapshot_side(
-            &state,
-            pool_pubkey,
-            snapshot.slot,
-            quote_mint,
-            base_mint,
-            quote_probe,
-        )?;
+        let base_to_quote = if prefer_exact_out {
+            if let Some(probe) = quote_probe {
+                self.build_snapshot_side(
+                    &state,
+                    pool_pubkey,
+                    snapshot.slot,
+                    base_mint,
+                    quote_mint,
+                    probe,
+                    false,
+                )?
+            } else if let Some(probe) = base_probe {
+                self.build_snapshot_side(
+                    &state,
+                    pool_pubkey,
+                    snapshot.slot,
+                    base_mint,
+                    quote_mint,
+                    probe,
+                    true,
+                )?
+            } else {
+                return None;
+            }
+        } else {
+            let probe = base_probe?;
+            self.build_snapshot_side(
+                &state,
+                pool_pubkey,
+                snapshot.slot,
+                base_mint,
+                quote_mint,
+                probe,
+                true,
+            )?
+        };
+
+        let quote_to_base = if prefer_exact_out {
+            if let Some(probe) = base_probe {
+                self.build_snapshot_side(
+                    &state,
+                    pool_pubkey,
+                    snapshot.slot,
+                    quote_mint,
+                    base_mint,
+                    probe,
+                    false,
+                )?
+            } else if let Some(probe) = quote_probe {
+                self.build_snapshot_side(
+                    &state,
+                    pool_pubkey,
+                    snapshot.slot,
+                    quote_mint,
+                    base_mint,
+                    probe,
+                    true,
+                )?
+            } else {
+                return None;
+            }
+        } else {
+            let probe = quote_probe?;
+            self.build_snapshot_side(
+                &state,
+                pool_pubkey,
+                snapshot.slot,
+                quote_mint,
+                base_mint,
+                probe,
+                true,
+            )?
+        };
 
         Some(PoolBidirectionalQuotes {
             base_to_quote,
@@ -835,26 +1257,14 @@ impl ProtocolAdapter for WhirlpoolAdapter {
     }
 }
 
-fn needs_hydration(extras: &WhirlpoolPoolExtras) -> bool {
-    extras.token_mint_a.is_none()
-        || extras.token_mint_b.is_none()
-        || extras.token_vault_a.is_none()
-        || extras.token_vault_b.is_none()
-        || extras.tick_spacing.is_none()
-        || extras.sqrt_price_x64.is_none()
-        || extras.liquidity.is_none()
-        || extras.tick_current_index.is_none()
-        || extras.fee_rate.is_none()
-        || extras.protocol_fee_rate.is_none()
-        || extras.oracle.is_none()
-}
-
 #[derive(Clone, Debug)]
 struct HydratedPoolMeta {
     token_mint_a: Pubkey,
     token_mint_b: Pubkey,
     token_vault_a: Pubkey,
     token_vault_b: Pubkey,
+    token_program_a: Pubkey,
+    token_program_b: Pubkey,
     tick_spacing: i32,
     liquidity: u128,
     sqrt_price_x64: u128,
@@ -862,6 +1272,14 @@ struct HydratedPoolMeta {
     fee_rate: u16,
     protocol_fee_rate: u16,
     oracle: Pubkey,
+    trade_enable_timestamp: Option<u64>,
+    adaptive_fee: Option<WhirlpoolAdaptiveFeeInfo>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HydratedOracleMeta {
+    trade_enable_timestamp: Option<u64>,
+    adaptive_fee: Option<WhirlpoolAdaptiveFeeInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -1364,18 +1782,71 @@ fn fetch_whirlpool_meta(
     for client in clients {
         match client.get_account(&pool) {
             Ok(account) => {
-                if let Some(meta) = parse_whirlpool_account(pool, &program_id, &account.data) {
+                if let Some(mut meta) = parse_whirlpool_account(pool, &program_id, &account.data) {
+                    let owner_a =
+                        match fetch_mint_owner_with_priority(client, clients, &meta.token_mint_a) {
+                            Ok(owner) => owner,
+                            Err(error) => {
+                                last_error = Some(error);
+                                continue;
+                            }
+                        };
+                    let owner_b =
+                        match fetch_mint_owner_with_priority(client, clients, &meta.token_mint_b) {
+                            Ok(owner) => owner,
+                            Err(error) => {
+                                last_error = Some(error);
+                                continue;
+                            }
+                        };
+                    meta.token_program_a = owner_a;
+                    meta.token_program_b = owner_b;
+                    match fetch_oracle_meta(pool, meta.oracle, clients) {
+                        Ok(oracle_meta) => {
+                            meta.trade_enable_timestamp = oracle_meta.trade_enable_timestamp;
+                            meta.adaptive_fee = oracle_meta.adaptive_fee;
+                        }
+                        Err(error) => {
+                            warn!(
+                                target = "adapter::whirlpool",
+                                pool = %pool,
+                                oracle = %meta.oracle,
+                                %error,
+                                "failed to hydrate whirlpool oracle account"
+                            );
+                        }
+                    }
                     return Ok(meta);
                 } else {
                     return Err(FetchError::InvalidLayout("whirlpool pool account"));
                 }
             }
             Err(error) => {
-                if is_account_not_found(&error) {
-                    last_error = Some(FetchError::AccountNotFound);
+                last_error = Some(classify_fetch_error(&error));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or(FetchError::AccountNotFound))
+}
+
+fn fetch_oracle_meta(
+    pool: Pubkey,
+    oracle: Pubkey,
+    clients: &[Arc<RpcClient>],
+) -> Result<HydratedOracleMeta, FetchError> {
+    let mut last_error: Option<FetchError> = None;
+    for client in clients {
+        match client.get_account(&oracle) {
+            Ok(account) => {
+                if let Some(meta) = parse_oracle_account(pool, &account.data) {
+                    return Ok(meta);
                 } else {
-                    last_error = Some(FetchError::Rpc(error.to_string()));
+                    return Err(FetchError::InvalidLayout("whirlpool oracle account"));
                 }
+            }
+            Err(error) => {
+                last_error = Some(classify_fetch_error(&error));
             }
         }
     }
@@ -1385,6 +1856,37 @@ fn fetch_whirlpool_meta(
 
 fn is_account_not_found(error: &ClientError) -> bool {
     error.to_string().contains("AccountNotFound")
+}
+
+fn classify_fetch_error(error: &ClientError) -> FetchError {
+    if is_account_not_found(error) {
+        FetchError::AccountNotFound
+    } else {
+        FetchError::Rpc(error.to_string())
+    }
+}
+
+fn fetch_mint_owner_with_priority(
+    primary: &Arc<RpcClient>,
+    clients: &[Arc<RpcClient>],
+    mint: &Pubkey,
+) -> Result<Pubkey, FetchError> {
+    let mut last_error = match primary.get_account(mint) {
+        Ok(account) => return Ok(account.owner),
+        Err(error) => Some(classify_fetch_error(&error)),
+    };
+
+    for candidate in clients {
+        if Arc::ptr_eq(candidate, primary) {
+            continue;
+        }
+        match candidate.get_account(mint) {
+            Ok(account) => return Ok(account.owner),
+            Err(error) => last_error = Some(classify_fetch_error(&error)),
+        }
+    }
+
+    Err(last_error.unwrap_or(FetchError::AccountNotFound))
 }
 
 fn log_pool_fetch_error(pool: Pubkey, error: &FetchError, failures: u32) {
@@ -1582,6 +2084,15 @@ const WHIRLPOOL_ACCOUNT_MIN_LEN: usize = ANCHOR_DISCRIMINATOR_LEN
     + 16 // fee growth global b
     + 8 // reward last updated timestamp
     + (WHIRLPOOL_REWARD_INFO_BYTES * 3);
+const ADAPTIVE_FEE_CONSTANTS_LEN: usize = 34;
+const ADAPTIVE_FEE_VARIABLES_LEN: usize = 44;
+const ORACLE_RESERVED_BYTES: usize = 128;
+const ORACLE_ACCOUNT_MIN_LEN: usize = ANCHOR_DISCRIMINATOR_LEN
+    + PUBKEY_BYTES // whirlpool
+    + 8 // trade enable timestamp
+    + ADAPTIVE_FEE_CONSTANTS_LEN
+    + ADAPTIVE_FEE_VARIABLES_LEN
+    + ORACLE_RESERVED_BYTES;
 
 fn parse_whirlpool_account(
     pool: Pubkey,
@@ -1620,6 +2131,8 @@ fn parse_whirlpool_account(
         token_mint_b,
         token_vault_a,
         token_vault_b,
+        token_program_a: Pubkey::default(),
+        token_program_b: Pubkey::default(),
         tick_spacing,
         liquidity,
         sqrt_price_x64,
@@ -1627,6 +2140,89 @@ fn parse_whirlpool_account(
         fee_rate,
         protocol_fee_rate,
         oracle,
+        trade_enable_timestamp: None,
+        adaptive_fee: None,
+    })
+}
+
+fn parse_oracle_account(pool: Pubkey, data: &[u8]) -> Option<HydratedOracleMeta> {
+    if data.len() < ORACLE_ACCOUNT_MIN_LEN {
+        return None;
+    }
+
+    let mut cursor = ANCHOR_DISCRIMINATOR_LEN;
+    let whirlpool = read_pubkey_bytes(&mut cursor, data)?;
+    if whirlpool != pool {
+        return None;
+    }
+
+    let trade_enable_timestamp = read_u64(&mut cursor, data)?;
+    let constants = parse_adaptive_fee_constants(&mut cursor, data)?;
+    let variables = parse_adaptive_fee_variables(&mut cursor, data)?;
+    skip_bytes(&mut cursor, ORACLE_RESERVED_BYTES, data)?;
+
+    let adaptive_fee = if constants.tick_group_size == 0 {
+        None
+    } else {
+        Some(WhirlpoolAdaptiveFeeInfo {
+            constants,
+            variables,
+        })
+    };
+
+    Some(HydratedOracleMeta {
+        trade_enable_timestamp: Some(trade_enable_timestamp),
+        adaptive_fee,
+    })
+}
+
+fn parse_adaptive_fee_constants(
+    cursor: &mut usize,
+    data: &[u8],
+) -> Option<WhirlpoolAdaptiveFeeConstants> {
+    let filter_period = read_u16(cursor, data)?;
+    let decay_period = read_u16(cursor, data)?;
+    let reduction_factor = read_u16(cursor, data)?;
+    let adaptive_fee_control_factor = read_u32(cursor, data)?;
+    let max_volatility_accumulator = read_u32(cursor, data)?;
+    let tick_group_size = read_u16(cursor, data)?;
+    let major_swap_threshold_ticks = read_u16(cursor, data)?;
+    let mut reserved = [0u8; 16];
+    let end = cursor.checked_add(reserved.len())?;
+    reserved.copy_from_slice(data.get(*cursor..end)?);
+    *cursor = end;
+    Some(WhirlpoolAdaptiveFeeConstants {
+        filter_period,
+        decay_period,
+        reduction_factor,
+        adaptive_fee_control_factor,
+        max_volatility_accumulator,
+        tick_group_size,
+        major_swap_threshold_ticks,
+        reserved,
+    })
+}
+
+fn parse_adaptive_fee_variables(
+    cursor: &mut usize,
+    data: &[u8],
+) -> Option<WhirlpoolAdaptiveFeeVariables> {
+    let last_reference_update_timestamp = read_u64(cursor, data)?;
+    let last_major_swap_timestamp = read_u64(cursor, data)?;
+    let volatility_reference = read_u32(cursor, data)?;
+    let tick_group_index_reference = read_i32(cursor, data)?;
+    let volatility_accumulator = read_u32(cursor, data)?;
+    let mut reserved = [0u8; 16];
+    let end = cursor.checked_add(reserved.len())?;
+    reserved.copy_from_slice(data.get(*cursor..end)?);
+    *cursor = end;
+    Some(WhirlpoolAdaptiveFeeVariables {
+        last_reference_update_timestamp,
+        last_major_swap_timestamp,
+        volatility_reference,
+        tick_group_index_reference,
+        volatility_accumulator,
+        reserved,
     })
 }
 
@@ -1777,6 +2373,20 @@ fn read_u16(cursor: &mut usize, data: &[u8]) -> Option<u16> {
     Some(u16::from_le_bytes(bytes))
 }
 
+fn read_u32(cursor: &mut usize, data: &[u8]) -> Option<u32> {
+    let end = cursor.checked_add(4)?;
+    let bytes: [u8; 4] = data.get(*cursor..end)?.try_into().ok()?;
+    *cursor = end;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(cursor: &mut usize, data: &[u8]) -> Option<u64> {
+    let end = cursor.checked_add(8)?;
+    let bytes: [u8; 8] = data.get(*cursor..end)?.try_into().ok()?;
+    *cursor = end;
+    Some(u64::from_le_bytes(bytes))
+}
+
 fn read_i32(cursor: &mut usize, data: &[u8]) -> Option<i32> {
     let end = cursor.checked_add(4)?;
     let bytes: [u8; 4] = data.get(*cursor..end)?.try_into().ok()?;
@@ -1866,6 +2476,8 @@ pub struct WhirlpoolState {
     pub token_mint_b: Pubkey,
     pub token_vault_a: Option<Pubkey>,
     pub token_vault_b: Option<Pubkey>,
+    pub token_program_a: Option<Pubkey>,
+    pub token_program_b: Option<Pubkey>,
     pub reserve_a: Option<u128>,
     pub reserve_b: Option<u128>,
     pub tick_spacing: Option<i32>,
@@ -1878,6 +2490,12 @@ pub struct WhirlpoolState {
     pub tick_array0: Option<Pubkey>,
     pub tick_array1: Option<Pubkey>,
     pub tick_array2: Option<Pubkey>,
+    pub token_a_transfer_fee: Option<TokenTransferFee>,
+    pub token_b_transfer_fee: Option<TokenTransferFee>,
+    pub transfer_hook_program_a: Option<Pubkey>,
+    pub transfer_hook_program_b: Option<Pubkey>,
+    pub trade_enable_timestamp: Option<u64>,
+    pub adaptive_fee: Option<WhirlpoolAdaptiveFeeInfo>,
     pub last_update_slot: u64,
     pub last_update_at: Instant,
 }
@@ -1893,6 +2511,36 @@ impl WhirlpoolState {
             self.reserve_a
         } else if mint == self.token_mint_b {
             self.reserve_b
+        } else {
+            None
+        }
+    }
+
+    pub fn transfer_fee_for_mint(&self, mint: Pubkey) -> Option<TokenTransferFee> {
+        if mint == self.token_mint_a {
+            self.token_a_transfer_fee
+        } else if mint == self.token_mint_b {
+            self.token_b_transfer_fee
+        } else {
+            None
+        }
+    }
+
+    pub fn transfer_hook_program_for_mint(&self, mint: Pubkey) -> Option<Pubkey> {
+        if mint == self.token_mint_a {
+            self.transfer_hook_program_a
+        } else if mint == self.token_mint_b {
+            self.transfer_hook_program_b
+        } else {
+            None
+        }
+    }
+
+    pub fn vault_for_mint(&self, mint: Pubkey) -> Option<Pubkey> {
+        if mint == self.token_mint_a {
+            self.token_vault_a
+        } else if mint == self.token_mint_b {
+            self.token_vault_b
         } else {
             None
         }
@@ -1930,6 +2578,8 @@ impl From<SimulationError> for QuoteStatus {
 struct SlippageSimulation {
     amount_out: u64,
     consumed_input: u64,
+    net_input_amount: u64,
+    fee_amount: u64,
     edge_bps: f64,
     sqrt_price_before: Option<u128>,
     sqrt_price_after: u128,
@@ -2006,6 +2656,8 @@ fn simulate_constant_liquidity_exact_in(
     Ok(SlippageSimulation {
         amount_out,
         consumed_input: actual_amount_in,
+        net_input_amount: step.amount_in.min(u64::MAX as u128) as u64,
+        fee_amount: step.fee_amount.min(u64::MAX as u128) as u64,
         edge_bps,
         sqrt_price_before: Some(sqrt_price_x64),
         sqrt_price_after,
@@ -2049,6 +2701,8 @@ fn simulate_tick_arrays_exact_in(
 
     let mut amount_remaining = req.amount as u128;
     let mut amount_out_accum = 0u128;
+    let mut amount_in_accum = 0u128;
+    let mut fee_accum = 0u128;
     let mut steps = 0usize;
 
     while amount_remaining > 0 && liquidity > 0 && sqrt_price_x96 != sqrt_price_limit {
@@ -2091,6 +2745,8 @@ fn simulate_tick_arrays_exact_in(
             .saturating_sub(step.amount_in)
             .saturating_sub(step.fee_amount);
         amount_out_accum = amount_out_accum.saturating_add(step.amount_out);
+        amount_in_accum = amount_in_accum.saturating_add(step.amount_in);
+        fee_accum = fee_accum.saturating_add(step.fee_amount);
 
         if sqrt_price_x96 == target_price {
             if let Some(init_tick) = crossing {
@@ -2150,6 +2806,8 @@ fn simulate_tick_arrays_exact_in(
     Ok(SlippageSimulation {
         amount_out,
         consumed_input: actual_amount_in,
+        net_input_amount: amount_in_accum.min(u64::MAX as u128) as u64,
+        fee_amount: fee_accum.min(u64::MAX as u128) as u64,
         edge_bps,
         sqrt_price_before: state.sqrt_price_x64,
         sqrt_price_after: sqrt_price_x64_from_x96(&sqrt_price_x96),
@@ -2583,6 +3241,97 @@ mod tests {
     use dashmap::DashMap;
 
     #[test]
+    fn static_alt_accounts_include_protocol_dependencies() {
+        let whirlpool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+        let oracle = Pubkey::new_unique();
+        let token_program_a = Pubkey::new_unique();
+        let token_program_b = Pubkey::new_unique();
+        let state = WhirlpoolState {
+            whirlpool,
+            token_mint_a: mint_a,
+            token_mint_b: mint_b,
+            token_vault_a: Some(vault_a),
+            token_vault_b: Some(vault_b),
+            token_program_a: Some(token_program_a),
+            token_program_b: Some(token_program_b),
+            reserve_a: None,
+            reserve_b: None,
+            tick_spacing: None,
+            liquidity: None,
+            sqrt_price_x64: None,
+            tick_current_index: None,
+            fee_rate: None,
+            protocol_fee_rate: None,
+            oracle: Some(oracle),
+            tick_array0: None,
+            tick_array1: None,
+            tick_array2: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            transfer_hook_program_a: None,
+            transfer_hook_program_b: None,
+            trade_enable_timestamp: None,
+            adaptive_fee: None,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+        };
+
+        let accounts = WhirlpoolAdapter::static_alt_accounts(&state);
+        assert!(accounts.contains(&whirlpool));
+        assert!(accounts.contains(&mint_a));
+        assert!(accounts.contains(&mint_b));
+        assert!(accounts.contains(&vault_a));
+        assert!(accounts.contains(&vault_b));
+        assert!(accounts.contains(&oracle));
+        assert!(accounts.contains(&token_program_a));
+        assert!(accounts.contains(&token_program_b));
+        assert!(accounts.contains(&MEMO_PROGRAM_ID));
+    }
+
+    #[test]
+    fn static_alt_accounts_fall_back_to_spl_token() {
+        let whirlpool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let state = WhirlpoolState {
+            whirlpool,
+            token_mint_a: mint_a,
+            token_mint_b: mint_b,
+            token_vault_a: None,
+            token_vault_b: None,
+            token_program_a: None,
+            token_program_b: None,
+            reserve_a: None,
+            reserve_b: None,
+            tick_spacing: None,
+            liquidity: None,
+            sqrt_price_x64: None,
+            tick_current_index: None,
+            fee_rate: None,
+            protocol_fee_rate: None,
+            oracle: None,
+            tick_array0: None,
+            tick_array1: None,
+            tick_array2: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            transfer_hook_program_a: None,
+            transfer_hook_program_b: None,
+            trade_enable_timestamp: None,
+            adaptive_fee: None,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+        };
+
+        let accounts = WhirlpoolAdapter::static_alt_accounts(&state);
+        assert!(accounts.contains(&SPL_TOKEN_PROGRAM_ID));
+    }
+
+    #[test]
     fn parses_whirlpool_account_layout() {
         let pool = Pubkey::new_unique();
         let config = Pubkey::new_unique();
@@ -2649,6 +3398,64 @@ mod tests {
     }
 
     #[test]
+    fn attaches_supplemental_tick_arrays_in_chunks() {
+        let adapter = WhirlpoolAdapter::new(WhirlpoolAdapterConfig::default(), None);
+        let base_arrays = vec![
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        let supplemental_a = Pubkey::new_unique();
+        let supplemental_b = Pubkey::new_unique();
+        let supplemental_c = Pubkey::new_unique();
+        let supplemental_d = Pubkey::new_unique();
+        let supplemental = vec![
+            base_arrays[0],
+            supplemental_a,
+            supplemental_b,
+            supplemental_b,
+            Pubkey::default(),
+            supplemental_c,
+            supplemental_d,
+        ];
+        let mut context = TemplateContext {
+            whirlpool_tick_arrays: base_arrays,
+            ..TemplateContext::default()
+        };
+
+        adapter.attach_supplemental_tick_arrays(&mut context, &supplemental);
+
+        let extras: Vec<Pubkey> = context
+            .remaining_accounts
+            .iter()
+            .map(|meta| meta.pubkey)
+            .collect();
+        assert_eq!(
+            extras,
+            vec![
+                supplemental_a,
+                supplemental_b,
+                supplemental_c,
+                supplemental_d
+            ]
+        );
+        assert_eq!(context.whirlpool_remaining_accounts.len(), 2);
+        assert_eq!(
+            context.whirlpool_remaining_accounts,
+            vec![
+                WhirlpoolRemainingAccountsSlice {
+                    accounts_type: WhirlpoolRemainingAccountsType::SupplementalTickArrays,
+                    length: 3,
+                },
+                WhirlpoolRemainingAccountsSlice {
+                    accounts_type: WhirlpoolRemainingAccountsType::SupplementalTickArraysOne,
+                    length: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn constant_liquidity_simulation_applies_slippage() {
         let pool = Pubkey::new_unique();
         let token_a = Pubkey::new_unique();
@@ -2659,6 +3466,8 @@ mod tests {
             token_mint_b: token_b,
             token_vault_a: None,
             token_vault_b: None,
+            token_program_a: None,
+            token_program_b: None,
             reserve_a: None,
             reserve_b: None,
             tick_spacing: Some(1),
@@ -2671,6 +3480,12 @@ mod tests {
             tick_array0: None,
             tick_array1: None,
             tick_array2: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            transfer_hook_program_a: None,
+            transfer_hook_program_b: None,
+            trade_enable_timestamp: None,
+            adaptive_fee: None,
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -2699,6 +3514,8 @@ mod tests {
             token_mint_b: token_b,
             token_vault_a: None,
             token_vault_b: None,
+            token_program_a: None,
+            token_program_b: None,
             reserve_a: None,
             reserve_b: None,
             tick_spacing: Some(1),
@@ -2711,6 +3528,12 @@ mod tests {
             tick_array0: None,
             tick_array1: None,
             tick_array2: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            transfer_hook_program_a: None,
+            transfer_hook_program_b: None,
+            trade_enable_timestamp: None,
+            adaptive_fee: None,
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -2738,6 +3561,8 @@ mod tests {
             token_mint_b: token_b,
             token_vault_a: None,
             token_vault_b: None,
+            token_program_a: None,
+            token_program_b: None,
             reserve_a: None,
             reserve_b: None,
             tick_spacing: Some(1),
@@ -2750,6 +3575,12 @@ mod tests {
             tick_array0: None,
             tick_array1: None,
             tick_array2: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            transfer_hook_program_a: None,
+            transfer_hook_program_b: None,
+            trade_enable_timestamp: None,
+            adaptive_fee: None,
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -2779,6 +3610,8 @@ mod tests {
             token_mint_b: token_b,
             token_vault_a: None,
             token_vault_b: None,
+            token_program_a: None,
+            token_program_b: None,
             reserve_a: None,
             reserve_b: None,
             tick_spacing: Some(1),
@@ -2791,6 +3624,12 @@ mod tests {
             tick_array0: None,
             tick_array1: None,
             tick_array2: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            transfer_hook_program_a: None,
+            transfer_hook_program_b: None,
+            trade_enable_timestamp: None,
+            adaptive_fee: None,
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -2852,6 +3691,8 @@ mod tests {
             state: DashMap::new(),
             config: WhirlpoolAdapterConfig::default(),
             hydrator: None,
+            transfer_fee_cache: None,
+            transfer_hook_resolver: None,
             template_builder: None,
             registered_templates: DashMap::new(),
         };
@@ -2866,6 +3707,8 @@ mod tests {
             token_mint_b: quote_mint,
             token_vault_a: None,
             token_vault_b: None,
+            token_program_a: None,
+            token_program_b: None,
             reserve_a: Some(2_000_000u128),
             reserve_b: Some(3_000_000u128),
             tick_spacing: Some(1),
@@ -2878,6 +3721,12 @@ mod tests {
             tick_array0: None,
             tick_array1: None,
             tick_array2: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            transfer_hook_program_a: None,
+            transfer_hook_program_b: None,
+            trade_enable_timestamp: None,
+            adaptive_fee: None,
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -2908,5 +3757,82 @@ mod tests {
         assert_eq!(quotes.quote_to_base.input_mint, snapshot.quote_mint);
         assert!(quotes.base_to_quote.expected_output > 0);
         assert!(quotes.quote_to_base.expected_output > 0);
+    }
+
+    #[test]
+    fn snapshot_bidirectional_quotes_honor_exact_out_preference() {
+        let mut config = WhirlpoolAdapterConfig::default();
+        config.prefer_exact_out_quotes = true;
+        let adapter = WhirlpoolAdapter {
+            program_id: Pubkey::from_str(WHIRLPOOL_PROGRAM_ID).unwrap(),
+            state: DashMap::new(),
+            config,
+            hydrator: None,
+            transfer_fee_cache: None,
+            transfer_hook_resolver: None,
+            template_builder: None,
+            registered_templates: DashMap::new(),
+        };
+
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+
+        let state = WhirlpoolState {
+            whirlpool: pool,
+            token_mint_a: base_mint,
+            token_mint_b: quote_mint,
+            token_vault_a: None,
+            token_vault_b: None,
+            token_program_a: None,
+            token_program_b: None,
+            reserve_a: Some(2_000_000u128),
+            reserve_b: Some(3_000_000u128),
+            tick_spacing: Some(1),
+            liquidity: Some(5_000_000u128),
+            sqrt_price_x64: Some(1u128 << 64),
+            tick_current_index: Some(0),
+            fee_rate: Some(500),
+            protocol_fee_rate: Some(0),
+            oracle: None,
+            tick_array0: None,
+            tick_array1: None,
+            tick_array2: None,
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            transfer_hook_program_a: None,
+            transfer_hook_program_b: None,
+            trade_enable_timestamp: None,
+            adaptive_fee: None,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+        };
+        adapter.state.insert(pool, state);
+
+        let snapshot = PoolSnapshot {
+            pool_id: pool.to_string(),
+            program_id: adapter.program_id.to_string(),
+            slot: 1,
+            block_hash: None,
+            block_time_unix: None,
+            base_mint: base_mint.to_string(),
+            quote_mint: quote_mint.to_string(),
+            base_post_amount: 2_000_000u128,
+            quote_post_amount: 3_000_000u128,
+            updated_at: Instant::now(),
+            freshness: SnapshotFreshness::LiveCorecast,
+            allow_reserve_backfill: true,
+            quotes: None,
+            extensions: PoolUpdateExtensions::default(),
+        };
+
+        let quotes = adapter
+            .bidirectional_quotes(&snapshot)
+            .expect("quotes missing");
+
+        assert!(!quotes.base_to_quote.amount_specified_is_input);
+        assert!(!quotes.quote_to_base.amount_specified_is_input);
+        assert!(quotes.base_to_quote.notional > 0);
+        assert!(quotes.quote_to_base.notional > 0);
     }
 }

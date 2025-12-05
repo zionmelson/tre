@@ -122,7 +122,21 @@ impl AdapterBook {
         let input_mint = Pubkey::from_str(&trade.sell_mint).ok()?;
         let output_mint = Pubkey::from_str(&trade.buy_mint).ok()?;
 
-        let request = QuoteRequest {
+        if adapter.prefer_exact_out_quotes() && trade.buy_amount > 0 {
+            let request = QuoteRequest {
+                pool_id,
+                input_mint,
+                output_mint,
+                amount: trade.buy_amount,
+                slot: trade.slot,
+                direction: SwapDirection::ExactOut,
+            };
+            if let Some(quote) = adapter.quote_exact_out(request) {
+                return Some(quote);
+            }
+        }
+
+        let fallback = QuoteRequest {
             pool_id,
             input_mint,
             output_mint,
@@ -131,7 +145,7 @@ impl AdapterBook {
             direction: SwapDirection::ExactIn,
         };
 
-        adapter.quote_exact_in(request)
+        adapter.quote_exact_in(fallback)
     }
 
     pub fn requires_authoritative_quotes(&self, program_id: &str) -> bool {
@@ -152,6 +166,143 @@ fn register_adapter(
     adapter: Arc<dyn ProtocolAdapter>,
 ) {
     map.insert(adapter.program_id().to_string(), adapter);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hydration::types::QuoteStatus;
+    use crate::template::TemplateContext;
+
+    struct FakeAdapter {
+        program_id: Pubkey,
+        prefer_exact_out: bool,
+        exact_out_success: bool,
+        exact_in_success: bool,
+    }
+
+    impl FakeAdapter {
+        fn new(
+            program_id: Pubkey,
+            prefer_exact_out: bool,
+            exact_out_success: bool,
+            exact_in_success: bool,
+        ) -> Self {
+            Self {
+                program_id,
+                prefer_exact_out,
+                exact_out_success,
+                exact_in_success,
+            }
+        }
+
+        fn build_response(&self, req: QuoteRequest) -> QuoteResponse {
+            QuoteResponse {
+                amount_in: req.amount,
+                amount_out: req.amount,
+                edge_bps: 0.0,
+                sqrt_price_limit: None,
+                min_output_amount: Some(req.amount),
+                status: QuoteStatus::Ok,
+                request: req,
+                context: TemplateContext::default(),
+            }
+        }
+    }
+
+    impl ProtocolAdapter for FakeAdapter {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn program_id(&self) -> Pubkey {
+            self.program_id
+        }
+
+        fn prefer_exact_out_quotes(&self) -> bool {
+            self.prefer_exact_out
+        }
+
+        fn ingest_pool_update(&self, _update: &PoolUpdate) {}
+
+        fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
+            if self.exact_in_success {
+                Some(self.build_response(req))
+            } else {
+                None
+            }
+        }
+
+        fn quote_exact_out(&self, req: QuoteRequest) -> Option<QuoteResponse> {
+            if self.exact_out_success {
+                Some(self.build_response(req))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn sample_trade(program_id: &Pubkey) -> TradeUpdate {
+        let pool_id = Pubkey::new_unique();
+        let buy_mint = Pubkey::new_unique();
+        let sell_mint = Pubkey::new_unique();
+        TradeUpdate {
+            seq: 1,
+            slot: 123,
+            program_id: program_id.to_string(),
+            pool_id: pool_id.to_string(),
+            signature: Pubkey::new_unique().to_string(),
+            buy_mint: buy_mint.to_string(),
+            sell_mint: sell_mint.to_string(),
+            buy_amount: 50,
+            sell_amount: 100,
+        }
+    }
+
+    fn adapter_book_with(adapter: Arc<dyn ProtocolAdapter>) -> AdapterBook {
+        let mut adapters = HashMap::new();
+        adapters.insert(adapter.program_id().to_string(), adapter);
+        AdapterBook {
+            adapters,
+            strict_price_programs: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn quote_trade_prefers_exact_out_when_available() {
+        let program_id = Pubkey::new_unique();
+        let adapter = Arc::new(FakeAdapter::new(program_id, true, true, false));
+        let book = adapter_book_with(adapter);
+        let trade = sample_trade(&program_id);
+
+        let quote = book.quote_trade(&trade).expect("quote");
+        assert_eq!(quote.request.direction, SwapDirection::ExactOut);
+        assert_eq!(quote.request.amount, trade.buy_amount);
+    }
+
+    #[test]
+    fn quote_trade_falls_back_to_exact_in() {
+        let program_id = Pubkey::new_unique();
+        let adapter = Arc::new(FakeAdapter::new(program_id, true, false, true));
+        let book = adapter_book_with(adapter);
+        let trade = sample_trade(&program_id);
+
+        let quote = book.quote_trade(&trade).expect("quote");
+        assert_eq!(quote.request.direction, SwapDirection::ExactIn);
+        assert_eq!(quote.request.amount, trade.sell_amount);
+    }
+
+    #[test]
+    fn quote_trade_uses_exact_in_when_not_preferred() {
+        let program_id = Pubkey::new_unique();
+        let adapter = Arc::new(FakeAdapter::new(program_id, false, true, true));
+        let book = adapter_book_with(adapter);
+        let trade = sample_trade(&program_id);
+
+        let quote = book.quote_trade(&trade).expect("quote");
+        assert_eq!(quote.request.direction, SwapDirection::ExactIn);
+        assert_eq!(quote.request.amount, trade.sell_amount);
+    }
 }
 
 fn raydium_config(config: &AppConfig) -> RaydiumV3AdapterConfig {
@@ -218,6 +369,9 @@ fn whirlpool_config(config: &AppConfig) -> WhirlpoolAdapterConfig {
     }
     if let Some(max_failures) = config.protocol_max_tick_array_failures("whirlpool") {
         adapter_config.max_tick_array_failures = max_failures.max(1);
+    }
+    if let Some(prefer_exact_out) = config.protocol_prefer_exact_out_quotes("whirlpool") {
+        adapter_config.prefer_exact_out_quotes = prefer_exact_out;
     }
     adapter_config
 }

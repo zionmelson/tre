@@ -178,6 +178,12 @@ impl AppConfig {
             .and_then(|entry| entry.max_tick_array_failures)
     }
 
+    pub fn protocol_prefer_exact_out_quotes(&self, protocol: &str) -> Option<bool> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.prefer_exact_out_quotes)
+    }
+
     pub fn protocol_borrow_pct(&self, protocol: &str) -> f64 {
         self.protocols
             .get(protocol)
@@ -601,6 +607,8 @@ pub struct ProtocolConfig {
     pub max_tick_array_failures: Option<u32>,
     #[serde(default)]
     pub borrow_pct: Option<f64>,
+    #[serde(default)]
+    pub prefer_exact_out_quotes: Option<bool>,
 }
 
 impl ProtocolConfig {
@@ -622,6 +630,7 @@ impl Default for ProtocolConfig {
             max_pool_failures: None,
             max_tick_array_failures: None,
             borrow_pct: None,
+            prefer_exact_out_quotes: None,
         }
     }
 }

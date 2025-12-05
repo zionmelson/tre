@@ -18,6 +18,7 @@ pub use self::raydium_v3::{
     RaydiumV3PoolExtras, RAYDIUM_V3_INPUT_UTILIZATION_BPS, RAYDIUM_V3_PROGRAM_ID,
 };
 pub use self::whirlpool::{
+    WhirlpoolAdaptiveFeeConstants, WhirlpoolAdaptiveFeeInfo, WhirlpoolAdaptiveFeeVariables,
     WhirlpoolPoolExtras, WHIRLPOOL_INPUT_UTILIZATION_BPS, WHIRLPOOL_PROGRAM_ID,
 };
 
@@ -849,7 +850,10 @@ mod lb_clmm {
 }
 
 mod whirlpool {
-    use super::shared::{lookup_account_string, pubkey_from_bytes, InstructionAccountLookup};
+    use super::shared::{
+        currency_mint, currency_program, lookup_account_string, pubkey_from_bytes,
+        InstructionAccountLookup,
+    };
     use super::*;
 
     pub const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
@@ -863,6 +867,8 @@ mod whirlpool {
         pub token_vault_b: Option<String>,
         pub token_mint_a: Option<String>,
         pub token_mint_b: Option<String>,
+        pub token_program_a: Option<String>,
+        pub token_program_b: Option<String>,
         pub tick_spacing: Option<i32>,
         pub sqrt_price_x64: Option<u128>,
         pub liquidity: Option<u128>,
@@ -873,6 +879,36 @@ mod whirlpool {
         pub tick_array0: Option<String>,
         pub tick_array1: Option<String>,
         pub tick_array2: Option<String>,
+        pub trade_enable_timestamp: Option<u64>,
+        pub adaptive_fee: Option<WhirlpoolAdaptiveFeeInfo>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct WhirlpoolAdaptiveFeeConstants {
+        pub filter_period: u16,
+        pub decay_period: u16,
+        pub reduction_factor: u16,
+        pub adaptive_fee_control_factor: u32,
+        pub max_volatility_accumulator: u32,
+        pub tick_group_size: u16,
+        pub major_swap_threshold_ticks: u16,
+        pub reserved: [u8; 16],
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct WhirlpoolAdaptiveFeeVariables {
+        pub last_reference_update_timestamp: u64,
+        pub last_major_swap_timestamp: u64,
+        pub volatility_reference: u32,
+        pub tick_group_index_reference: i32,
+        pub volatility_accumulator: u32,
+        pub reserved: [u8; 16],
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct WhirlpoolAdaptiveFeeInfo {
+        pub constants: WhirlpoolAdaptiveFeeConstants,
+        pub variables: WhirlpoolAdaptiveFeeVariables,
     }
 
     pub(crate) fn parse_extras(event: &PoolLiquidityChangeEvent) -> Option<WhirlpoolPoolExtras> {
@@ -885,10 +921,17 @@ mod whirlpool {
         let instruction = event.instruction.as_ref()?;
         let program = instruction.program.as_ref()?;
         let lookup = InstructionAccountLookup::new(program, &instruction.accounts);
+        let market = event.market.as_ref();
+        let base_currency = market.and_then(|value| value.base_currency.as_ref());
+        let quote_currency = market.and_then(|value| value.quote_currency.as_ref());
 
-        let extras = WhirlpoolPoolExtras {
+        let mut extras = WhirlpoolPoolExtras {
             token_vault_a: lookup_account_string(&lookup, &["tokenVaultA", "token_vault_a"]),
             token_vault_b: lookup_account_string(&lookup, &["tokenVaultB", "token_vault_b"]),
+            token_mint_a: lookup_account_string(&lookup, &["tokenMintA", "token_mint_a"]),
+            token_mint_b: lookup_account_string(&lookup, &["tokenMintB", "token_mint_b"]),
+            token_program_a: lookup_account_string(&lookup, &["tokenProgramA", "token_program_a"]),
+            token_program_b: lookup_account_string(&lookup, &["tokenProgramB", "token_program_b"]),
             oracle: lookup_account_string(&lookup, &["oracle"]),
             tick_array0: lookup_account_string(&lookup, &["tickArray0", "tick_array0"]),
             tick_array1: lookup_account_string(&lookup, &["tickArray1", "tick_array1"]),
@@ -896,20 +939,38 @@ mod whirlpool {
             ..Default::default()
         };
 
+        if extras.token_mint_a.is_none() {
+            extras.token_mint_a = currency_mint(base_currency).map(|pk| pk.to_string());
+        }
+        if extras.token_mint_b.is_none() {
+            extras.token_mint_b = currency_mint(quote_currency).map(|pk| pk.to_string());
+        }
+        if extras.token_program_a.is_none() {
+            extras.token_program_a = currency_program(base_currency).map(|pk| pk.to_string());
+        }
+        if extras.token_program_b.is_none() {
+            extras.token_program_b = currency_program(quote_currency).map(|pk| pk.to_string());
+        }
+
         extras_if_any(extras)
     }
 
     fn extras_if_any(extras: WhirlpoolPoolExtras) -> Option<WhirlpoolPoolExtras> {
-        if extras.token_vault_a.is_none()
-            && extras.token_vault_b.is_none()
-            && extras.oracle.is_none()
-            && extras.tick_array0.is_none()
-            && extras.tick_array1.is_none()
-            && extras.tick_array2.is_none()
-        {
-            None
-        } else {
+        let has_data = extras.token_vault_a.is_some()
+            || extras.token_vault_b.is_some()
+            || extras.token_mint_a.is_some()
+            || extras.token_mint_b.is_some()
+            || extras.token_program_a.is_some()
+            || extras.token_program_b.is_some()
+            || extras.oracle.is_some()
+            || extras.tick_array0.is_some()
+            || extras.tick_array1.is_some()
+            || extras.tick_array2.is_some();
+
+        if has_data {
             Some(extras)
+        } else {
+            None
         }
     }
 }

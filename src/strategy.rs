@@ -537,6 +537,7 @@ mod tests {
                 input_amount: TEST_INPUT_LAMPORTS,
                 available_input_liquidity: TEST_INPUT_LAMPORTS,
                 estimated_output_amount: TEST_INPUT_LAMPORTS + TEST_PROFIT_LAMPORTS,
+                amount_specified_is_input: true,
                 effective_price: 1.0,
                 fee_bps: 30,
                 template_fee_bps: 30,
