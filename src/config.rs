@@ -609,6 +609,8 @@ pub struct ProtocolConfig {
     pub borrow_pct: Option<f64>,
     #[serde(default)]
     pub prefer_exact_out_quotes: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_pubkey")]
+    pub required_partner: Option<Pubkey>,
 }
 
 impl ProtocolConfig {
@@ -631,6 +633,7 @@ impl Default for ProtocolConfig {
             max_tick_array_failures: None,
             borrow_pct: None,
             prefer_exact_out_quotes: None,
+            required_partner: None,
         }
     }
 }
@@ -803,6 +806,17 @@ where
 {
     let opt = Option::<String>::deserialize(deserializer)?;
     Ok(opt.map(|raw| expand_tilde(&raw)))
+}
+
+fn deserialize_optional_pubkey<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Pubkey>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    opt.map(|raw| Pubkey::from_str(&raw).map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 fn expand_tilde(path: &str) -> PathBuf {

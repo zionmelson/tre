@@ -8,7 +8,10 @@ use crate::proto::solana_messages::{
     Account as ProtoAccount, Currency, PoolLiquidityChangeEvent, Program,
 };
 
-pub use self::cp_amm::{CpAmmPoolExtras, CP_AMM_INPUT_UTILIZATION_BPS, CP_AMM_PROGRAM_ID};
+pub use self::cp_amm::{
+    CpAmmBaseFeeExtras, CpAmmDynamicFeeExtras, CpAmmPoolExtras, CpAmmPoolFeesExtras,
+    CP_AMM_INPUT_UTILIZATION_BPS, CP_AMM_PROGRAM_ID,
+};
 pub use self::lb_clmm::{
     LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras, LbClmmPoolExtras,
     LB_CLMM_INPUT_UTILIZATION_BPS, LB_CLMM_PROGRAM_ID,
@@ -281,6 +284,8 @@ mod cp_amm {
         pub token_b_mint: Option<String>,
         pub token_a_program: Option<String>,
         pub token_b_program: Option<String>,
+        pub whitelisted_vault: Option<String>,
+        pub partner: Option<String>,
         pub amp: Option<u64>,
         pub lp_fee_bps: Option<u16>,
         pub protocol_fee_bps: Option<u16>,
@@ -290,7 +295,51 @@ mod cp_amm {
         pub liquidity: Option<u128>,
         pub sqrt_min_price_x64: Option<u128>,
         pub sqrt_max_price_x64: Option<u128>,
+        pub permanent_lock_liquidity: Option<u128>,
+        pub collect_fee_mode: Option<u8>,
+        pub activation_point: Option<u64>,
+        pub activation_type: Option<u8>,
+        pub pool_status: Option<u8>,
+        pub pool_type: Option<u8>,
+        pub pool_version: Option<u8>,
+        pub token_a_flag: Option<u8>,
+        pub token_b_flag: Option<u8>,
+        pub pool_fees: Option<CpAmmPoolFeesExtras>,
         pub hydrated_at: Option<Instant>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CpAmmPoolFeesExtras {
+        pub base_fee: CpAmmBaseFeeExtras,
+        pub protocol_fee_percent: u8,
+        pub partner_fee_percent: u8,
+        pub referral_fee_percent: u8,
+        pub dynamic_fee: CpAmmDynamicFeeExtras,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CpAmmBaseFeeExtras {
+        pub cliff_fee_numerator: u64,
+        pub base_fee_mode: u8,
+        pub first_factor: u16,
+        pub second_factor: [u8; 8],
+        pub third_factor: u64,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CpAmmDynamicFeeExtras {
+        pub initialized: u8,
+        pub max_volatility_accumulator: u32,
+        pub variable_fee_control: u32,
+        pub bin_step: u16,
+        pub filter_period: u16,
+        pub decay_period: u16,
+        pub reduction_factor: u16,
+        pub last_update_timestamp: u64,
+        pub bin_step_u128: u128,
+        pub sqrt_price_reference: u128,
+        pub volatility_accumulator: u128,
+        pub volatility_reference: u128,
     }
 
     pub(crate) fn parse_extras(event: &PoolLiquidityChangeEvent) -> Option<CpAmmPoolExtras> {

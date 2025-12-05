@@ -11,6 +11,7 @@ pub enum QuoteStatus {
     InsufficientLiquidity,
     MissingState,
     MissingReferral,
+    MissingPartner,
     RateLimited,
     MissingTickArrays,
     InsufficientBins,
@@ -20,8 +21,9 @@ pub enum QuoteStatus {
 mod protocols;
 
 pub use protocols::{
-    CpAmmPoolExtras, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras,
-    LbClmmPoolExtras, RaydiumV3PoolExtras, WhirlpoolAdaptiveFeeConstants, WhirlpoolAdaptiveFeeInfo,
+    CpAmmBaseFeeExtras, CpAmmDynamicFeeExtras, CpAmmPoolExtras, CpAmmPoolFeesExtras,
+    LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras, LbClmmPoolExtras,
+    RaydiumV3PoolExtras, WhirlpoolAdaptiveFeeConstants, WhirlpoolAdaptiveFeeInfo,
     WhirlpoolAdaptiveFeeVariables, WhirlpoolPoolExtras, CP_AMM_INPUT_UTILIZATION_BPS,
     CP_AMM_PROGRAM_ID, LB_CLMM_INPUT_UTILIZATION_BPS, LB_CLMM_PROGRAM_ID,
     RAYDIUM_V3_INPUT_UTILIZATION_BPS, RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_INPUT_UTILIZATION_BPS,

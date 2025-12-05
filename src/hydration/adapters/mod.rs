@@ -110,7 +110,14 @@ pub struct QuoteRequest {
     pub output_mint: Pubkey,
     pub amount: u64,
     pub slot: u64,
+    pub block_time: Option<i64>,
     pub direction: SwapDirection,
+}
+
+impl QuoteRequest {
+    pub fn block_time_u64(&self) -> Option<u64> {
+        self.block_time.and_then(|ts| u64::try_from(ts).ok())
+    }
 }
 
 #[derive(Debug, Clone)]

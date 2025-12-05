@@ -674,6 +674,7 @@ impl RaydiumV3Adapter {
             output_mint,
             amount: probe_amount,
             slot,
+            block_time: None,
             direction: SwapDirection::ExactIn,
         };
 

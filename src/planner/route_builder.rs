@@ -124,6 +124,20 @@ impl RouteBuilder {
                 .unwrap_or_else(TemplateContext::default);
             context.template_ready = readiness.template_ready;
             context.alt_ready = readiness.alt_ready;
+            if let Some(side) = quote_side {
+                if let Some(leftover) = context.partial_fill_remaining {
+                    if side.notional == 0 {
+                        context.partial_fill_remaining = None;
+                    } else {
+                        let scaled = scale_partial_fill_remaining(
+                            leftover,
+                            current_amount,
+                            side.notional,
+                        );
+                        context.partial_fill_remaining = (scaled > 0).then_some(scaled);
+                    }
+                }
+            }
 
             legs.push(RouteLegPlan {
                 pool_id: leg.pool_id.clone(),
@@ -202,4 +216,36 @@ fn price_for_leg<'a>(
     }
 
     None
+}
+
+fn scale_partial_fill_remaining(leftover: u64, target_amount: u64, reference_notional: u64) -> u64 {
+    if leftover == 0 || target_amount == 0 || reference_notional == 0 {
+        return 0;
+    }
+    let scaled = u128::from(leftover)
+        .saturating_mul(u128::from(target_amount))
+        / u128::from(reference_notional);
+    scaled.min(u128::from(target_amount)).min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scale_partial_fill_remaining;
+
+    #[test]
+    fn scales_partial_remainder_down() {
+        let scaled = scale_partial_fill_remaining(200, 500, 1_000);
+        assert_eq!(scaled, 100);
+    }
+
+    #[test]
+    fn scales_partial_remainder_up() {
+        let scaled = scale_partial_fill_remaining(150, 2_000, 500);
+        assert_eq!(scaled, 600);
+    }
+
+    #[test]
+    fn zero_reference_zeroes_remainder() {
+        assert_eq!(scale_partial_fill_remaining(150, 1_000, 0), 0);
+    }
 }

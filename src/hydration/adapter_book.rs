@@ -129,6 +129,7 @@ impl AdapterBook {
                 output_mint,
                 amount: trade.buy_amount,
                 slot: trade.slot,
+                block_time: None,
                 direction: SwapDirection::ExactOut,
             };
             if let Some(quote) = adapter.quote_exact_out(request) {
@@ -142,6 +143,7 @@ impl AdapterBook {
             output_mint,
             amount: trade.sell_amount,
             slot: trade.slot,
+            block_time: None,
             direction: SwapDirection::ExactIn,
         };
 
@@ -326,6 +328,9 @@ fn cp_amm_config(config: &AppConfig) -> CpAmmAdapterConfig {
     }
     if let Some(util_bps) = config.protocol_max_utilization_bps("cp_amm") {
         adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
+    }
+    if let Some(protocol) = config.protocols.get("cp_amm") {
+        adapter_config.required_partner = protocol.required_partner;
     }
     adapter_config
 }

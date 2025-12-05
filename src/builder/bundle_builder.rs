@@ -409,6 +409,22 @@ fn hydrate_cp_amm_accounts(
         .context
         .host_fee_account
         .or(pool_accounts.referral_token_account);
+    let input_token_program = plan
+        .context
+        .input_token_program
+        .or(pool_accounts.token_a_program)
+        .ok_or_else(|| anyhow!(
+            "template for pool {} missing input token program",
+            plan.pool_id
+        ))?;
+    let output_token_program = plan
+        .context
+        .output_token_program
+        .or(pool_accounts.token_b_program)
+        .ok_or_else(|| anyhow!(
+            "template for pool {} missing output token program",
+            plan.pool_id
+        ))?;
 
     for (meta, spec) in accounts.iter_mut().zip(specs.iter()) {
         if spec.address.is_some() {
@@ -432,6 +448,12 @@ fn hydrate_cp_amm_accounts(
                 if let Some(pk) = host_fee_account {
                     meta.pubkey = pk;
                 }
+            }
+            "token_a_program" => {
+                meta.pubkey = input_token_program;
+            }
+            "token_b_program" => {
+                meta.pubkey = output_token_program;
             }
             _ => {}
         }
@@ -722,7 +744,10 @@ fn apply_patch(
             }
         },
         TemplateFieldKind::CpAmm(field) => match field {
-            CpAmmField::AmountIn => write_u128(plan.amount_in as u128, slice),
+            CpAmmField::AmountIn => {
+                let amount_in = cp_amm_effective_amount_in(plan);
+                write_u128(amount_in as u128, slice)
+            }
             CpAmmField::MinimumOutput => {
                 let min_out = plan
                     .min_output_amount
@@ -875,6 +900,14 @@ fn apply_slippage_guard(amount: u64, tolerance_bps: u64) -> u64 {
     amount.saturating_sub(slip)
 }
 
+fn cp_amm_effective_amount_in(plan: &BundleInstructionPlan) -> u64 {
+    if !plan.amount_specified_is_input {
+        return plan.amount_in;
+    }
+    let leftover = plan.context.partial_fill_remaining.unwrap_or(0);
+    plan.amount_in.saturating_sub(leftover)
+}
+
 fn apply_template_context(
     plan: &BundleInstructionPlan,
     template: &InstructionTemplate,
@@ -947,16 +980,23 @@ fn prune_optional_accounts(template: &InstructionTemplate, accounts: &mut Vec<Ac
     let Some(specs) = account_specs_for_template(template) else {
         return;
     };
-    if specs.len() != accounts.len() {
+    if specs.len() > accounts.len() {
         return;
     }
 
     let mut pruned = Vec::with_capacity(accounts.len());
-    for (spec, meta) in specs.iter().zip(accounts.iter()) {
+    for (index, spec) in specs.iter().enumerate() {
+        let Some(meta) = accounts.get(index) else {
+            return;
+        };
         if spec.is_optional && meta.pubkey == Pubkey::default() {
             continue;
         }
         pruned.push(meta.clone());
+    }
+
+    if accounts.len() > specs.len() {
+        pruned.extend_from_slice(&accounts[specs.len()..]);
     }
 
     *accounts = pruned;

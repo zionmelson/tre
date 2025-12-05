@@ -462,6 +462,7 @@ impl LbClmmAdapter {
             output_mint,
             amount: probe_amount,
             slot,
+            block_time: None,
             direction: SwapDirection::ExactIn,
         };
 
@@ -2186,6 +2187,7 @@ mod tests {
             output_mint: token_y,
             amount: 150,
             slot: 0,
+            block_time: None,
             direction: SwapDirection::ExactIn,
         };
 
@@ -2249,6 +2251,7 @@ mod tests {
             output_mint: token_x,
             amount: 200,
             slot: 0,
+            block_time: None,
             direction: SwapDirection::ExactIn,
         };
 

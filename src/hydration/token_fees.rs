@@ -55,6 +55,7 @@ pub fn apply_pre_fee_amount(amount: u64, fee: Option<TokenTransferFee>) -> Optio
 struct TransferFeeMeta {
     fee: Option<TokenTransferFee>,
     transfer_hook_program_id: Option<Pubkey>,
+    token_program: Pubkey,
     hydrated_at: Instant,
 }
 
@@ -117,6 +118,19 @@ impl TokenTransferFeeHydrator {
             .and_then(|meta| meta.transfer_hook_program_id)
     }
 
+    pub fn mint_program(&self, mint: Pubkey) -> Option<Pubkey> {
+        if let Some(meta) = self.hydrator.cached(&mint) {
+            if meta.hydrated_at.elapsed() >= self.retry_backoff && self.should_schedule(mint) {
+                self.hydrator.schedule(mint);
+            }
+            return Some(meta.token_program);
+        }
+        if self.should_schedule(mint) {
+            self.hydrator.schedule(mint);
+        }
+        None
+    }
+
     fn should_schedule(&self, mint: Pubkey) -> bool {
         let now = Instant::now();
         if let Some(last) = self.last_attempts.get(&mint) {
@@ -142,6 +156,7 @@ fn fetch_token_transfer_fee_meta(
                     return Some(TransferFeeMeta {
                         fee: None,
                         transfer_hook_program_id: None,
+                        token_program: owner,
                         hydrated_at: Instant::now(),
                     });
                 }
@@ -156,6 +171,7 @@ fn fetch_token_transfer_fee_meta(
                         return Some(TransferFeeMeta {
                             fee,
                             transfer_hook_program_id,
+                            token_program: owner,
                             hydrated_at: Instant::now(),
                         });
                     }

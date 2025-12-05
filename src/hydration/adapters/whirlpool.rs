@@ -878,6 +878,7 @@ impl WhirlpoolAdapter {
             output_mint,
             amount: probe_amount,
             slot,
+            block_time: None,
             direction: if amount_specified_is_input {
                 SwapDirection::ExactIn
             } else {
@@ -3495,6 +3496,7 @@ mod tests {
             output_mint: token_b,
             amount: 1_000_000,
             slot: 0,
+            block_time: None,
             direction: SwapDirection::ExactIn,
         };
 
@@ -3543,6 +3545,7 @@ mod tests {
             output_mint: token_b,
             amount: 5,
             slot: 0,
+            block_time: None,
             direction: SwapDirection::ExactIn,
         };
 
@@ -3590,6 +3593,7 @@ mod tests {
             output_mint: token_a,
             amount: 50_000,
             slot: 0,
+            block_time: None,
             direction: SwapDirection::ExactIn,
         };
 
@@ -3639,6 +3643,7 @@ mod tests {
             output_mint: token_b,
             amount: 10_000,
             slot: 0,
+            block_time: None,
             direction: SwapDirection::ExactOut,
         };
 
