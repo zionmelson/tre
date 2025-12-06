@@ -13,7 +13,7 @@ use crate::builder::BuilderHandle;
 use crate::bundle::{BundleClient, BundleTracker};
 use crate::config::AppConfig;
 use crate::core::{Lease, RingConsumer, SlabPool, SpscRing};
-use crate::hydration::{HydrationService, HydrationSnapshot};
+use crate::hydration::{HydrationService, SnapshotChannel};
 use crate::notifier::Notifier;
 use crate::planner::types::BundleCandidate;
 use crate::planner::{
@@ -47,12 +47,12 @@ impl ExecutorRuntime {
         let pool_store_view = hydration_service.pool_store_view();
         let strategy = Arc::new(StrategyEngine::new(config.clone())?);
         let notifier = Arc::new(Notifier::new(strategy.clone(), config.clone()));
-        let (hydration_tx, hydration_rx) =
-            SpscRing::<HydrationSnapshot>::with_capacity(config.perf.ring_capacity).into_split();
+        let (snapshot_publisher, snapshot_reader) = SnapshotChannel::new().split();
         handles.push(hydration_service.spawn_adapter_ingest(stop.clone())?);
-        handles.push(hydration_service.spawn_snapshot_worker(stop.clone(), hydration_tx)?);
+        handles.push(hydration_service.spawn_snapshot_worker(stop.clone(), snapshot_publisher)?);
         handles.push(hydration_service.spawn_watcher_metrics(stop.clone())?);
         handles.push(hydration_service.spawn_pool_maintenance(stop.clone())?);
+        let mut hydration_reader = Some(snapshot_reader);
 
         let queue_capacity = config.watcher.queue_capacity.max(1);
         let graph_updates = pool_store.subscribe(queue_capacity);
@@ -90,7 +90,6 @@ impl ExecutorRuntime {
         }
 
         if hydration_only {
-            handles.push(spawn_snapshot_drain(stop.clone(), hydration_rx)?);
             info!("hydration-only topology active; planner + submitter skipped");
             return Ok(Self {
                 stop,
@@ -98,6 +97,10 @@ impl ExecutorRuntime {
                 _config: config,
             });
         }
+
+        let hydration_reader = hydration_reader
+            .take()
+            .expect("hydration snapshot reader missing");
 
         let (planner_tx, planner_rx) =
             SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
@@ -111,7 +114,7 @@ impl ExecutorRuntime {
         handles.push(spawn_fast_lane_planner(
             stop.clone(),
             Some(config.perf.eval_core),
-            hydration_rx,
+            hydration_reader,
             graph_handle.clone(),
             notifier.clone(),
             planner_tx,
@@ -181,22 +184,6 @@ fn describe_panic(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
     } else {
         "unknown panic".to_string()
     }
-}
-
-fn spawn_snapshot_drain(
-    stop: Arc<AtomicBool>,
-    consumer: RingConsumer<HydrationSnapshot>,
-) -> Result<thread::JoinHandle<Result<()>>> {
-    thread::Builder::new()
-        .name("hydration_drain".into())
-        .spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                while consumer.pop().is_some() {}
-                thread::sleep(Duration::from_millis(5));
-            }
-            Ok(())
-        })
-        .map_err(Into::into)
 }
 
 fn spawn_planner_drain(

@@ -20,8 +20,7 @@ use crate::hydration::token_fees::{
 };
 use crate::hydration::types::{
     CpAmmBaseFeeExtras, CpAmmDynamicFeeExtras, CpAmmPoolExtras, CpAmmPoolFeesExtras,
-    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
-    CP_AMM_INPUT_UTILIZATION_BPS,
+    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, CP_AMM_INPUT_UTILIZATION_BPS,
 };
 use crate::template::TemplateContext;
 
@@ -553,8 +552,7 @@ impl CpAmmAdapter {
 
     fn cache_stale(&self, state: &CpAmmState, current_slot: u64) -> bool {
         let slot_stale = self.config.stale_slot_threshold > 0
-            && current_slot
-                .saturating_sub(state.last_update_slot)
+            && current_slot.saturating_sub(state.last_update_slot)
                 > self.config.stale_slot_threshold;
         let time_stale = self.config.stale_after_ms > 0
             && state.last_update_at.elapsed().as_millis() as u64 > self.config.stale_after_ms;
@@ -874,10 +872,13 @@ fn quote_status_response(req: QuoteRequest, status: QuoteStatus) -> QuoteRespons
 #[derive(Debug, Clone)]
 struct SimulatedSwapQuote {
     pub executed_input_amount: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub net_input_amount: u64,
     pub output_amount: u64,
     pub fee_amount: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub token_in_fee_amount: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub token_out_fee_amount: u64,
     pub sqrt_price_after: u128,
     pub amount_leftover: u64,
@@ -889,8 +890,10 @@ struct SimulatedSwapQuote {
 struct ClmmStep {
     pub amount_out: u64,
     pub net_input_amount: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fee_amount: u64,
     pub sqrt_price_after: u128,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub hit_price_limit: bool,
 }
 
@@ -1113,7 +1116,11 @@ fn simulate_cp_amm_exact_in(
 
     let current_point = state.current_point(req.slot, block_time)?;
     let fee_config = state.fee_config();
-    let fee_mode = FeeMode::new(state.collect_fee_mode(), direction, state.has_referral_account());
+    let fee_mode = FeeMode::new(
+        state.collect_fee_mode(),
+        direction,
+        state.has_referral_account(),
+    );
     let has_partner = state.has_partner();
 
     let input_fee = state.transfer_fee_for_mint(&req.input_mint);
@@ -1124,8 +1131,8 @@ fn simulate_cp_amm_exact_in(
         return None;
     }
 
-    let mut trade_fee_numerator = fee_config
-        .trade_fee_from_included(direction, current_point, post_fee_budget)?;
+    let trade_fee_numerator =
+        fee_config.trade_fee_from_included(direction, current_point, post_fee_budget)?;
     let mut fee_split_input = FeeSplit::zero();
     let mut swap_budget = post_fee_budget;
     if fee_mode.fees_on_input {
@@ -1150,8 +1157,8 @@ fn simulate_cp_amm_exact_in(
 
     let mut pool_consumed_included = pool_consumed_net;
     if fee_mode.fees_on_input {
-        let adjusted_numerator = fee_config
-            .trade_fee_from_excluded(direction, current_point, pool_consumed_net)?;
+        let adjusted_numerator =
+            fee_config.trade_fee_from_excluded(direction, current_point, pool_consumed_net)?;
         let (included, split) = fee_config.apply_fee_to_excluded_amount(
             pool_consumed_net,
             adjusted_numerator,
@@ -1223,7 +1230,11 @@ fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<S
 
     let current_point = state.current_point(req.slot, block_time)?;
     let fee_config = state.fee_config();
-    let fee_mode = FeeMode::new(state.collect_fee_mode(), direction, state.has_referral_account());
+    let fee_mode = FeeMode::new(
+        state.collect_fee_mode(),
+        direction,
+        state.has_referral_account(),
+    );
     let has_partner = state.has_partner();
 
     let input_fee = state.transfer_fee_for_mint(&req.input_mint);
@@ -1239,8 +1250,11 @@ fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<S
     let gross_target_out = if fee_mode.fees_on_input {
         desired_after_token_fee
     } else {
-        let numerator = fee_config
-            .trade_fee_from_excluded(direction, current_point, desired_after_token_fee)?;
+        let numerator = fee_config.trade_fee_from_excluded(
+            direction,
+            current_point,
+            desired_after_token_fee,
+        )?;
         let (included, split) = fee_config.apply_fee_to_excluded_amount(
             desired_after_token_fee,
             numerator,
@@ -1264,8 +1278,8 @@ fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<S
     let mut fee_split_input = FeeSplit::zero();
     let mut pool_consumed = pool_input_net;
     if fee_mode.fees_on_input {
-        let trade_fee_numerator_input = fee_config
-            .trade_fee_from_excluded(direction, current_point, pool_input_net)?;
+        let trade_fee_numerator_input =
+            fee_config.trade_fee_from_excluded(direction, current_point, pool_input_net)?;
         let (included_amount, split) = fee_config.apply_fee_to_excluded_amount(
             pool_input_net,
             trade_fee_numerator_input,
@@ -1276,7 +1290,8 @@ fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<S
         pool_consumed = included_amount;
     }
 
-    let (executed_input_amount, token_in_fee_amount) = apply_pre_fee_amount(pool_consumed, input_fee)?;
+    let (executed_input_amount, token_in_fee_amount) =
+        apply_pre_fee_amount(pool_consumed, input_fee)?;
 
     let mut post_trade_output = step.amount_out;
     if !fee_mode.fees_on_input {
@@ -1306,9 +1321,8 @@ fn simulate_cp_amm_exact_out(state: &CpAmmState, req: &QuoteRequest) -> Option<S
         fee_split_output
     };
 
-    let slippage =
-        compute_slippage_bps(reserve_in, reserve_out, pool_input_net, step.amount_out)
-            .unwrap_or(0.0);
+    let slippage = compute_slippage_bps(reserve_in, reserve_out, pool_input_net, step.amount_out)
+        .unwrap_or(0.0);
     let mid_price = direction_mid_price(state, direction)?;
     let execution_price =
         scaled_execution_price(state, direction, output_amount, executed_input_amount)?;
@@ -1474,13 +1488,9 @@ fn compute_slippage_bps(
 
 fn token_program_for_mint(state: &CpAmmState, mint: &Pubkey) -> Pubkey {
     if *mint == state.token_a_mint {
-        state
-            .token_a_program
-            .unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY)
+        state.token_a_program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY)
     } else if *mint == state.token_b_mint {
-        state
-            .token_b_program
-            .unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY)
+        state.token_b_program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY)
     } else {
         *SPL_TOKEN_PROGRAM_PUBKEY
     }
@@ -1564,11 +1574,7 @@ fn hydration_meta_expired(extras: &CpAmmPoolExtras, ttl_ms: u64) -> bool {
     }
 }
 
-fn apply_hydrated_meta(
-    extras: &mut CpAmmPoolExtras,
-    meta: &HydratedPoolMeta,
-    force_refresh: bool,
-) {
+fn apply_hydrated_meta(extras: &mut CpAmmPoolExtras, meta: &HydratedPoolMeta, force_refresh: bool) {
     if force_refresh || extras.token_a_mint.is_none() {
         extras.token_a_mint = Some(meta.token_a_mint.to_string());
     }
@@ -2249,8 +2255,10 @@ impl FeeConfig {
                                 dynamic_fee: fees.dynamic_fee.clone(),
                                 activation_point: state.activation_point.unwrap_or(0),
                                 pool_version,
-                                cliff_fee_numerator:
-                                    fees.base_fee.cliff_fee_numerator.min(FEE_DENOMINATOR),
+                                cliff_fee_numerator: fees
+                                    .base_fee
+                                    .cliff_fee_numerator
+                                    .min(FEE_DENOMINATOR),
                             }),
                             protocol_fee_percent: fees.protocol_fee_percent,
                             partner_fee_percent: fees.partner_fee_percent,
@@ -2283,7 +2291,8 @@ impl FeeConfig {
             .lp_fee_bps
             .unwrap_or(0)
             .saturating_add(state.protocol_fee_bps.unwrap_or(0))
-            .saturating_add(state.referral_bps.unwrap_or(0)) as u64;
+            .saturating_add(state.referral_bps.unwrap_or(0))
+            as u64;
         let trade_fee_numerator = bps_to_numerator(fallback_trade_bps);
         let protocol_bps = state.protocol_fee_bps.unwrap_or(0) as u64;
         let referral_bps = state.referral_bps.unwrap_or(0) as u64;
@@ -2348,8 +2357,7 @@ impl FeeConfig {
         if included_amount == 0 || trade_fee_numerator == 0 {
             return Some((included_amount, FeeSplit::zero()));
         }
-        let (net, fee_amount) =
-            compute_excluded_fee_amount(trade_fee_numerator, included_amount)?;
+        let (net, fee_amount) = compute_excluded_fee_amount(trade_fee_numerator, included_amount)?;
         let split = self.split_fee(fee_amount, has_referral, has_partner);
         Some((net, split))
     }
@@ -2383,7 +2391,11 @@ impl FeeConfig {
         };
         let protocol_after_referral = protocol_fee.saturating_sub(referral_fee);
         let partner_fee = if has_partner {
-            mul_div_floor_u64(protocol_after_referral, self.partner_fee_percent.into(), 100)
+            mul_div_floor_u64(
+                protocol_after_referral,
+                self.partner_fee_percent.into(),
+                100,
+            )
         } else {
             0
         };
@@ -2399,8 +2411,8 @@ impl FeeConfig {
 }
 
 fn sanitize_pool_fees(fees: &mut CpAmmPoolFeesExtras, pool_version: u8) -> bool {
-    let max_fee_numerator = max_fee_numerator_for_version(pool_version)
-        .unwrap_or(MAX_FEE_NUMERATOR_V1);
+    let max_fee_numerator =
+        max_fee_numerator_for_version(pool_version).unwrap_or(MAX_FEE_NUMERATOR_V1);
     if max_fee_numerator < MIN_FEE_NUMERATOR {
         return false;
     }
@@ -2459,10 +2471,7 @@ fn sanitize_scheduler_extras(base: &mut CpAmmBaseFeeExtras, mode: BaseFeeModeFla
     }
 }
 
-fn sanitize_rate_limiter_extras(
-    base: &mut CpAmmBaseFeeExtras,
-    pool_version: u8,
-) -> bool {
+fn sanitize_rate_limiter_extras(base: &mut CpAmmBaseFeeExtras, pool_version: u8) -> bool {
     if base.first_factor == 0 {
         return false;
     }
@@ -2600,7 +2609,8 @@ fn compute_excluded_fee_amount(
     trade_fee_numerator: u64,
     included_fee_amount: u64,
 ) -> Option<(u64, u64)> {
-    let fee_amount = mul_div_round_up_u64(included_fee_amount, trade_fee_numerator, FEE_DENOMINATOR)?;
+    let fee_amount =
+        mul_div_round_up_u64(included_fee_amount, trade_fee_numerator, FEE_DENOMINATOR)?;
     let excluded = included_fee_amount.checked_sub(fee_amount)?;
     Some((excluded, fee_amount))
 }
@@ -2698,7 +2708,8 @@ impl FeeRateLimiter {
             let numerator_2 = c + increment * (a + one.clone());
             x0.clone() * numerator_1 + b * numerator_2
         } else {
-            let numerator_1 = c + c * max_index + increment * max_index * (max_index + one.clone()) / two;
+            let numerator_1 =
+                c + c * max_index + increment * max_index * (max_index + one.clone()) / two;
             let numerator_2 = U256::from(max_fee_numerator);
             let d = a - max_index;
             let left_amount = d * x0.clone() + b;
@@ -2706,8 +2717,7 @@ impl FeeRateLimiter {
         };
 
         let denominator = U256::from(FEE_DENOMINATOR);
-        let trading_fee = (trading_fee_numerator + denominator.clone() - one)
-            / denominator;
+        let trading_fee = (trading_fee_numerator + denominator.clone() - one) / denominator;
         let trading_fee_u64: u64 = trading_fee
             .try_into()
             .map_err(|_| FeeComputationError::InvalidConfig)?;
@@ -2748,8 +2758,7 @@ impl FeeRateLimiter {
 
     fn get_excluded_fee_amount(&self, included_fee_amount: u64) -> FeeResult<u64> {
         let fee_numerator = self.fee_numerator_from_included_core(included_fee_amount)?;
-        let (excluded, _) =
-            compute_excluded_fee_amount(fee_numerator, included_fee_amount)
+        let (excluded, _) = compute_excluded_fee_amount(fee_numerator, included_fee_amount)
             .ok_or(FeeComputationError::InvalidConfig)?;
         Ok(excluded)
     }
@@ -2779,8 +2788,7 @@ impl FeeRateLimiter {
                 .checked_sub(checked_excluded)
                 .ok_or(FeeComputationError::MathOverflow)?;
             let max_fee_numerator = bps_to_numerator_u64(u64::from(self.max_fee_bps))?;
-            let (included_remaining, _) =
-                compute_included_fee_amount(max_fee_numerator, remaining)
+            let (included_remaining, _) = compute_included_fee_amount(max_fee_numerator, remaining)
                 .ok_or(FeeComputationError::InvalidConfig)?;
             let total_included = included_remaining
                 .checked_add(checked_included)
@@ -2820,7 +2828,8 @@ impl FeeRateLimiter {
             - two.clone() * cliff.clone() * reference.clone();
         let z = two.clone() * excluded.clone() * denominator.clone() * reference.clone();
 
-        let disc = y.clone()
+        let disc = y
+            .clone()
             .checked_mul(y.clone())
             .ok_or(FeeComputationError::MathOverflow)?
             .checked_sub(four.clone() * x.clone() * z.clone())
@@ -2924,7 +2933,9 @@ impl BaseFeeKind {
         included_amount: u64,
     ) -> FeeResult<u64> {
         match self {
-            BaseFeeKind::Scheduler(scheduler) => scheduler.base_fee(current_point, activation_point),
+            BaseFeeKind::Scheduler(scheduler) => {
+                scheduler.base_fee(current_point, activation_point)
+            }
             BaseFeeKind::RateLimiter(limiter) => limiter
                 .get_fee_numerator_from_included_fee_amount(
                     current_point,
@@ -2943,7 +2954,9 @@ impl BaseFeeKind {
         excluded_amount: u64,
     ) -> FeeResult<u64> {
         match self {
-            BaseFeeKind::Scheduler(scheduler) => scheduler.base_fee(current_point, activation_point),
+            BaseFeeKind::Scheduler(scheduler) => {
+                scheduler.base_fee(current_point, activation_point)
+            }
             BaseFeeKind::RateLimiter(limiter) => limiter
                 .get_fee_numerator_from_excluded_fee_amount(
                     current_point,
@@ -3030,7 +3043,8 @@ fn exponential_fee(cliff: u64, reduction_factor: u64, period: u64) -> FeeResult<
             .checked_div(denominator)
             .ok_or(FeeComputationError::InvalidConfig)?;
     }
-    fee.try_into().map_err(|_| FeeComputationError::InvalidConfig)
+    fee.try_into()
+        .map_err(|_| FeeComputationError::InvalidConfig)
 }
 
 fn percent_from_components(part: u64, whole: u64) -> u8 {
@@ -3421,7 +3435,10 @@ mod tests {
         apply_hydrated_meta(&mut extras, &meta, false);
         let after_no_refresh = extras.pool_fees.as_ref().expect("fees present");
         assert_eq!(after_no_refresh.dynamic_fee.volatility_accumulator, 10);
-        assert_eq!(extras.token_a_mint.as_deref(), Some(old_mint_string.as_str()));
+        assert_eq!(
+            extras.token_a_mint.as_deref(),
+            Some(old_mint_string.as_str())
+        );
 
         let refreshed_mint = meta.token_a_mint.to_string();
         apply_hydrated_meta(&mut extras, &meta, true);
@@ -3431,7 +3448,10 @@ mod tests {
             refreshed_pool_fees.dynamic_fee.volatility_accumulator
         );
         assert_eq!(refreshed.base_fee.cliff_fee_numerator, 500);
-        assert_eq!(extras.token_a_mint.as_deref(), Some(refreshed_mint.as_str()));
+        assert_eq!(
+            extras.token_a_mint.as_deref(),
+            Some(refreshed_mint.as_str())
+        );
         assert!(extras.hydrated_at.is_some());
     }
 
@@ -3691,13 +3711,16 @@ mod tests {
             direction: SwapDirection::ExactIn,
         };
 
-        let simulation =
-            simulate_cp_amm_exact_in(&state, &req, false).expect("rate-limited quote");
+        let simulation = simulate_cp_amm_exact_in(&state, &req, false).expect("rate-limited quote");
         assert!(simulation.fee_amount > 0);
-        let direction = resolve_trade_direction(&state, &req.input_mint, &req.output_mint)
-            .expect("direction");
+        let direction =
+            resolve_trade_direction(&state, &req.input_mint, &req.output_mint).expect("direction");
         assert_eq!(direction, TradeDirection::BToA);
-        let fee_mode = FeeMode::new(state.collect_fee_mode(), direction, state.has_referral_account());
+        let fee_mode = FeeMode::new(
+            state.collect_fee_mode(),
+            direction,
+            state.has_referral_account(),
+        );
         assert!(fee_mode.fees_on_input);
         let current_point = state
             .current_point(req.slot, req.block_time_u64())
@@ -3732,10 +3755,14 @@ mod tests {
 
         let simulation = simulate_cp_amm_exact_out(&state, &req).expect("rate-limited exact out");
         assert!(simulation.fee_amount > 0);
-        let direction = resolve_trade_direction(&state, &req.input_mint, &req.output_mint)
-            .expect("direction");
+        let direction =
+            resolve_trade_direction(&state, &req.input_mint, &req.output_mint).expect("direction");
         assert_eq!(direction, TradeDirection::BToA);
-        let fee_mode = FeeMode::new(state.collect_fee_mode(), direction, state.has_referral_account());
+        let fee_mode = FeeMode::new(
+            state.collect_fee_mode(),
+            direction,
+            state.has_referral_account(),
+        );
         assert!(fee_mode.fees_on_input);
         let current_point = state
             .current_point(req.slot, req.block_time_u64())
@@ -3953,22 +3980,15 @@ mod tests {
             simulate_cp_amm_exact_in(&state, &req, false).expect("quote should succeed");
         assert!(simulation.token_in_fee_amount > 0);
         assert!(simulation.token_out_fee_amount > 0);
-        let direction =
-            resolve_trade_direction(&state, &req.input_mint, &req.output_mint).unwrap();
+        let direction = resolve_trade_direction(&state, &req.input_mint, &req.output_mint).unwrap();
         let fee_mode = FeeMode::new(state.collect_fee_mode(), direction, false);
         let mut expected_consumed = simulation
             .net_input_amount
             .saturating_add(simulation.token_in_fee_amount);
         if fee_mode.fees_on_input {
-            expected_consumed =
-                expected_consumed.saturating_add(simulation.fee_amount);
+            expected_consumed = expected_consumed.saturating_add(simulation.fee_amount);
         }
-        assert!(
-            simulation
-                .executed_input_amount
-                .abs_diff(expected_consumed)
-                <= 1
-        );
+        assert!(simulation.executed_input_amount.abs_diff(expected_consumed) <= 1);
         assert!(simulation.output_amount < req.amount);
 
         // ensure state without fees reverts to original behavior

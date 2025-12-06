@@ -298,34 +298,27 @@ fn hydrate_amm_v3_accounts(
     let context_input_account = plan.context.input_token_account;
     let context_output_account = plan.context.output_token_account;
     if plan.context.whirlpool_tick_arrays.len() < 3 {
-        bail!(
-            "plan for pool {} missing Raydium tick arrays",
-            plan.pool_id
-        );
+        bail!("plan for pool {} missing Raydium tick arrays", plan.pool_id);
     }
     let tick_arrays = &plan.context.whirlpool_tick_arrays;
     let bitmap_extension = plan.context.raydium_tick_array_bitmap_extension;
     let input_transfer_mint = if plan.context.input_transfer_fee_config.is_some() {
-        Some(
-            Pubkey::from_str(&plan.input_mint).with_context(|| {
-                format!(
-                    "invalid input mint {} for pool {}",
-                    plan.input_mint, plan.pool_id
-                )
-            })?,
-        )
+        Some(Pubkey::from_str(&plan.input_mint).with_context(|| {
+            format!(
+                "invalid input mint {} for pool {}",
+                plan.input_mint, plan.pool_id
+            )
+        })?)
     } else {
         None
     };
     let output_transfer_mint = if plan.context.output_transfer_fee_config.is_some() {
-        Some(
-            Pubkey::from_str(&plan.output_mint).with_context(|| {
-                format!(
-                    "invalid output mint {} for pool {}",
-                    plan.output_mint, plan.pool_id
-                )
-            })?,
-        )
+        Some(Pubkey::from_str(&plan.output_mint).with_context(|| {
+            format!(
+                "invalid output mint {} for pool {}",
+                plan.output_mint, plan.pool_id
+            )
+        })?)
     } else {
         None
     };
@@ -2458,13 +2451,8 @@ mod tests {
             lookup_table: None,
         };
 
-        let hydrated = hydrate_accounts_for_plan(
-            &cache,
-            &plan,
-            Pubkey::new_unique(),
-            &token_atas,
-        )
-        .expect("amm_v3 accounts");
+        let hydrated = hydrate_accounts_for_plan(&cache, &plan, Pubkey::new_unique(), &token_atas)
+            .expect("amm_v3 accounts");
 
         let bitmap_idx = find_account_index(specs, "tick_array_bitmap_extension");
         assert_eq!(hydrated[bitmap_idx].pubkey, bitmap);
@@ -2530,12 +2518,8 @@ mod tests {
             lookup_table: None,
         };
 
-        let result = hydrate_accounts_for_plan(
-            &cache,
-            &plan,
-            Pubkey::new_unique(),
-            &HashMap::new(),
-        );
+        let result =
+            hydrate_accounts_for_plan(&cache, &plan, Pubkey::new_unique(), &HashMap::new());
         assert!(result.is_err(), "missing tick arrays should error");
     }
 

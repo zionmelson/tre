@@ -47,6 +47,7 @@ struct TelemetryState {
     hydration_template_cache_entries: Gauge,
     hydration_alt_ready_tables: Gauge,
     hydration_flash_routes_prepared: Gauge,
+    hydration_snapshot_overwrites: Counter,
     hydration_ready_pools: Gauge,
     hydration_tracked_pools: Gauge,
     hydration_heartbeat_unix_ms: Gauge,
@@ -197,6 +198,13 @@ impl TelemetryState {
             "hydration_flash_routes_prepared",
             "Flash-loan routes currently pre-built by the hydration service",
             hydration_flash_routes_prepared.clone(),
+        );
+
+        let hydration_snapshot_overwrites = Counter::default();
+        registry.register(
+            "hydration_snapshot_overwrites_total",
+            "Count of hydration readiness snapshots overwritten before consumption",
+            hydration_snapshot_overwrites.clone(),
         );
 
         let hydration_ready_pools = Gauge::default();
@@ -415,6 +423,7 @@ impl TelemetryState {
             hydration_template_cache_entries,
             hydration_alt_ready_tables,
             hydration_flash_routes_prepared,
+            hydration_snapshot_overwrites,
             hydration_ready_pools,
             hydration_tracked_pools,
             hydration_heartbeat_unix_ms,
@@ -848,6 +857,12 @@ pub fn record_hydration_flash_routes(prepared_routes: u64) {
         state
             .hydration_flash_routes_prepared
             .set(clamp_u64_to_i64(prepared_routes));
+    }
+}
+
+pub fn record_hydration_snapshot_overwrite() {
+    if let Some(state) = TELEMETRY.get() {
+        state.hydration_snapshot_overwrites.inc();
     }
 }
 

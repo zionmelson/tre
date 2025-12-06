@@ -17,9 +17,9 @@ use solana_client::rpc_config::{
 use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
 use solana_client::rpc_response::{UiAccount, UiAccountData};
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
-use tracing::{debug, info, trace, warn};
 #[cfg(test)]
 use spl_token_2022::extension::transfer_fee::TransferFee;
+use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
 use crate::builder::{BuilderHandle, LbClmmPoolAccounts, LbClmmPoolMeta};
@@ -35,8 +35,8 @@ use crate::hydration::{
     },
 };
 use crate::template::{
-    LbClmmAccountsType, LbClmmRemainingAccountsSlice, LbClmmRewardAccountContext,
-    TemplateContext, TransferFeeConfigHint,
+    LbClmmAccountsType, LbClmmRemainingAccountsSlice, LbClmmRewardAccountContext, TemplateContext,
+    TransferFeeConfigHint,
 };
 
 use super::{
@@ -843,8 +843,10 @@ impl LbClmmAdapter {
 
     fn max_input_budget(&self, state: &LbClmmState, req: &QuoteRequest) -> u64 {
         match state.resolve_reserves(&req.input_mint, &req.output_mint) {
-            Some((reserve, _)) => clamp_reserve_to_utilization(reserve, self.config.max_swap_utilization_bps)
-                .min(u64::MAX as u128) as u64,
+            Some((reserve, _)) => {
+                clamp_reserve_to_utilization(reserve, self.config.max_swap_utilization_bps)
+                    .min(u64::MAX as u128) as u64
+            }
             None => u64::MAX,
         }
     }
@@ -855,7 +857,11 @@ impl LbClmmAdapter {
         } else {
             request_slot
         };
-        state.hydration_stale(slot, self.config.stale_slot_threshold, self.config.stale_after_ms)
+        state.hydration_stale(
+            slot,
+            self.config.stale_slot_threshold,
+            self.config.stale_after_ms,
+        )
     }
 
     fn build_snapshot_side(
@@ -998,7 +1004,6 @@ impl LbClmmAdapter {
 
         Ok(TransferFeeAdjustedSimulation {
             simulation,
-            net_input_amount: post_fee_budget,
             net_output_amount,
             executed_input_amount,
         })
@@ -1189,7 +1194,9 @@ impl ProtocolAdapter for LbClmmAdapter {
         response.context.expected_fee_amount = Some(simulation.taker_fee_amount);
         if request.amount > adjusted.executed_input_amount {
             response.context.partial_fill_remaining = Some(
-                request.amount.saturating_sub(adjusted.executed_input_amount),
+                request
+                    .amount
+                    .saturating_sub(adjusted.executed_input_amount),
             );
         }
         if let Some(host_fee) = state.host_fee_account {
@@ -1253,9 +1260,8 @@ impl ProtocolAdapter for LbClmmAdapter {
         response.context.compute_unit_price = Some(LB_CLMM_DEFAULT_CU_PRICE);
         response.context.expected_fee_amount = Some(simulation.taker_fee_amount);
         if gross_input > adjusted.executed_input_amount {
-            response.context.partial_fill_remaining = Some(
-                gross_input.saturating_sub(adjusted.executed_input_amount),
-            );
+            response.context.partial_fill_remaining =
+                Some(gross_input.saturating_sub(adjusted.executed_input_amount));
         }
         if let Some(host_fee) = state.host_fee_account {
             response.context.host_fee_account = Some(host_fee);
@@ -1662,7 +1668,6 @@ struct LbClmmSimulationOutcome {
 
 struct TransferFeeAdjustedSimulation {
     simulation: LbClmmSimulationOutcome,
-    net_input_amount: u64,
     net_output_amount: u64,
     executed_input_amount: u64,
 }
@@ -3418,9 +3423,14 @@ mod tests {
             direction: SwapDirection::ExactOut,
         };
 
-        let quote = adapter.quote_exact_out(req.clone()).expect("exact-out quote");
+        let quote = adapter
+            .quote_exact_out(req.clone())
+            .expect("exact-out quote");
         assert_eq!(quote.request.amount, req.amount);
-        assert!(quote.amount_out >= req.amount, "net output should satisfy target");
+        assert!(
+            quote.amount_out >= req.amount,
+            "net output should satisfy target"
+        );
         assert_eq!(quote.min_output_amount, Some(quote.amount_out));
 
         let (gross_output, _) = apply_pre_fee_amount(req.amount, state.token_y_transfer_fee)

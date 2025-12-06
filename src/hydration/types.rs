@@ -17,6 +17,7 @@ pub enum QuoteStatus {
     InsufficientBins,
     PriceImpactExceeded,
     TradingDisabled,
+    TokenFeeUnsupported,
 }
 
 mod protocols;
@@ -24,11 +25,11 @@ mod protocols;
 pub use protocols::{
     CpAmmBaseFeeExtras, CpAmmDynamicFeeExtras, CpAmmPoolExtras, CpAmmPoolFeesExtras,
     LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras, LbClmmPoolExtras,
-    LbClmmRewardExtras, RaydiumTransferFeeConfig, RaydiumV3PoolExtras, WhirlpoolAdaptiveFeeConstants,
-    WhirlpoolAdaptiveFeeInfo, WhirlpoolAdaptiveFeeVariables, WhirlpoolPoolExtras,
-    CP_AMM_INPUT_UTILIZATION_BPS, CP_AMM_PROGRAM_ID, LB_CLMM_INPUT_UTILIZATION_BPS,
-    LB_CLMM_PROGRAM_ID, RAYDIUM_V3_INPUT_UTILIZATION_BPS, RAYDIUM_V3_PROGRAM_ID,
-    WHIRLPOOL_INPUT_UTILIZATION_BPS, WHIRLPOOL_PROGRAM_ID,
+    LbClmmRewardExtras, RaydiumTransferFeeConfig, RaydiumV3PoolExtras,
+    WhirlpoolAdaptiveFeeConstants, WhirlpoolAdaptiveFeeInfo, WhirlpoolAdaptiveFeeVariables,
+    WhirlpoolPoolExtras, CP_AMM_INPUT_UTILIZATION_BPS, CP_AMM_PROGRAM_ID,
+    LB_CLMM_INPUT_UTILIZATION_BPS, LB_CLMM_PROGRAM_ID, RAYDIUM_V3_INPUT_UTILIZATION_BPS,
+    RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_INPUT_UTILIZATION_BPS, WHIRLPOOL_PROGRAM_ID,
 };
 
 use protocols::{

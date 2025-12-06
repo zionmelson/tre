@@ -18,11 +18,10 @@ use tracing::{debug, info, warn};
 use super::{
     adapters::{AdapterReadiness, ReadinessBlocker, ReadinessBlockerKind},
     AdapterBook, AltManagerStats, FlashLoanPlanner, PoolStateEvent, PoolStateUpdate, PoolStore,
-    PoolStoreView, RpcRefresher, TemplateCache, TemplateCacheStats,
+    PoolStoreView, RpcRefresher, SnapshotPublisher, TemplateCache, TemplateCacheStats,
 };
 use crate::builder::{templates::SwapTemplateDirection, BuilderHandle};
 use crate::config::AppConfig;
-use crate::core::RingProducer;
 use crate::corecast::CoreCastClient;
 use crate::hydration::types::{PoolSnapshot, PoolUpdate, WHIRLPOOL_PROGRAM_ID};
 use crate::telemetry;
@@ -106,13 +105,13 @@ impl HydrationService {
     pub fn spawn_snapshot_worker(
         &self,
         stop: Arc<AtomicBool>,
-        producer: RingProducer<HydrationSnapshot>,
+        publisher: SnapshotPublisher,
     ) -> Result<thread::JoinHandle<Result<()>>> {
         let builder = self.builder.clone();
         let interval = self.publish_interval;
         thread::Builder::new()
             .name("hydration_service".into())
-            .spawn(move || run_snapshot_loop(stop, producer, builder, interval))
+            .spawn(move || run_snapshot_loop(stop, publisher, builder, interval))
             .map_err(Into::into)
     }
 
@@ -313,7 +312,7 @@ fn format_blocker(blocker: ReadinessBlocker) -> String {
 
 fn run_snapshot_loop(
     stop: Arc<AtomicBool>,
-    producer: RingProducer<HydrationSnapshot>,
+    publisher: SnapshotPublisher,
     builder: BuilderHandle,
     interval: Duration,
 ) -> Result<()> {
@@ -324,19 +323,17 @@ fn run_snapshot_loop(
             alt_stats: builder.alt_manager().stats(),
             flash_routes_prepared: builder.flash_loan_planner().prepared_route_count(),
         };
-        match producer.push(snapshot) {
-            Ok(()) => {
-                debug!(
-                    templates = snapshot.template_stats.template_count,
-                    ready_tables = snapshot.alt_stats.ready_tables,
-                    flash_routes = snapshot.flash_routes_prepared,
-                    "published hydration snapshot"
-                );
-            }
-            Err(_) => {
-                warn!("hydration snapshot channel full; dropping readiness sample");
-            }
+        let template_count = snapshot.template_stats.template_count;
+        let ready_tables = snapshot.alt_stats.ready_tables;
+        let flash_routes = snapshot.flash_routes_prepared;
+        let overwritten = publisher.publish(snapshot);
+        if overwritten {
+            telemetry::record_hydration_snapshot_overwrite();
         }
+        debug!(
+            templates = template_count,
+            ready_tables, flash_routes, overwritten, "published hydration snapshot"
+        );
         thread::sleep(interval);
     }
     Ok(())

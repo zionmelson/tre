@@ -3,7 +3,7 @@
 ## Objectives
 
 - **Freshness first:** Pool snapshots, template caches, ALT tables, flash-loan routes, and blockhashes carry TTLs that cap end-to-end latency at ~45 ms. Anything older is rejected before the builder signs a bundle.
-- **Single in-memory path:** CoreCast deltas are decoded once by the hydration service and stay in RAM via `PoolStore`, `SpscRing`, and `SlabPool` structures—no RocksDB, JSON polling, or multi-stage disk queues.
+- **Single in-memory path:** CoreCast deltas are decoded once by the hydration service and stay in RAM via `PoolStore`, the lossy `SnapshotChannel`, and `SlabPool` structures—no RocksDB, JSON polling, or multi-stage disk queues.
 - **Deterministic latency:** CPU affinity, lock-free channels, and bounded allocators keep `CoreCast → HydrationSnapshot → Planner → Submitter` deterministic even under load.
 - **Observability-backed safety:** Prometheus metrics (`telemetry.rs`) expose queue depth, stale pools, planner backlog, submission latency, bundle outcomes, and tip pressure so automation (or humans) can pause trading quickly.
 
@@ -41,7 +41,7 @@
 
 - Builds a single `HydrationService` around a shared `BuilderHandle`. It owns the `AdapterBook`, template cache, ALT manager, flash-loan planner, and the `PoolStore` (runtime map of hydrated pools subject to freshness/size policies from `config.watcher`).
 - `spawn_adapter_ingest` opens the credentialed `CoreCastClient`, consumes pool deltas, enriches them with adapter-specific metadata, and applies them to `PoolStore`. An allowlist derived from `AppConfig::token_pair_allowlist` limits ingestion to configured mint pairs.
-- `spawn_snapshot_worker` publishes lightweight `HydrationSnapshot`s onto an SPSC ring every ~25 ms. Each snapshot advertises template counts, ALT freshness, and flash-route readiness so the planner can skip pools that are warming up.
+- `spawn_snapshot_worker` publishes lightweight `HydrationSnapshot`s into a single-slot `SnapshotChannel` every ~25 ms. Publishing overwrites the previous entry if the planner has not consumed it yet, ensuring the planner always reads the freshest state while telemetry counts any overwrites.
 - `spawn_pool_maintenance` coordinates RPC refresh via `RpcRefresher` when CoreCast stalls, and `pool_store.collect_stale` ensures old entries are either refreshed or marked stale for the planner.
 - `pool_store.subscribe` fans updates out to graph builders, planners, and metrics threads. Thread shutdown is coordinated through a shared `AtomicBool` stop flag owned by the runtime.
 
@@ -71,7 +71,7 @@
 ## Data Contracts
 
 - **`PoolState` / `PoolStateUpdate`** – Represent hydrated protocol state: slot, `Instant` timestamps, base/quote liquidity summaries, protocol identifiers, freshness flags, and a monotonically increasing generation counter.
-- **`HydrationSnapshot`** – Cheap `Copy` struct delivered via SPSC ring that includes template counts, ALT manager stats, and flash-route readiness plus the `issued_at` timestamp. Callers compare `Instant::now()` against `snapshot.stale_at(freshness_budget)` to guard planners.
+- **`HydrationSnapshot`** – Cheap `Copy` struct delivered via the lossy `SnapshotChannel` that includes template counts, ALT manager stats, and flash-route readiness plus the `issued_at` timestamp. The channel always exposes the newest snapshot, dropping older ones and incrementing an overwrite metric so operators can see when freshness pressure is high. Callers compare `Instant::now()` against `snapshot.stale_at(freshness_budget)` to guard planners.
 - **`TemplateReadiness`** – Returned by `BuilderHandle::template_readiness(pool, direction)` and combines template TTL + ALT TTL so route planning can skip pools missing a hydrated template/ALT table.
 - **`BundleCandidate`** – Planner output containing `BundleBuildContext`, route metadata, estimated edge/profit/tip, flash-loan reservations, and detection timestamps. Candidates always live inside a `Lease` from `SlabPool` so memory stays deterministic.
 - **`PendingSubmission`** – Tracker input with `bundle_id`, `seq`, endpoint, detection time, and optional tips. Tracker augments it with result streams and emits `BundleSubmissionEvent`s (submitted, accepted, rejected, expired, etc.).

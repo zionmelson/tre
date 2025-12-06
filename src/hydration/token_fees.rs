@@ -214,7 +214,9 @@ fn parse_transfer_fee_extension(
 
 #[cfg(test)]
 impl TokenTransferFeeHydrator {
-    pub fn with_static(entries: Vec<(Pubkey, Option<TokenTransferFee>, Option<Pubkey>, Pubkey)>) -> Self {
+    pub fn with_static(
+        entries: Vec<(Pubkey, Option<TokenTransferFee>, Option<Pubkey>, Pubkey)>,
+    ) -> Self {
         let cache = Arc::new(DashMap::new());
         for (mint, fee, hook_program, token_program) in entries {
             cache.insert(

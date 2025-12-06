@@ -15,10 +15,12 @@ use tracing::{debug, info, trace, warn};
 
 use crate::builder::{BuilderHandle, BuilderStage};
 use crate::config::AppConfig;
-use crate::core::{pin_current_thread, Lease, RingConsumer, RingProducer, SlabPool};
+use crate::core::{pin_current_thread, Lease, RingProducer, SlabPool};
 use crate::corecast::CoreCastClient;
 use crate::hydration::types::{PoolSnapshot, TradeUpdate};
-use crate::hydration::{HydrationSnapshot, PoolStateEvent, PoolStateUpdate, PoolStore};
+use crate::hydration::{
+    HydrationSnapshot, PoolStateEvent, PoolStateUpdate, PoolStore, SnapshotReader,
+};
 use crate::notifier::Notifier;
 use crate::planner::graph_manager::ArbitrageOpportunity;
 use crate::planner::types::{BundleCandidate, Opportunity};
@@ -62,6 +64,7 @@ impl Default for PlannerConfig {
 pub struct FastLanePlanner {
     builder: BuilderHandle,
     config: PlannerConfig,
+    snapshot_reader: SnapshotReader,
     trade_rx: Receiver<TradeUpdate>,
     pool_updates: Receiver<PoolStateUpdate>,
     bundle_pool: SlabPool<BundleCandidate>,
@@ -85,6 +88,7 @@ impl FastLanePlanner {
     pub fn new(
         builder: BuilderHandle,
         config: PlannerConfig,
+        snapshot_reader: SnapshotReader,
         graph: GraphHandle,
         notifier: Arc<Notifier>,
         trade_rx: Receiver<TradeUpdate>,
@@ -99,6 +103,7 @@ impl FastLanePlanner {
         Self {
             builder,
             config,
+            snapshot_reader,
             trade_rx,
             pool_updates,
             bundle_pool,
@@ -127,12 +132,7 @@ impl FastLanePlanner {
         start + self.config.detection_budget
     }
 
-    pub fn run(
-        mut self,
-        stop: Arc<AtomicBool>,
-        core_id: Option<usize>,
-        snapshot_consumer: RingConsumer<HydrationSnapshot>,
-    ) -> Result<()> {
+    pub fn run(mut self, stop: Arc<AtomicBool>, core_id: Option<usize>) -> Result<()> {
         if let Some(core) = core_id {
             let _ = pin_current_thread(core);
         }
@@ -161,7 +161,7 @@ impl FastLanePlanner {
                 made_progress = true;
                 self.pending_cycle_scan = true;
             }
-            while let Some(snapshot) = snapshot_consumer.pop() {
+            if let Some(snapshot) = self.snapshot_reader.take_latest() {
                 self.handle_snapshot(snapshot);
                 made_progress = true;
             }
@@ -192,9 +192,16 @@ impl FastLanePlanner {
                 return false;
             }
             if self.pool_store.wait_until_ready(self.readiness_timeout) {
+                info!(
+                    target = "fastlane",
+                    ready_pools = self.pool_store.ready_len(),
+                    tracked_pools = self.pool_store.len(),
+                    min_ready = self.min_ready_pools,
+                    "\u{1F4B9} fastlane ready"
+                );
                 return true;
             }
-            warn!(
+            debug!(
                 target = "fastlane",
                 timeout_ms = self.readiness_timeout.as_millis(),
                 ready_pools = self.pool_store.ready_len(),
@@ -515,7 +522,7 @@ struct CachedPool {
 pub fn spawn_fast_lane_planner(
     stop: Arc<AtomicBool>,
     core_id: Option<usize>,
-    snapshot_consumer: RingConsumer<HydrationSnapshot>,
+    snapshot_reader: SnapshotReader,
     graph: GraphHandle,
     notifier: Arc<Notifier>,
     bundle_producer: RingProducer<Lease<BundleCandidate>>,
@@ -531,6 +538,7 @@ pub fn spawn_fast_lane_planner(
     let worker = FastLanePlanner::new(
         builder,
         config,
+        snapshot_reader,
         graph,
         notifier,
         trade_rx,
@@ -543,7 +551,7 @@ pub fn spawn_fast_lane_planner(
     );
     thread::Builder::new()
         .name("fast_lane_planner".into())
-        .spawn(move || worker.run(stop, core_id, snapshot_consumer))
+        .spawn(move || worker.run(stop, core_id))
         .map_err(Into::into)
 }
 

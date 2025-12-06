@@ -170,22 +170,6 @@ impl WhirlpoolAdapter {
         });
     }
 
-    fn state_is_fresh(&self, state: &WhirlpoolState, reference_slot: u64) -> bool {
-        let slot_fresh = if self.config.stale_slot_threshold == 0 || reference_slot == 0 {
-            true
-        } else {
-            reference_slot
-                .saturating_sub(state.last_update_slot)
-                <= self.config.stale_slot_threshold
-        };
-        let instant_fresh = if self.config.stale_after_ms == 0 {
-            true
-        } else {
-            state.last_update_at.elapsed().as_millis() as u64 <= self.config.stale_after_ms
-        };
-        slot_fresh && instant_fresh
-    }
-
     fn upsert_state(&self, update: &PoolUpdate, extras: WhirlpoolPoolExtras) {
         let Some(pool_pubkey) = parse_pubkey(&update.pool_id) else {
             warn!(
@@ -442,11 +426,7 @@ impl WhirlpoolAdapter {
         program.unwrap_or(SPL_TOKEN_PROGRAM_ID)
     }
 
-    fn decorate_template_context(
-        &self,
-        response: &mut QuoteResponse,
-        base_state: &WhirlpoolState,
-    ) {
+    fn decorate_template_context(&self, response: &mut QuoteResponse, base_state: &WhirlpoolState) {
         let refreshed_state = self.refreshed_state(base_state);
         let state = &refreshed_state;
         let mut context = self.snapshot_template_context(state);
@@ -527,55 +507,6 @@ impl WhirlpoolAdapter {
             context.remaining_accounts.extend(accounts);
             context.whirlpool_remaining_accounts.push(slice);
         }
-    }
-
-    fn fallback_exact_in_response(
-        &self,
-        request: QuoteRequest,
-        state: &WhirlpoolState,
-        output_fee: Option<TokenTransferFee>,
-        status: QuoteStatus,
-    ) -> QuoteResponse {
-        let fallback_amount = state
-            .mid_price()
-            .and_then(|price| {
-                quote_from_price(&request, &state.token_mint_a, &state.token_mint_b, price)
-            })
-            .unwrap_or(0);
-        let (net_fallback_out, _) =
-            apply_post_fee_amount(fallback_amount, output_fee).unwrap_or((fallback_amount, 0));
-        let mut response = build_quote_response(request, net_fallback_out);
-        response.status = status;
-        response.min_output_amount = Some(net_fallback_out);
-        self.decorate_template_context(&mut response, state);
-        response
-    }
-
-    fn fallback_exact_out_response(
-        &self,
-        request: QuoteRequest,
-        state: &WhirlpoolState,
-        input_fee: Option<TokenTransferFee>,
-        output_fee: Option<TokenTransferFee>,
-        status: QuoteStatus,
-    ) -> QuoteResponse {
-        let amount_in = quote_exact_out_from_price(&request, state).unwrap_or(request.amount);
-        let (executed_input_amount, _) =
-            apply_pre_fee_amount(amount_in, input_fee).unwrap_or((amount_in, 0));
-        let (net_amount_out, _) =
-            apply_post_fee_amount(request.amount, output_fee).unwrap_or((request.amount, 0));
-        let mut response = QuoteResponse {
-            amount_in: executed_input_amount,
-            amount_out: net_amount_out,
-            edge_bps: 0.0,
-            sqrt_price_limit: None,
-            min_output_amount: Some(net_amount_out),
-            status,
-            request,
-            context: TemplateContext::default(),
-        };
-        self.decorate_template_context(&mut response, state);
-        response
     }
 
     fn collect_transfer_hook_accounts(
@@ -1196,8 +1127,8 @@ impl ProtocolAdapter for WhirlpoolAdapter {
             let amount_in = quote_exact_out_from_price(&request, &state).unwrap_or(request.amount);
             let (executed_input_amount, _) =
                 apply_pre_fee_amount(amount_in, input_fee).unwrap_or((amount_in, 0));
-            let (net_amount_out, _) = apply_post_fee_amount(request.amount, output_fee)
-                .unwrap_or((request.amount, 0));
+            let (net_amount_out, _) =
+                apply_post_fee_amount(request.amount, output_fee).unwrap_or((request.amount, 0));
             let mut response = QuoteResponse {
                 amount_in: executed_input_amount,
                 amount_out: net_amount_out,
@@ -1499,9 +1430,7 @@ struct WhirlpoolPoolHydrator {
     endpoint_count: usize,
     pool_failures: DashMap<Pubkey, FailureWindow>,
     tick_failures: DashMap<(Pubkey, i32), FailureWindow>,
-    pool_backoff: Duration,
     tick_backoff: Duration,
-    max_pool_failures: u32,
     max_tick_failures: u32,
 }
 
@@ -1571,9 +1500,7 @@ impl WhirlpoolPoolHydrator {
             endpoint_count,
             pool_failures,
             tick_failures,
-            pool_backoff,
             tick_backoff,
-            max_pool_failures,
             max_tick_failures,
         })
     }
@@ -1811,7 +1738,7 @@ impl WhirlpoolPoolHydrator {
             let failures = self.record_tick_failure(pool, start);
             self.log_tick_fetch_error(pool, start, &address, &error, failures);
         } else {
-            warn!(
+            debug!(
                 target = "adapter::whirlpool",
                 pool = %pool,
                 %address,
@@ -1832,7 +1759,7 @@ impl WhirlpoolPoolHydrator {
         failures: u32,
     ) {
         if failures == 1 {
-            warn!(
+            debug!(
                 target = "adapter::whirlpool",
                 pool = %pool,
                 start = start_tick_index,
@@ -1930,7 +1857,7 @@ fn fetch_whirlpool_meta(
                             meta.adaptive_fee = oracle_meta.adaptive_fee;
                         }
                         Err(error) => {
-                            warn!(
+                            debug!(
                                 target = "adapter::whirlpool",
                                 pool = %pool,
                                 oracle = %meta.oracle,
@@ -2701,7 +2628,6 @@ impl From<SimulationError> for QuoteStatus {
 struct SlippageSimulation {
     amount_out: u64,
     consumed_input: u64,
-    net_input_amount: u64,
     fee_amount: u64,
     edge_bps: f64,
     sqrt_price_before: Option<u128>,
@@ -2779,7 +2705,6 @@ fn simulate_constant_liquidity_exact_in(
     Ok(SlippageSimulation {
         amount_out,
         consumed_input: actual_amount_in,
-        net_input_amount: step.amount_in.min(u64::MAX as u128) as u64,
         fee_amount: step.fee_amount.min(u64::MAX as u128) as u64,
         edge_bps,
         sqrt_price_before: Some(sqrt_price_x64),
@@ -2929,7 +2854,6 @@ fn simulate_tick_arrays_exact_in(
     Ok(SlippageSimulation {
         amount_out,
         consumed_input: actual_amount_in,
-        net_input_amount: amount_in_accum.min(u64::MAX as u128) as u64,
         fee_amount: fee_accum.min(u64::MAX as u128) as u64,
         edge_bps,
         sqrt_price_before: state.sqrt_price_x64,
@@ -3916,9 +3840,12 @@ mod tests {
         let token_program = Pubkey::new_unique();
         let mint_a = Pubkey::new_unique();
         let mint_b = Pubkey::new_unique();
-        let fee_cache = TokenTransferFeeHydrator::with_static(vec![
-            (mint_a, None, Some(hook_program), token_program),
-        ]);
+        let fee_cache = TokenTransferFeeHydrator::with_static(vec![(
+            mint_a,
+            None,
+            Some(hook_program),
+            token_program,
+        )]);
         let adapter = WhirlpoolAdapter {
             program_id: Pubkey::from_str(WHIRLPOOL_PROGRAM_ID).unwrap(),
             state: DashMap::new(),

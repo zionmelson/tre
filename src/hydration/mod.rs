@@ -6,6 +6,7 @@ pub mod ingest;
 pub mod pool_state;
 pub mod rpc_refresh;
 pub mod service;
+pub mod snapshot;
 pub mod template_cache;
 pub mod token_fees;
 pub mod transfer_hooks;
@@ -21,6 +22,7 @@ pub use ingest::spawn_ingest_stage;
 pub use pool_state::{PoolState, PoolStateEvent, PoolStateUpdate, PoolStore, PoolStoreView};
 pub use rpc_refresh::RpcRefresher;
 pub use service::{HydrationService, HydrationSnapshot, TemplateReadiness};
+pub use snapshot::{SnapshotChannel, SnapshotPublisher, SnapshotReader};
 pub use template_cache::{
     AltHandleId, AmmV3Field, AmmV3FieldLayout, AmmV3PoolAccounts, AmmV3TemplateParams, CpAmmField,
     CpAmmFieldLayout, CpAmmTemplateParams, InstructionTemplate, LbClmmField, LbClmmFieldLayout,

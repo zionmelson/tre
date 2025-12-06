@@ -13,9 +13,7 @@ use spl_transfer_hook_interface::{
 };
 use tracing::{debug, warn};
 
-use crate::telemetry::{
-    record_transfer_hook_event, TransferHookEvent, TransferHookFailureReason,
-};
+use crate::telemetry::{record_transfer_hook_event, TransferHookEvent, TransferHookFailureReason};
 
 /// Resolves the on-chain accounts required to satisfy TransferHook CPI checks
 /// for a specific mint/program pair.
