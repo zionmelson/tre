@@ -21,7 +21,7 @@ use crate::hydration::token_fees::{
 };
 use crate::hydration::transfer_hooks::{TransferHookAccountContext, TransferHookAccountsResolver};
 use crate::hydration::types::{
-    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
+    HydrationComponent, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
     WhirlpoolAdaptiveFeeConstants, WhirlpoolAdaptiveFeeInfo, WhirlpoolAdaptiveFeeVariables,
     WhirlpoolPoolExtras, WHIRLPOOL_INPUT_UTILIZATION_BPS,
 };
@@ -62,6 +62,14 @@ mod u256 {
 pub use u256::U256;
 
 const DEFAULT_WHIRLPOOL_HYDRATION_RETRY_MS: u64 = 60_000;
+const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
+const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
+
+#[derive(Clone)]
+struct SnapshotStatusLogEntry {
+    status: QuoteStatus,
+    logged_at: Instant,
+}
 
 #[derive(Debug, Clone)]
 pub struct WhirlpoolAdapterConfig {
@@ -105,6 +113,8 @@ pub struct WhirlpoolAdapter {
     transfer_hook_resolver: Option<TransferHookAccountsResolver>,
     template_builder: Option<BuilderHandle>,
     registered_templates: DashMap<Pubkey, WhirlpoolRegistration>,
+    snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
+    missing_state_log: DashMap<Pubkey, Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -145,6 +155,8 @@ impl WhirlpoolAdapter {
             transfer_hook_resolver,
             template_builder,
             registered_templates: DashMap::new(),
+            snapshot_failure_log: DashMap::new(),
+            missing_state_log: DashMap::new(),
         }
     }
 
@@ -761,6 +773,28 @@ impl WhirlpoolAdapter {
         hydrator.prefetch_tick_arrays(state.whirlpool, collected);
     }
 
+    fn schedule_tick_array_windows(&self, state: &WhirlpoolState) {
+        let Some(hydrator) = self.hydrator.as_ref() else {
+            return;
+        };
+        let mut seen = HashSet::new();
+        let mut hints = Vec::new();
+        for direction in [TradeDirection::AToB, TradeDirection::BToA] {
+            if let Some((primary, supplemental)) = self.derive_tick_array_window(state, direction)
+            {
+                for pk in primary.into_iter().chain(supplemental.into_iter()) {
+                    if seen.insert(pk) {
+                        hints.push(pk);
+                    }
+                }
+            }
+        }
+        if hints.is_empty() {
+            return;
+        }
+        hydrator.prefetch_tick_arrays(state.whirlpool, hints);
+    }
+
     fn fallback_tick_arrays_from_state(&self, state: &WhirlpoolState) -> Option<Vec<Pubkey>> {
         let arrays = [state.tick_array0?, state.tick_array1?, state.tick_array2?];
         Some(arrays.into_iter().collect())
@@ -856,6 +890,122 @@ impl WhirlpoolAdapter {
         clamp_amount_to_reserve(amount, reserve, self.config.max_swap_utilization_bps)
     }
 
+    fn state_stale(&self, state: &WhirlpoolState, request_slot: u64) -> bool {
+        let reference_slot = if request_slot == 0 {
+            state.last_update_slot
+        } else {
+            request_slot
+        };
+        let slot_stale = self.config.stale_slot_threshold > 0
+            && reference_slot.saturating_sub(state.last_update_slot)
+                > self.config.stale_slot_threshold;
+        let time_stale = self.config.stale_after_ms > 0
+            && state.last_update_at.elapsed().as_millis() as u64 > self.config.stale_after_ms;
+        slot_stale || time_stale
+    }
+
+    fn log_state_cache_miss(&self, pool: Pubkey, slot: u64) {
+        if let Some(entry) = self.missing_state_log.get(&pool) {
+            if (entry.value().elapsed().as_millis() as u64) < STATE_MISS_LOG_INTERVAL_MS {
+                return;
+            }
+        }
+        self.missing_state_log.insert(pool, Instant::now());
+        warn!(
+            target = "adapter::whirlpool",
+            pool = %pool,
+            slot,
+            hydrator_online = self.hydrator.is_some(),
+            "whirlpool strict price snapshot requested before hydration"
+        );
+    }
+
+    fn clear_snapshot_issue(&self, pool: Pubkey, base_to_quote: bool) {
+        self.snapshot_failure_log.remove(&(pool, base_to_quote));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_snapshot_issue(
+        &self,
+        state: &WhirlpoolState,
+        slot: u64,
+        base_to_quote: bool,
+        status: QuoteStatus,
+        reason: &'static str,
+        probe_amount: Option<u64>,
+        amount_specified_is_input: Option<bool>,
+        block_time_unix: Option<i64>,
+    ) {
+        if status == QuoteStatus::Ok {
+            self.clear_snapshot_issue(state.whirlpool, base_to_quote);
+            return;
+        }
+
+        let key = (state.whirlpool, base_to_quote);
+        let should_log = match self.snapshot_failure_log.get(&key) {
+            Some(entry) => {
+                let cached = entry.value();
+                cached.status != status
+                    || cached.logged_at.elapsed().as_millis() as u64
+                        >= SNAPSHOT_FAILURE_LOG_INTERVAL_MS
+            }
+            None => true,
+        };
+
+        if !should_log {
+            return;
+        }
+
+        self.snapshot_failure_log.insert(
+            key,
+            SnapshotStatusLogEntry {
+                status,
+                logged_at: Instant::now(),
+            },
+        );
+
+        let cache_age_ms = state.last_update_at.elapsed().as_millis() as u64;
+        let hydrator_clients = self
+            .hydrator
+            .as_ref()
+            .map(|hydrator| hydrator.client_count())
+            .unwrap_or(0);
+        let normalized_time = normalize_block_time(block_time_unix);
+        let trading_enabled = trade_enabled(state, normalized_time);
+
+        warn!(
+            target = "adapter::whirlpool",
+            pool = %state.whirlpool,
+            slot,
+            direction = if base_to_quote {
+                "base_to_quote"
+            } else {
+                "quote_to_base"
+            },
+            status = ?status,
+            reason,
+            probe_amount,
+            amount_specified_is_input,
+            block_time_unix,
+            last_update_slot = state.last_update_slot,
+            cache_age_ms,
+            preferred_exact_out = self.config.prefer_exact_out_quotes,
+            tick_spacing = ?state.tick_spacing,
+            liquidity = ?state.liquidity,
+            sqrt_price_x64 = ?state.sqrt_price_x64,
+            tick_current_index = ?state.tick_current_index,
+            reserve_a = ?state.reserve_a,
+            reserve_b = ?state.reserve_b,
+            tick_array0 = state.tick_array0.is_some(),
+            tick_array1 = state.tick_array1.is_some(),
+            tick_array2 = state.tick_array2.is_some(),
+            trading_enabled,
+            hydrator_clients,
+            hydrator_online = self.hydrator.is_some(),
+            "whirlpool strict price quote unavailable"
+        );
+    }
+
     fn build_snapshot_side(
         &self,
         state: &WhirlpoolState,
@@ -864,10 +1014,49 @@ impl WhirlpoolAdapter {
         block_time_unix: Option<i64>,
         input_mint: Pubkey,
         output_mint: Pubkey,
+        base_to_quote: bool,
         probe_amount: u64,
         amount_specified_is_input: bool,
     ) -> Option<PoolQuoteSide> {
-        if probe_amount == 0 || input_mint == output_mint {
+        if probe_amount == 0 {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::InsufficientLiquidity,
+                "probe_amount_zero",
+                Some(probe_amount),
+                Some(amount_specified_is_input),
+                block_time_unix,
+            );
+            return None;
+        }
+
+        if input_mint == output_mint {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::MissingState,
+                "identical_mints",
+                Some(probe_amount),
+                Some(amount_specified_is_input),
+                block_time_unix,
+            );
+            return None;
+        }
+
+        if self.state_stale(state, slot) {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::StaleState,
+                "state_stale",
+                Some(probe_amount),
+                Some(amount_specified_is_input),
+                block_time_unix,
+            );
             return None;
         }
 
@@ -875,6 +1064,16 @@ impl WhirlpoolAdapter {
         let state = &refreshed_state;
 
         if !trade_enabled(state, normalize_block_time(block_time_unix)) {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::TradingDisabled,
+                "trade_disabled",
+                Some(probe_amount),
+                Some(amount_specified_is_input),
+                block_time_unix,
+            );
             return None;
         }
 
@@ -885,6 +1084,16 @@ impl WhirlpoolAdapter {
             }
         }
         if seen < 2 {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::MissingState,
+                "mint_mismatch",
+                Some(probe_amount),
+                Some(amount_specified_is_input),
+                block_time_unix,
+            );
             return None;
         }
 
@@ -902,31 +1111,95 @@ impl WhirlpoolAdapter {
             },
         };
 
-        let direction = resolve_direction(state, &req)?;
-        let mut preferred_arrays = Vec::new();
-        let (simulation, notional) = if amount_specified_is_input {
-            match simulate_authoritative_exact_in(self.hydrator.as_ref(), state, &req, probe_amount)
-            {
-                Ok(sim) => (sim, probe_amount),
-                Err(SimulationError::MissingState | SimulationError::MissingTickArrays) => {
-                    let sim = simulate_constant_liquidity_exact_in(state, &req).ok()?;
-                    (sim, probe_amount)
-                }
-                Err(SimulationError::InsufficientLiquidity) => return None,
+        let direction = match resolve_direction(state, &req) {
+            Some(direction) => direction,
+            None => {
+                self.record_snapshot_issue(
+                    state,
+                    slot,
+                    base_to_quote,
+                    QuoteStatus::MissingState,
+                    "direction_unresolved",
+                    Some(probe_amount),
+                    Some(amount_specified_is_input),
+                    block_time_unix,
+                );
+                return None;
             }
-        } else {
-            let (required_input, sim) =
-                find_input_for_exact_out(self.hydrator.as_ref(), state, &req, probe_amount).ok()?;
-            (sim, required_input)
         };
+
+        let mut preferred_arrays = Vec::new();
+        let map_sim_error = |err: SimulationError| -> (QuoteStatus, &'static str) {
+            let reason = match err {
+                SimulationError::MissingState => "simulation_missing_state",
+                SimulationError::MissingTickArrays => "simulation_missing_tick_arrays",
+                SimulationError::InsufficientLiquidity => "simulation_insufficient_liquidity",
+            };
+            (err.into(), reason)
+        };
+
+        let simulation_result: Result<(SlippageSimulation, u64), (QuoteStatus, &'static str)> =
+            if amount_specified_is_input {
+                match simulate_authoritative_exact_in(
+                    self.hydrator.as_ref(),
+                    state,
+                    &req,
+                    probe_amount,
+                ) {
+                    Ok(sim) => Ok((sim, probe_amount)),
+                    Err(SimulationError::MissingState | SimulationError::MissingTickArrays) => {
+                        match simulate_constant_liquidity_exact_in(state, &req) {
+                            Ok(sim) => Ok((sim, probe_amount)),
+                            Err(err) => Err(map_sim_error(err)),
+                        }
+                    }
+                    Err(err) => Err(map_sim_error(err)),
+                }
+            } else {
+                match find_input_for_exact_out(self.hydrator.as_ref(), state, &req, probe_amount) {
+                    Ok((required_input, sim)) => Ok((sim, required_input)),
+                    Err(err) => Err(map_sim_error(err)),
+                }
+            };
+
+        let (simulation, notional) = match simulation_result {
+            Ok(result) => result,
+            Err((status, reason)) => {
+                self.record_snapshot_issue(
+                    state,
+                    slot,
+                    base_to_quote,
+                    status,
+                    reason,
+                    Some(probe_amount),
+                    Some(amount_specified_is_input),
+                    block_time_unix,
+                );
+                return None;
+            }
+        };
+
         if !simulation.tick_arrays.is_empty() {
             preferred_arrays = simulation.tick_arrays.clone();
         }
+
         let expected_output = simulation.amount_out;
-        if expected_output == 0 || simulation.consumed_input == 0 {
+        let executed_input = simulation.consumed_input;
+        if expected_output == 0 || executed_input == 0 {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::InsufficientLiquidity,
+                "simulation_zero_amount",
+                Some(probe_amount),
+                Some(amount_specified_is_input),
+                block_time_unix,
+            );
             return None;
         }
-        let effective_price = simulation.amount_out as f64 / simulation.consumed_input as f64;
+
+        let effective_price = expected_output as f64 / executed_input as f64;
         let slippage_bps = simulation.edge_bps;
         let sqrt_price_limit = Some(simulation.sqrt_price_after);
 
@@ -940,6 +1213,17 @@ impl WhirlpoolAdapter {
             context.whirlpool_tick_arrays = arrays;
         }
         self.attach_owner_accounts(state, &mut context, input_mint, output_mint);
+
+        self.record_snapshot_issue(
+            state,
+            slot,
+            base_to_quote,
+            QuoteStatus::Ok,
+            "ok",
+            Some(probe_amount),
+            Some(amount_specified_is_input),
+            block_time_unix,
+        );
 
         Some(PoolQuoteSide {
             input_mint: input_mint.to_string(),
@@ -996,12 +1280,24 @@ impl ProtocolAdapter for WhirlpoolAdapter {
     }
 
     fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
+        snapshot.hydration.require(HydrationComponent::Meta);
+        snapshot.hydration.require(HydrationComponent::TickArrays);
         let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
             return;
         };
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
+        if state.meta_ready() {
+            snapshot
+                .hydration
+                .mark_ready(HydrationComponent::Meta, state.last_update_slot);
+        }
+        if state.tick_arrays_ready() {
+            snapshot
+                .hydration
+                .mark_ready(HydrationComponent::TickArrays, state.last_update_slot);
+        }
         let extras = snapshot
             .extensions
             .whirlpool
@@ -1031,6 +1327,23 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         extras
             .token_mint_b
             .get_or_insert_with(|| state.token_mint_b.to_string());
+    }
+
+    fn warm_components(&self, snapshot: &PoolSnapshot, components: &[HydrationComponent]) {
+        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
+            return;
+        };
+        if components.contains(&HydrationComponent::Meta) {
+            if let Some(hydrator) = self.hydrator.as_ref() {
+                hydrator.hydrate(pool_pubkey);
+            }
+        }
+        if components.contains(&HydrationComponent::TickArrays) {
+            if let Some(state) = self.get_state(&pool_pubkey) {
+                self.prefetch_tick_array_hints(&state);
+                self.schedule_tick_array_windows(&state);
+            }
+        }
     }
 
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
@@ -1202,7 +1515,13 @@ impl ProtocolAdapter for WhirlpoolAdapter {
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         let pool_pubkey = parse_pubkey(&snapshot.pool_id)?;
-        let state = self.get_state(&pool_pubkey)?;
+        let state = match self.get_state(&pool_pubkey) {
+            Some(state) => state,
+            None => {
+                self.log_state_cache_miss(pool_pubkey, snapshot.slot);
+                return None;
+            }
+        };
         let base_mint = parse_pubkey(&snapshot.base_mint)?;
         let quote_mint = parse_pubkey(&snapshot.quote_mint)?;
         if base_mint == quote_mint {
@@ -1213,6 +1532,20 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         let base_probe = snapshot_probe_amount(snapshot.base_post_amount, utilization);
         let quote_probe = snapshot_probe_amount(snapshot.quote_post_amount, utilization);
         let prefer_exact_out = self.config.prefer_exact_out_quotes;
+        let block_time = snapshot.block_time_unix;
+
+        let log_empty_reserve = |base_to_quote: bool, reason: &'static str| {
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                base_to_quote,
+                QuoteStatus::InsufficientLiquidity,
+                reason,
+                None,
+                None,
+                block_time,
+            );
+        };
 
         let base_to_quote = if prefer_exact_out {
             if let Some(probe) = quote_probe {
@@ -1223,6 +1556,7 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                     snapshot.block_time_unix,
                     base_mint,
                     quote_mint,
+                    true,
                     probe,
                     false,
                 )?
@@ -1234,14 +1568,22 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                     snapshot.block_time_unix,
                     base_mint,
                     quote_mint,
+                    true,
                     probe,
                     true,
                 )?
             } else {
+                log_empty_reserve(true, "base_quote_reserve_empty");
                 return None;
             }
         } else {
-            let probe = base_probe?;
+            let probe = match base_probe {
+                Some(probe) => probe,
+                None => {
+                    log_empty_reserve(true, "base_reserve_empty");
+                    return None;
+                }
+            };
             self.build_snapshot_side(
                 &state,
                 pool_pubkey,
@@ -1249,6 +1591,7 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                 snapshot.block_time_unix,
                 base_mint,
                 quote_mint,
+                true,
                 probe,
                 true,
             )?
@@ -1263,6 +1606,7 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                     snapshot.block_time_unix,
                     quote_mint,
                     base_mint,
+                    false,
                     probe,
                     false,
                 )?
@@ -1274,14 +1618,22 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                     snapshot.block_time_unix,
                     quote_mint,
                     base_mint,
+                    false,
                     probe,
                     true,
                 )?
             } else {
+                log_empty_reserve(false, "base_quote_reserve_empty");
                 return None;
             }
         } else {
-            let probe = quote_probe?;
+            let probe = match quote_probe {
+                Some(probe) => probe,
+                None => {
+                    log_empty_reserve(false, "quote_reserve_empty");
+                    return None;
+                }
+            };
             self.build_snapshot_side(
                 &state,
                 pool_pubkey,
@@ -1289,6 +1641,7 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                 snapshot.block_time_unix,
                 quote_mint,
                 base_mint,
+                false,
                 probe,
                 true,
             )?
@@ -2595,6 +2948,17 @@ impl WhirlpoolState {
             None
         }
     }
+
+    fn meta_ready(&self) -> bool {
+        self.tick_spacing.is_some()
+            && self.sqrt_price_x64.is_some()
+            && self.liquidity.is_some()
+            && self.tick_current_index.is_some()
+    }
+
+    fn tick_arrays_ready(&self) -> bool {
+        self.tick_array0.is_some() && self.tick_array1.is_some() && self.tick_array2.is_some()
+    }
 }
 
 fn parse_pubkey(value: &str) -> Option<Pubkey> {
@@ -3308,7 +3672,9 @@ mod math {
 mod tests {
     use super::*;
     use crate::hydration::adapters::{QuoteRequest, SwapDirection};
-    use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness};
+    use crate::hydration::types::{
+        HydrationStatus, PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness,
+    };
     use dashmap::DashMap;
 
     #[test]
@@ -3821,6 +4187,7 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
+            hydration: HydrationStatus::new(1),
             extensions: PoolUpdateExtensions::default(),
         };
 
@@ -4031,6 +4398,7 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
+            hydration: HydrationStatus::new(1),
             extensions: PoolUpdateExtensions::default(),
         };
 
@@ -4106,6 +4474,7 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
+            hydration: HydrationStatus::new(1),
             extensions: PoolUpdateExtensions::default(),
         };
 

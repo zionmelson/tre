@@ -3,7 +3,7 @@ use std::time::Duration;
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
 pub use crate::hydration::types::QuoteStatus;
-use crate::hydration::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate};
+use crate::hydration::types::{HydrationComponent, PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate};
 
 mod cp_amm;
 mod hydration;
@@ -56,6 +56,8 @@ pub trait ProtocolAdapter: Send + Sync {
     fn readiness_blockers(&self) -> AdapterReadiness {
         AdapterReadiness::default()
     }
+
+    fn warm_components(&self, _snapshot: &PoolSnapshot, _components: &[HydrationComponent]) {}
 }
 
 #[derive(Debug, Clone, Default)]

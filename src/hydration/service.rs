@@ -23,7 +23,7 @@ use super::{
 use crate::builder::{templates::SwapTemplateDirection, BuilderHandle};
 use crate::config::AppConfig;
 use crate::corecast::CoreCastClient;
-use crate::hydration::types::{PoolSnapshot, PoolUpdate, WHIRLPOOL_PROGRAM_ID};
+use crate::hydration::types::{HydrationComponent, PoolSnapshot, PoolUpdate, WHIRLPOOL_PROGRAM_ID};
 use crate::telemetry;
 use crate::token_pair::TokenPair;
 
@@ -407,6 +407,10 @@ async fn pump_pool_stream(
                                     {
                                         snapshot.quotes = Some(quotes);
                                     }
+                                    let pending = snapshot.hydration.pending_components();
+                                    if !pending.is_empty() {
+                                        adapter_book.warm_components(&snapshot, &pending);
+                                    }
                                     let ready = snapshot_ready_for_fastlane(
                                         &builder,
                                         &snapshot,
@@ -562,6 +566,21 @@ fn evaluate_snapshot_readiness(
         }
     }
 
+    if !snapshot.hydration.ready() {
+        let pending = snapshot.hydration.pending_components();
+        let lag_ms = snapshot.hydration.pending_age_ms(snapshot.updated_at);
+        let lag_slots = snapshot.hydration.slot_lag(snapshot.slot);
+        for component in &pending {
+            telemetry::record_hydration_component_pending(
+                &snapshot.program_id,
+                component.as_str(),
+                Some(lag_ms),
+                Some(lag_slots),
+            );
+        }
+        return Err(PoolReadinessFailure::HydrationPending(pending));
+    }
+
     if snapshot.quotes.is_none() {
         return Err(PoolReadinessFailure::MissingQuotes);
     }
@@ -579,13 +598,14 @@ fn evaluate_snapshot_readiness(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum PoolReadinessFailure {
     InvalidPoolId,
     MissingTemplate(SwapTemplateDirection),
     MissingAlt(SwapTemplateDirection),
     MissingQuotes,
     MissingWhirlpoolTickArrays,
+    HydrationPending(Vec<HydrationComponent>),
 }
 
 impl fmt::Display for PoolReadinessFailure {
@@ -606,6 +626,13 @@ impl fmt::Display for PoolReadinessFailure {
             PoolReadinessFailure::MissingWhirlpoolTickArrays => {
                 write!(f, "missing-whirlpool-tick-arrays")
             }
+            PoolReadinessFailure::HydrationPending(components) => {
+                write!(
+                    f,
+                    "hydration-pending components={}",
+                    format_hydration_components(components)
+                )
+            }
         }
     }
 }
@@ -615,4 +642,15 @@ fn format_swap_direction(direction: SwapTemplateDirection) -> &'static str {
         SwapTemplateDirection::BaseIn => "base_in",
         SwapTemplateDirection::BaseOut => "base_out",
     }
+}
+
+fn format_hydration_components(components: &[HydrationComponent]) -> String {
+    if components.is_empty() {
+        return "none".to_string();
+    }
+    components
+        .iter()
+        .map(|component| component.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }

@@ -12,7 +12,7 @@ use crate::hydration::adapters::{
     ProtocolAdapter, QuoteRequest, QuoteResponse, RaydiumV3Adapter, RaydiumV3AdapterConfig,
     SwapDirection, WhirlpoolAdapter, WhirlpoolAdapterConfig,
 };
-use crate::hydration::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate, TradeUpdate};
+use crate::hydration::types::{HydrationComponent, PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate, TradeUpdate};
 
 const BPS_DENOMINATOR: u64 = 10_000;
 
@@ -148,6 +148,15 @@ impl AdapterBook {
         };
 
         adapter.quote_exact_in(fallback)
+    }
+
+    pub fn warm_components(&self, snapshot: &PoolSnapshot, components: &[HydrationComponent]) {
+        if components.is_empty() {
+            return;
+        }
+        if let Some(adapter) = self.adapters.get(&snapshot.program_id) {
+            adapter.warm_components(snapshot, components);
+        }
     }
 
     pub fn requires_authoritative_quotes(&self, program_id: &str) -> bool {

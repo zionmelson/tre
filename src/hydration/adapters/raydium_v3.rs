@@ -27,8 +27,8 @@ use uint::construct_uint;
 use crate::builder::{AmmV3PoolMeta, BuilderHandle};
 use crate::hydration::token_fees::{apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee};
 use crate::hydration::types::{
-    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, RaydiumTransferFeeConfig,
-    RaydiumV3PoolExtras, RAYDIUM_V3_INPUT_UTILIZATION_BPS,
+    HydrationComponent, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
+    RaydiumTransferFeeConfig, RaydiumV3PoolExtras, RAYDIUM_V3_INPUT_UTILIZATION_BPS,
 };
 use crate::template::{TemplateContext, TransferFeeConfigHint};
 
@@ -96,6 +96,14 @@ struct TickArrayCacheEntry {
     accounts: Vec<Pubkey>,
 }
 
+const REQUIRED_TICK_ARRAYS_PER_SIDE: usize = 3;
+
+#[derive(Clone)]
+struct SnapshotStatusLogEntry {
+    status: QuoteStatus,
+    logged_at: Instant,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TransferFeeConfigSummary {
     epoch: u64,
@@ -151,6 +159,8 @@ struct MintAccountMeta {
 }
 
 const DEFAULT_RAYDIUM_HYDRATION_RETRY_MS: u64 = 10_000;
+const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
+const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
 
 #[derive(Debug, Clone)]
 pub struct RaydiumV3AdapterConfig {
@@ -185,6 +195,8 @@ pub struct RaydiumV3Adapter {
     hydrator: Option<RaydiumPoolHydrator>,
     template_builder: Option<BuilderHandle>,
     registered_templates: DashSet<Pubkey>,
+    snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
+    missing_state_log: DashMap<Pubkey, Instant>,
 }
 
 impl RaydiumV3Adapter {
@@ -211,6 +223,8 @@ impl RaydiumV3Adapter {
             hydrator,
             template_builder,
             registered_templates: DashSet::new(),
+            snapshot_failure_log: DashMap::new(),
+            missing_state_log: DashMap::new(),
         }
     }
 
@@ -329,8 +343,40 @@ impl RaydiumV3Adapter {
         );
 
         self.register_templates_with_builder(&state);
+        self.request_tick_arrays(&state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
+    }
+
+    fn meta_ready(state: &RaydiumV3State) -> bool {
+        state.tick_spacing.is_some()
+            && state.sqrt_price_x64.is_some()
+            && state.liquidity.is_some()
+            && state.current_tick.is_some()
+    }
+
+    fn tick_arrays_ready(&self, state: &RaydiumV3State) -> bool {
+        let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
+        Self::tick_cache_entry_ready(state.tick_array_cache.zero_for_one.as_ref(), ttl)
+            && Self::tick_cache_entry_ready(state.tick_array_cache.one_for_zero.as_ref(), ttl)
+    }
+
+    fn tick_cache_entry_ready(entry: Option<&TickArrayCacheEntry>, ttl: Duration) -> bool {
+        let Some(cache) = entry else {
+            return false;
+        };
+        if cache.accounts.len() < REQUIRED_TICK_ARRAYS_PER_SIDE {
+            return false;
+        }
+        ttl.as_millis() == 0 || cache.hydrated_at.elapsed() <= ttl
+    }
+
+    fn request_tick_arrays(&self, state: &RaydiumV3State) {
+        if let Some(hydrator) = self.hydrator.as_ref() {
+            if let (Some(spacing), Some(current_tick)) = (state.tick_spacing, state.current_tick) {
+                hydrator.warm_tick_arrays(state.pool_id, spacing, current_tick);
+            }
+        }
     }
 
     fn enrich_extras(
@@ -473,6 +519,119 @@ impl RaydiumV3Adapter {
         });
 
         self.registered_templates.insert(state.pool_id);
+    }
+
+    fn log_state_cache_miss(&self, pool: Pubkey, slot: u64) {
+        if let Some(entry) = self.missing_state_log.get(&pool) {
+            if (entry.value().elapsed().as_millis() as u64) < STATE_MISS_LOG_INTERVAL_MS {
+                return;
+            }
+        }
+        self.missing_state_log.insert(pool, Instant::now());
+        warn!(
+            target = "adapter::raydium_v3",
+            pool = %pool,
+            slot,
+            hydrator_online = self.hydrator.is_some(),
+            "raydium strict price snapshot requested before hydration"
+        );
+    }
+
+    fn clear_snapshot_issue(&self, pool: Pubkey, base_to_quote: bool) {
+        self.snapshot_failure_log.remove(&(pool, base_to_quote));
+    }
+
+    fn record_snapshot_issue(
+        &self,
+        state: &RaydiumV3State,
+        slot: u64,
+        base_to_quote: bool,
+        status: QuoteStatus,
+        reason: &'static str,
+        probe_amount: Option<u64>,
+    ) {
+        if status == QuoteStatus::Ok {
+            self.clear_snapshot_issue(state.pool_id, base_to_quote);
+            return;
+        }
+
+        let key = (state.pool_id, base_to_quote);
+        let should_log = match self.snapshot_failure_log.get(&key) {
+            Some(entry) => {
+                let cached = entry.value();
+                cached.status != status
+                    || cached.logged_at.elapsed().as_millis() as u64
+                        >= SNAPSHOT_FAILURE_LOG_INTERVAL_MS
+            }
+            None => true,
+        };
+
+        if !should_log {
+            return;
+        }
+
+        self.snapshot_failure_log.insert(
+            key,
+            SnapshotStatusLogEntry {
+                status,
+                logged_at: Instant::now(),
+            },
+        );
+
+        let tick_cache_zero = state
+            .tick_array_cache
+            .zero_for_one
+            .as_ref()
+            .map(|entry| entry.accounts.len())
+            .unwrap_or(0);
+        let tick_cache_one = state
+            .tick_array_cache
+            .one_for_zero
+            .as_ref()
+            .map(|entry| entry.accounts.len())
+            .unwrap_or(0);
+        let tick_cache_zero_age = state
+            .tick_array_cache
+            .zero_for_one
+            .as_ref()
+            .map(|entry| entry.hydrated_at.elapsed().as_millis() as u64);
+        let tick_cache_one_age = state
+            .tick_array_cache
+            .one_for_zero
+            .as_ref()
+            .map(|entry| entry.hydrated_at.elapsed().as_millis() as u64);
+        let hydrator_clients = self
+            .hydrator
+            .as_ref()
+            .map(|hydrator| hydrator.client_count())
+            .unwrap_or(0);
+
+        warn!(
+            target = "adapter::raydium_v3",
+            pool = %state.pool_id,
+            slot,
+            direction = if base_to_quote {
+                "base_to_quote"
+            } else {
+                "quote_to_base"
+            },
+            status = ?status,
+            reason,
+            probe_amount,
+            last_update_slot = state.last_update_slot,
+            base_vault = %state.vault_base,
+            quote_vault = %state.vault_quote,
+            has_tick_spacing = state.tick_spacing.is_some(),
+            has_current_tick = state.current_tick.is_some(),
+            has_sqrt_price = state.sqrt_price_x64.is_some(),
+            has_liquidity = state.liquidity.is_some(),
+            cached_zero_tick_arrays = tick_cache_zero,
+            cached_zero_age_ms = tick_cache_zero_age,
+            cached_one_tick_arrays = tick_cache_one,
+            cached_one_age_ms = tick_cache_one_age,
+            hydrator_clients,
+            "raydium strict price quote unavailable"
+        );
     }
 
     fn decorate_quote_context(
@@ -917,6 +1076,14 @@ impl RaydiumV3Adapter {
         probe_amount: u64,
     ) -> Option<PoolQuoteSide> {
         if probe_amount == 0 {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::InsufficientLiquidity,
+                "probe_amount_zero",
+                Some(probe_amount),
+            );
             return None;
         }
 
@@ -929,6 +1096,14 @@ impl RaydiumV3Adapter {
         };
 
         if state.is_disabled() {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::TradingDisabled,
+                "pool_disabled",
+                Some(probe_amount),
+            );
             return Some(self.unavailable_snapshot_side(
                 input_mint,
                 output_mint,
@@ -939,6 +1114,14 @@ impl RaydiumV3Adapter {
             ));
         }
         if state.is_stale(Some(slot), &self.config) {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::StaleState,
+                "state_stale",
+                Some(probe_amount),
+            );
             return Some(self.unavailable_snapshot_side(
                 input_mint,
                 output_mint,
@@ -962,6 +1145,14 @@ impl RaydiumV3Adapter {
         let simulation = match self.quote_amount_out(state, &req) {
             Ok(sim) => sim,
             Err(status) => {
+                self.record_snapshot_issue(
+                    state,
+                    slot,
+                    base_to_quote,
+                    status,
+                    "simulation_error",
+                    Some(probe_amount),
+                );
                 return Some(self.unavailable_snapshot_side(
                     input_mint,
                     output_mint,
@@ -973,6 +1164,14 @@ impl RaydiumV3Adapter {
             }
         };
         if simulation.executed_input_amount == 0 {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::InsufficientLiquidity,
+                "zero_executed_input",
+                Some(probe_amount),
+            );
             return None;
         }
         let execution_price =
@@ -992,6 +1191,15 @@ impl RaydiumV3Adapter {
         let slippage = reference_price
             .map(|reference| compute_slippage_bps(reference, execution_price))
             .unwrap_or_default();
+
+        self.record_snapshot_issue(
+            state,
+            slot,
+            base_to_quote,
+            QuoteStatus::Ok,
+            "ok",
+            Some(probe_amount),
+        );
 
         Some(PoolQuoteSide {
             input_mint: input_mint.to_string(),
@@ -1086,6 +1294,45 @@ impl ProtocolAdapter for RaydiumV3Adapter {
 
         // CoreCast metadata is often stale; rely solely on on-chain hydration.
         self.upsert_state(update, RaydiumV3PoolExtras::default());
+    }
+
+    fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
+        snapshot.hydration.require(HydrationComponent::Meta);
+        snapshot.hydration.require(HydrationComponent::TickArrays);
+        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
+            return;
+        };
+        let Some(state) = self.get_state(&pool_pubkey) else {
+            return;
+        };
+        if Self::meta_ready(&state) {
+            snapshot
+                .hydration
+                .mark_ready(HydrationComponent::Meta, state.last_update_slot);
+        }
+        if self.tick_arrays_ready(&state) {
+            snapshot
+                .hydration
+                .mark_ready(HydrationComponent::TickArrays, state.last_update_slot);
+        } else {
+            self.request_tick_arrays(&state);
+        }
+    }
+
+    fn warm_components(&self, snapshot: &PoolSnapshot, components: &[HydrationComponent]) {
+        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
+            return;
+        };
+        if components.contains(&HydrationComponent::Meta) {
+            if let Some(hydrator) = self.hydrator.as_ref() {
+                hydrator.hydrate(pool_pubkey);
+            }
+        }
+        if components.contains(&HydrationComponent::TickArrays) {
+            if let Some(state) = self.get_state(&pool_pubkey) {
+                self.request_tick_arrays(&state);
+            }
+        }
     }
 
     fn quote_exact_in(&self, mut req: QuoteRequest) -> Option<QuoteResponse> {
@@ -1188,12 +1435,44 @@ impl ProtocolAdapter for RaydiumV3Adapter {
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         let pool_pubkey = parse_pubkey(&snapshot.pool_id)?;
-        let state = self.get_state(&pool_pubkey)?;
+        let state = match self.get_state(&pool_pubkey) {
+            Some(state) => state,
+            None => {
+                self.log_state_cache_miss(pool_pubkey, snapshot.slot);
+                return None;
+            }
+        };
 
         let base_probe =
-            snapshot_probe_amount(state.vault_base, self.config.max_swap_utilization_bps)?;
+            match snapshot_probe_amount(state.vault_base, self.config.max_swap_utilization_bps) {
+                Some(value) => value,
+                None => {
+                    self.record_snapshot_issue(
+                        &state,
+                        snapshot.slot,
+                        true,
+                        QuoteStatus::InsufficientLiquidity,
+                        "base_reserve_empty",
+                        None,
+                    );
+                    return None;
+                }
+            };
         let quote_probe =
-            snapshot_probe_amount(state.vault_quote, self.config.max_swap_utilization_bps)?;
+            match snapshot_probe_amount(state.vault_quote, self.config.max_swap_utilization_bps) {
+                Some(value) => value,
+                None => {
+                    self.record_snapshot_issue(
+                        &state,
+                        snapshot.slot,
+                        false,
+                        QuoteStatus::InsufficientLiquidity,
+                        "quote_reserve_empty",
+                        None,
+                    );
+                    return None;
+                }
+            };
 
         let base_to_quote =
             self.build_snapshot_side(&state, pool_pubkey, snapshot.slot, true, base_probe)?;
@@ -1215,6 +1494,7 @@ const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const BPS_DENOMINATOR_U128: u128 = 10_000;
 const RAYDIUM_FEE_RATE_DENOMINATOR: u128 = 1_000_000;
+const RAYDIUM_STATUS_DISABLE_SWAP_BIT: u8 = 1 << 4;
 
 #[derive(Debug, Clone)]
 pub struct RaydiumV3State {
@@ -1255,7 +1535,9 @@ impl RaydiumV3State {
     }
 
     pub fn is_disabled(&self) -> bool {
-        matches!(self.pool_status, Some(status) if status != 0)
+        self.pool_status
+            .map(|status| status & RAYDIUM_STATUS_DISABLE_SWAP_BIT != 0)
+            .unwrap_or(false)
     }
 
     pub fn is_stale(&self, current_slot: Option<u64>, config: &RaydiumV3AdapterConfig) -> bool {
@@ -1886,6 +2168,11 @@ impl RaydiumPoolHydrator {
         }
 
         Some(selected)
+    }
+
+    fn warm_tick_arrays(&self, pool: Pubkey, tick_spacing: i32, current_tick: i32) {
+        let _ = self.preferred_tick_arrays_for_swap(pool, tick_spacing, current_tick, true);
+        let _ = self.preferred_tick_arrays_for_swap(pool, tick_spacing, current_tick, false);
     }
 
     fn should_skip_missing_mint(&self, key: &Pubkey) -> bool {

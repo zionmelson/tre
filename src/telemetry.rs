@@ -59,6 +59,9 @@ struct TelemetryState {
     hydration_pool_slot: Family<HydrationPoolLabels, Gauge>,
     hydration_pool_base_liquidity: Family<HydrationPoolLabels, Gauge>,
     hydration_pool_quote_liquidity: Family<HydrationPoolLabels, Gauge>,
+    hydration_component_pending: Family<HydrationComponentLabels, Counter>,
+    hydration_component_lag_ms: Family<HydrationComponentLabels, Gauge>,
+    hydration_component_lag_slots: Family<HydrationComponentLabels, Gauge>,
     hydration_stale_pools: Counter,
     hydration_queue_depth_pct: Gauge,
     hydration_queue_depth_items: Gauge,
@@ -263,6 +266,27 @@ impl TelemetryState {
             hydration_pool_price_scaled.clone(),
         );
 
+        let hydration_component_pending = Family::default();
+        registry.register(
+            "hydration_component_pending_total",
+            "Pools blocked on specific hydration components grouped by adapter",
+            hydration_component_pending.clone(),
+        );
+
+        let hydration_component_lag_ms = Family::default();
+        registry.register(
+            "hydration_component_lag_ms",
+            "Age in milliseconds of the most recent observation for a pending hydration component",
+            hydration_component_lag_ms.clone(),
+        );
+
+        let hydration_component_lag_slots = Family::default();
+        registry.register(
+            "hydration_component_lag_slots",
+            "Slot delta between the snapshot slot and the latest hydrated component",
+            hydration_component_lag_slots.clone(),
+        );
+
         let hydration_pool_slot = Family::default();
         registry.register(
             "hydration_pool_slot",
@@ -432,6 +456,9 @@ impl TelemetryState {
             hydration_rpc_refresh_failure,
             hydration_transfer_hook_events,
             hydration_pool_price_scaled,
+            hydration_component_pending,
+            hydration_component_lag_ms,
+            hydration_component_lag_slots,
             hydration_pool_slot,
             hydration_pool_base_liquidity,
             hydration_pool_quote_liquidity,
@@ -650,6 +677,12 @@ struct HydrationPoolLabels {
     pool: String,
     base_mint: String,
     quote_mint: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct HydrationComponentLabels {
+    adapter: String,
+    component: &'static str,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
@@ -935,6 +968,36 @@ pub fn record_hydration_rpc_refresh_failure(adapter: &str) {
             .hydration_rpc_refresh_failure
             .get_or_create(&labels)
             .inc();
+    }
+}
+
+pub fn record_hydration_component_pending(
+    adapter: &str,
+    component: &'static str,
+    lag_ms: Option<u64>,
+    lag_slots: Option<u64>,
+) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationComponentLabels {
+            adapter: adapter.to_string(),
+            component,
+        };
+        state
+            .hydration_component_pending
+            .get_or_create(&labels)
+            .inc();
+        if let Some(ms) = lag_ms {
+            state
+                .hydration_component_lag_ms
+                .get_or_create(&labels)
+                .set(clamp_u64_to_i64(ms));
+        }
+        if let Some(slots) = lag_slots {
+            state
+                .hydration_component_lag_slots
+                .get_or_create(&labels)
+                .set(clamp_u64_to_i64(slots));
+        }
     }
 }
 

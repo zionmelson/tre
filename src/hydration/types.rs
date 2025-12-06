@@ -20,6 +20,181 @@ pub enum QuoteStatus {
     TokenFeeUnsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HydrationComponent {
+    Meta,
+    Liquidity,
+    TickArrays,
+    BinWindow,
+    Fees,
+}
+
+impl HydrationComponent {
+    pub const ALL: [HydrationComponent; 5] = [
+        HydrationComponent::Meta,
+        HydrationComponent::Liquidity,
+        HydrationComponent::TickArrays,
+        HydrationComponent::BinWindow,
+        HydrationComponent::Fees,
+    ];
+
+    const fn bit(self) -> u8 {
+        match self {
+            HydrationComponent::Meta => 1 << 0,
+            HydrationComponent::Liquidity => 1 << 1,
+            HydrationComponent::TickArrays => 1 << 2,
+            HydrationComponent::BinWindow => 1 << 3,
+            HydrationComponent::Fees => 1 << 4,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HydrationComponent::Meta => "meta",
+            HydrationComponent::Liquidity => "liquidity",
+            HydrationComponent::TickArrays => "tick_arrays",
+            HydrationComponent::BinWindow => "bin_window",
+            HydrationComponent::Fees => "fees",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            HydrationComponent::Meta => 0,
+            HydrationComponent::Liquidity => 1,
+            HydrationComponent::TickArrays => 2,
+            HydrationComponent::BinWindow => 3,
+            HydrationComponent::Fees => 4,
+        }
+    }
+}
+
+const HYDRATION_COMPONENT_COUNT: usize = HydrationComponent::ALL.len();
+
+#[derive(Debug, Clone)]
+pub struct HydrationStatus {
+    ingest_slot: u64,
+    required_mask: u8,
+    ready_mask: u8,
+    latest_ready_slot: Option<u64>,
+    last_ready_at: Option<Instant>,
+    component_slots: [Option<u64>; HYDRATION_COMPONENT_COUNT],
+    component_ready_at: [Option<Instant>; HYDRATION_COMPONENT_COUNT],
+}
+
+impl HydrationStatus {
+    pub const fn new(slot: u64) -> Self {
+        Self {
+            ingest_slot: slot,
+            required_mask: 0,
+            ready_mask: 0,
+            latest_ready_slot: None,
+            last_ready_at: None,
+            component_slots: [None; HYDRATION_COMPONENT_COUNT],
+            component_ready_at: [None; HYDRATION_COMPONENT_COUNT],
+        }
+    }
+
+    pub fn ingest_slot(&self) -> u64 {
+        self.ingest_slot
+    }
+
+    pub fn latest_ready_slot(&self) -> Option<u64> {
+        self.latest_ready_slot
+    }
+
+    pub fn require(&mut self, component: HydrationComponent) {
+        self.required_mask |= component.bit();
+    }
+
+    pub fn mark_ready(&mut self, component: HydrationComponent, slot: u64) {
+        self.require(component);
+        self.ready_mask |= component.bit();
+        let idx = component.index();
+        self.component_slots[idx] = Some(slot);
+        let now = Instant::now();
+        self.component_ready_at[idx] = Some(now);
+        if self
+            .latest_ready_slot
+            .map(|current| slot > current)
+            .unwrap_or(true)
+        {
+            self.latest_ready_slot = Some(slot);
+        }
+        self.last_ready_at = Some(now);
+    }
+
+    pub fn ready(&self) -> bool {
+        if self.required_mask == 0 {
+            return true;
+        }
+        let target_slot = self.ingest_slot;
+        HydrationComponent::ALL.iter().all(|component| {
+            if !self.requires(*component) {
+                return true;
+            }
+            self.component_meets_target(*component, target_slot)
+        })
+    }
+
+    pub fn pending_components(&self) -> Vec<HydrationComponent> {
+        HydrationComponent::ALL
+            .into_iter()
+            .filter(|component| self.is_pending(*component))
+            .collect()
+    }
+
+    pub fn pending_age_ms(&self, fallback: Instant) -> u64 {
+        let reference = self.last_ready_at.unwrap_or(fallback);
+        reference.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    pub fn slot_lag(&self, current_slot: u64) -> u64 {
+        let reference = self.latest_ready_slot.unwrap_or(self.ingest_slot);
+        current_slot.saturating_sub(reference)
+    }
+
+    pub fn component_slot(&self, component: HydrationComponent) -> Option<u64> {
+        self.component_slots[component.index()]
+    }
+
+    pub fn component_ready_at(&self, component: HydrationComponent) -> Option<Instant> {
+        self.component_ready_at[component.index()]
+    }
+
+    pub fn component_slot_lag(&self, component: HydrationComponent) -> Option<u64> {
+        let component_slot = self.component_slot(component)?;
+        Some(self.ingest_slot.saturating_sub(component_slot))
+    }
+
+    pub fn component_pending_age_ms(
+        &self,
+        component: HydrationComponent,
+        fallback: Instant,
+    ) -> u64 {
+        let reference = self.component_ready_at(component).unwrap_or(fallback);
+        reference.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn requires(&self, component: HydrationComponent) -> bool {
+        (self.required_mask & component.bit()) != 0
+    }
+
+    fn component_meets_target(&self, component: HydrationComponent, target_slot: u64) -> bool {
+        match self.component_slot(component) {
+            Some(slot) if slot >= target_slot => true,
+            _ => false,
+        }
+    }
+
+    fn is_pending(&self, component: HydrationComponent) -> bool {
+        if !self.requires(component) {
+            return false;
+        }
+        !self.component_meets_target(component, self.ingest_slot)
+    }
+}
+
 mod protocols;
 
 pub use protocols::{
@@ -107,6 +282,7 @@ impl PoolUpdate {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
+            hydration: HydrationStatus::new(self.slot),
             extensions: self.extensions,
         }
     }
@@ -229,6 +405,7 @@ pub struct PoolSnapshot {
     pub freshness: SnapshotFreshness,
     pub allow_reserve_backfill: bool,
     pub quotes: Option<PoolBidirectionalQuotes>,
+    pub hydration: HydrationStatus,
     pub extensions: PoolUpdateExtensions,
 }
 

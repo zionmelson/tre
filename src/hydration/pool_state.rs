@@ -409,7 +409,7 @@ impl PoolStoreView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::PoolUpdateExtensions;
+    use crate::hydration::types::{HydrationStatus, PoolUpdateExtensions};
 
     fn snapshot_with_freshness(freshness: SnapshotFreshness) -> PoolSnapshot {
         PoolSnapshot {
@@ -426,6 +426,7 @@ mod tests {
             freshness,
             allow_reserve_backfill: true,
             quotes: None,
+            hydration: HydrationStatus::new(1),
             extensions: PoolUpdateExtensions::default(),
         }
     }

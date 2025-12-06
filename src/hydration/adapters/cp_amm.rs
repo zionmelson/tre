@@ -20,7 +20,8 @@ use crate::hydration::token_fees::{
 };
 use crate::hydration::types::{
     CpAmmBaseFeeExtras, CpAmmDynamicFeeExtras, CpAmmPoolExtras, CpAmmPoolFeesExtras,
-    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, CP_AMM_INPUT_UTILIZATION_BPS,
+    HydrationComponent, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
+    CP_AMM_INPUT_UTILIZATION_BPS,
 };
 use crate::template::TemplateContext;
 
@@ -48,6 +49,14 @@ const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const Q64_FACTOR: f64 = 18_446_744_073_709_551_616.0;
 
 const DEFAULT_CP_AMM_HYDRATION_RETRY_MS: u64 = 60_000;
+const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
+const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
+
+#[derive(Clone)]
+struct SnapshotStatusLogEntry {
+    status: QuoteStatus,
+    logged_at: Instant,
+}
 
 static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program should be valid")
@@ -98,6 +107,8 @@ pub struct CpAmmAdapter {
     mint_metadata_cache: Option<MintMetadataHydrator>,
     template_builder: Option<BuilderHandle>,
     registered_templates: DashMap<Pubkey, RegisteredTemplateSignature>,
+    snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
+    missing_state_log: DashMap<Pubkey, Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +150,8 @@ impl CpAmmAdapter {
             mint_metadata_cache,
             template_builder,
             registered_templates: DashMap::new(),
+            snapshot_failure_log: DashMap::new(),
+            missing_state_log: DashMap::new(),
         }
     }
 
@@ -550,6 +563,99 @@ impl CpAmmAdapter {
         false
     }
 
+    fn log_state_cache_miss(&self, pool: Pubkey, slot: u64) {
+        if let Some(entry) = self.missing_state_log.get(&pool) {
+            if (entry.value().elapsed().as_millis() as u64) < STATE_MISS_LOG_INTERVAL_MS {
+                return;
+            }
+        }
+        self.missing_state_log.insert(pool, Instant::now());
+        warn!(
+            target = "adapter::cp_amm",
+            pool = %pool,
+            slot,
+            hydrator_online = self.hydrator.is_some(),
+            "cp_amm strict price snapshot requested before hydration"
+        );
+    }
+
+    fn clear_snapshot_issue(&self, pool: Pubkey, base_to_quote: bool) {
+        self.snapshot_failure_log.remove(&(pool, base_to_quote));
+    }
+
+    fn record_snapshot_issue(
+        &self,
+        state: &CpAmmState,
+        slot: u64,
+        base_to_quote: bool,
+        status: QuoteStatus,
+        reason: &'static str,
+        probe_amount: Option<u64>,
+    ) {
+        if status == QuoteStatus::Ok {
+            self.clear_snapshot_issue(state.pool, base_to_quote);
+            return;
+        }
+
+        let key = (state.pool, base_to_quote);
+        let should_log = match self.snapshot_failure_log.get(&key) {
+            Some(entry) => {
+                let cached = entry.value();
+                cached.status != status
+                    || cached.logged_at.elapsed().as_millis() as u64
+                        >= SNAPSHOT_FAILURE_LOG_INTERVAL_MS
+            }
+            None => true,
+        };
+
+        if !should_log {
+            return;
+        }
+
+        self.snapshot_failure_log.insert(
+            key,
+            SnapshotStatusLogEntry {
+                status,
+                logged_at: Instant::now(),
+            },
+        );
+
+        let hydration_age_ms = state
+            .last_hydrated_at
+            .map(|instant| instant.elapsed().as_millis() as u64);
+        let cache_age_ms = state.last_update_at.elapsed().as_millis() as u64;
+        let hydrator_clients = self
+            .hydrator
+            .as_ref()
+            .map(|hydrator| hydrator.client_count())
+            .unwrap_or(0);
+
+        warn!(
+            target = "adapter::cp_amm",
+            pool = %state.pool,
+            slot,
+            direction = if base_to_quote {
+                "base_to_quote"
+            } else {
+                "quote_to_base"
+            },
+            status = ?status,
+            reason,
+            probe_amount,
+            last_update_slot = state.last_update_slot,
+            cache_age_ms,
+            hydration_age_ms,
+            vault_a = %state.vault_a_balance,
+            vault_b = %state.vault_b_balance,
+            has_price = state.sqrt_price_x64.is_some(),
+            has_liquidity = state.liquidity.is_some(),
+            partner = ?state.partner,
+            referral = ?state.referral_token_account,
+            hydrator_clients,
+            "cp_amm strict price quote unavailable"
+        );
+    }
+
     fn cache_stale(&self, state: &CpAmmState, current_slot: u64) -> bool {
         let slot_stale = self.config.stale_slot_threshold > 0
             && current_slot.saturating_sub(state.last_update_slot)
@@ -569,16 +675,48 @@ impl CpAmmAdapter {
         probe_amount: u64,
     ) -> Option<PoolQuoteSide> {
         if probe_amount == 0 {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::InsufficientLiquidity,
+                "probe_amount_zero",
+                Some(probe_amount),
+            );
             return None;
         }
         if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::StaleState,
+                "hydration_stale",
+                Some(probe_amount),
+            );
             return None;
         }
         let block_time_u64 = normalize_block_time(block_time);
         if !state.swap_enabled(slot, block_time_u64) {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::TradingDisabled,
+                "swap_disabled",
+                Some(probe_amount),
+            );
             return None;
         }
         if self.partner_mismatch(state) {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::MissingPartner,
+                "partner_mismatch",
+                Some(probe_amount),
+            );
             return None;
         }
 
@@ -598,7 +736,20 @@ impl CpAmmAdapter {
             direction: SwapDirection::ExactIn,
         };
 
-        let simulation = simulate_cp_amm_exact_in(state, &req, true)?;
+        let simulation = match simulate_cp_amm_exact_in(state, &req, true) {
+            Some(sim) => sim,
+            None => {
+                self.record_snapshot_issue(
+                    state,
+                    slot,
+                    base_to_quote,
+                    QuoteStatus::InsufficientLiquidity,
+                    "simulation_error",
+                    Some(probe_amount),
+                );
+                return None;
+            }
+        };
         let expected_output = simulation.output_amount;
         let executed_input = simulation.executed_input_amount;
         let direction = if base_to_quote {
@@ -625,6 +776,15 @@ impl CpAmmAdapter {
             context.partial_fill_remaining = Some(simulation.amount_leftover);
         }
         context.expected_fee_amount = Some(simulation.fee_amount);
+
+        self.record_snapshot_issue(
+            state,
+            slot,
+            base_to_quote,
+            QuoteStatus::Ok,
+            "ok",
+            Some(probe_amount),
+        );
 
         Some(PoolQuoteSide {
             input_mint: input_mint.to_string(),
@@ -677,12 +837,18 @@ impl ProtocolAdapter for CpAmmAdapter {
     }
 
     fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
+        snapshot.hydration.require(HydrationComponent::Meta);
         let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
             return;
         };
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
+        if !state.hydration_stale(self.config.hydration_meta_ttl_ms) && state.meta_ready() {
+            snapshot
+                .hydration
+                .mark_ready(HydrationComponent::Meta, state.last_update_slot);
+        }
         let extras = snapshot
             .extensions
             .cp_amm
@@ -712,6 +878,18 @@ impl ProtocolAdapter for CpAmmAdapter {
         extras
             .token_b_mint
             .get_or_insert_with(|| state.token_b_mint.to_string());
+    }
+
+    fn warm_components(&self, snapshot: &PoolSnapshot, components: &[HydrationComponent]) {
+        if !components.contains(&HydrationComponent::Meta) {
+            return;
+        }
+        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
+            return;
+        };
+        if let Some(hydrator) = self.hydrator.as_ref() {
+            hydrator.warm(pool_pubkey);
+        }
     }
 
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
@@ -823,21 +1001,101 @@ impl ProtocolAdapter for CpAmmAdapter {
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         let pool_pubkey = parse_pubkey(&snapshot.pool_id)?;
-        let state = self.get_state(&pool_pubkey)?;
+        let state = match self.get_state(&pool_pubkey) {
+            Some(state) => state,
+            None => {
+                self.log_state_cache_miss(pool_pubkey, snapshot.slot);
+                return None;
+            }
+        };
         if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                true,
+                QuoteStatus::StaleState,
+                "hydration_stale",
+                None,
+            );
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                false,
+                QuoteStatus::StaleState,
+                "hydration_stale",
+                None,
+            );
             return None;
         }
         if self.cache_stale(&state, snapshot.slot) {
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                true,
+                QuoteStatus::StaleState,
+                "cache_stale",
+                None,
+            );
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                false,
+                QuoteStatus::StaleState,
+                "cache_stale",
+                None,
+            );
             return None;
         }
         let snapshot_block_time = normalize_block_time(snapshot.block_time_unix);
         if !state.swap_enabled(snapshot.slot, snapshot_block_time) {
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                true,
+                QuoteStatus::TradingDisabled,
+                "swap_disabled",
+                None,
+            );
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                false,
+                QuoteStatus::TradingDisabled,
+                "swap_disabled",
+                None,
+            );
             return None;
         }
 
         let utilization = self.config.max_swap_utilization_bps;
-        let base_probe = snapshot_probe_amount(state.vault_a_balance, utilization)?;
-        let quote_probe = snapshot_probe_amount(state.vault_b_balance, utilization)?;
+        let base_probe = match snapshot_probe_amount(state.vault_a_balance, utilization) {
+            Some(value) => value,
+            None => {
+                self.record_snapshot_issue(
+                    &state,
+                    snapshot.slot,
+                    true,
+                    QuoteStatus::InsufficientLiquidity,
+                    "base_reserve_empty",
+                    None,
+                );
+                return None;
+            }
+        };
+        let quote_probe = match snapshot_probe_amount(state.vault_b_balance, utilization) {
+            Some(value) => value,
+            None => {
+                self.record_snapshot_issue(
+                    &state,
+                    snapshot.slot,
+                    false,
+                    QuoteStatus::InsufficientLiquidity,
+                    "quote_reserve_empty",
+                    None,
+                );
+                return None;
+            }
+        };
 
         let base_to_quote = self.build_snapshot_side(
             &state,
@@ -1721,6 +1979,12 @@ impl CpAmmPoolHydrator {
         None
     }
 
+    fn warm(&self, pool: Pubkey) {
+        if self.should_schedule(pool) {
+            self.hydrator.schedule(pool);
+        }
+    }
+
     fn should_schedule(&self, pool: Pubkey) -> bool {
         let now = Instant::now();
         if let Some(last) = self.last_attempts.get(&pool) {
@@ -2169,6 +2433,13 @@ impl CpAmmState {
         } else {
             None
         }
+    }
+
+    fn meta_ready(&self) -> bool {
+        self.sqrt_price_x64.is_some()
+            && self.liquidity.is_some()
+            && self.sqrt_min_price_x64.is_some()
+            && self.sqrt_max_price_x64.is_some()
     }
 
     fn hydration_stale(&self, ttl_ms: u64) -> bool {
@@ -3293,7 +3564,9 @@ mod math {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::{PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness};
+    use crate::hydration::types::{
+        HydrationStatus, PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness,
+    };
     use spl_pod::primitives::{PodU16, PodU64};
     use spl_token_2022::extension::transfer_fee::TransferFee;
 
@@ -4279,6 +4552,7 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
+            hydration: HydrationStatus::new(42),
             extensions: PoolUpdateExtensions::default(),
         };
 

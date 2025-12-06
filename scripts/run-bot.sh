@@ -24,4 +24,5 @@ fi
 echo "[run-bot] Hydration workers: template cache, ALT manager, flash planner"
 echo "[run-bot] Fast execution workers: planner, signer pool, dual senders"
 
-cargo run --bin tre-arb-bot -- "${args[@]}" >> output.txt 
+# Mirror stdout/stderr to the console while still persisting logs for tailing
+cargo run --bin tre-arb-bot -- "${args[@]}" 2>&1 | tee -a output.txt

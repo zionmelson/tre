@@ -753,7 +753,7 @@ struct WeightedEdgeCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::{PoolUpdateExtensions, SnapshotFreshness};
+    use crate::hydration::types::{HydrationStatus, PoolUpdateExtensions, SnapshotFreshness};
     use std::time::Instant;
 
     fn snapshot(
@@ -788,6 +788,7 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
+            hydration: HydrationStatus::new(0),
             extensions: PoolUpdateExtensions::default(),
         }
     }

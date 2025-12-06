@@ -23,15 +23,17 @@ use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
 use crate::builder::{BuilderHandle, LbClmmPoolAccounts, LbClmmPoolMeta};
+#[cfg(test)]
+use crate::hydration::types::HydrationStatus;
 use crate::hydration::{
     token_fees::{
         apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
     },
     transfer_hooks::{TransferHookAccountContext, TransferHookAccountsResolver},
     types::{
-        compute_edge_bps, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras,
-        LbClmmPoolExtras, LbClmmRewardExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot,
-        PoolUpdate, LB_CLMM_INPUT_UTILIZATION_BPS,
+        compute_edge_bps, HydrationComponent, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras,
+        LbClmmBitmapExtras, LbClmmPoolExtras, LbClmmRewardExtras, PoolBidirectionalQuotes,
+        PoolQuoteSide, PoolSnapshot, PoolUpdate, LB_CLMM_INPUT_UTILIZATION_BPS,
     },
 };
 use crate::template::{
@@ -78,9 +80,17 @@ const BITMAP_SEGMENT_BYTES: usize = BITMAP_SEGMENT_WORDS * 8;
 const Q64_SCALE_OFFSET: u32 = 64;
 const Q64_ONE: u128 = 1u128 << Q64_SCALE_OFFSET;
 const MAX_Q64_EXPONENT: u32 = 0x80000;
+const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
+const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
 
 construct_uint! {
     pub struct U256(4);
+}
+
+#[derive(Clone)]
+struct SnapshotStatusLogEntry {
+    status: QuoteStatus,
+    logged_at: Instant,
 }
 
 static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
@@ -132,6 +142,8 @@ pub struct LbClmmAdapter {
     transfer_hook_resolver: Option<TransferHookAccountsResolver>,
     template_builder: Option<BuilderHandle>,
     registered_templates: DashSet<Pubkey>,
+    snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
+    missing_state_log: DashMap<Pubkey, Instant>,
 }
 
 impl LbClmmAdapter {
@@ -167,6 +179,8 @@ impl LbClmmAdapter {
             transfer_hook_resolver,
             template_builder,
             registered_templates: DashSet::new(),
+            snapshot_failure_log: DashMap::new(),
+            missing_state_log: DashMap::new(),
         }
     }
 
@@ -302,6 +316,7 @@ impl LbClmmAdapter {
             "upserting lb_clmm pool state"
         );
 
+        self.refresh_window(&state, state.active_bin_id);
         self.register_templates_with_builder(&state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
@@ -864,6 +879,103 @@ impl LbClmmAdapter {
         )
     }
 
+    fn log_state_cache_miss(&self, pool: Pubkey, slot: u64) {
+        if let Some(entry) = self.missing_state_log.get(&pool) {
+            if (entry.value().elapsed().as_millis() as u64) < STATE_MISS_LOG_INTERVAL_MS {
+                return;
+            }
+        }
+        self.missing_state_log.insert(pool, Instant::now());
+        warn!(
+            target = "adapter::lb_clmm",
+            pool = %pool,
+            slot,
+            hydrator_online = self.hydrator.is_some(),
+            "lb_clmm strict price snapshot requested before hydration"
+        );
+    }
+
+    fn clear_snapshot_issue(&self, pool: Pubkey, base_to_quote: bool) {
+        self.snapshot_failure_log.remove(&(pool, base_to_quote));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_snapshot_issue(
+        &self,
+        state: &LbClmmState,
+        slot: u64,
+        base_to_quote: bool,
+        status: QuoteStatus,
+        reason: &'static str,
+        probe_amount: Option<u64>,
+        missing_bin_id: Option<i32>,
+        observed_slippage_bps: Option<f64>,
+    ) {
+        if status == QuoteStatus::Ok {
+            self.clear_snapshot_issue(state.lb_pair, base_to_quote);
+            return;
+        }
+
+        let key = (state.lb_pair, base_to_quote);
+        let should_log = match self.snapshot_failure_log.get(&key) {
+            Some(entry) => {
+                let cached = entry.value();
+                cached.status != status
+                    || cached.logged_at.elapsed().as_millis() as u64
+                        >= SNAPSHOT_FAILURE_LOG_INTERVAL_MS
+            }
+            None => true,
+        };
+
+        if !should_log {
+            return;
+        }
+
+        self.snapshot_failure_log.insert(
+            key,
+            SnapshotStatusLogEntry {
+                status,
+                logged_at: Instant::now(),
+            },
+        );
+
+        let cache_age_ms = state.last_update_at.elapsed().as_millis() as u64;
+        let hydrator_clients = self
+            .hydrator
+            .as_ref()
+            .map(|hydrator| hydrator.client_count())
+            .unwrap_or(0);
+        let bin_span_start = state.bin_liquidity.keys().next().copied();
+        let bin_span_end = state.bin_liquidity.keys().next_back().copied();
+
+        warn!(
+            target = "adapter::lb_clmm",
+            pool = %state.lb_pair,
+            slot,
+            direction = if base_to_quote {
+                "base_to_quote"
+            } else {
+                "quote_to_base"
+            },
+            status = ?status,
+            reason,
+            probe_amount,
+            missing_bin_id,
+            observed_slippage_bps,
+            last_update_slot = state.last_update_slot,
+            cache_age_ms,
+            active_bin = state.active_bin_id,
+            bin_span_start,
+            bin_span_end,
+            bin_liquidity_entries = state.bin_liquidity.len(),
+            has_bitmap = state.active_bitmap.is_some(),
+            reserve_x = ?state.reserve_x_balance,
+            reserve_y = ?state.reserve_y_balance,
+            hydrator_clients,
+            "lb_clmm strict price quote unavailable"
+        );
+    }
+
     fn build_snapshot_side(
         &self,
         state: &LbClmmState,
@@ -873,10 +985,30 @@ impl LbClmmAdapter {
         probe_amount: u64,
     ) -> Option<PoolQuoteSide> {
         if probe_amount == 0 {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::InsufficientLiquidity,
+                "probe_amount_zero",
+                Some(probe_amount),
+                None,
+                None,
+            );
             return None;
         }
 
         if self.state_stale(state, slot) {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::StaleState,
+                "state_stale",
+                Some(probe_amount),
+                None,
+                None,
+            );
             return None;
         }
 
@@ -916,15 +1048,23 @@ impl LbClmmAdapter {
             Ok(adjusted) => {
                 let simulation = adjusted.simulation;
                 ctx.expected_fee_amount = Some(simulation.taker_fee_amount);
-                let effective_price = if probe_amount == 0 {
-                    0.0
-                } else {
-                    adjusted.net_output_amount as f64 / probe_amount as f64
-                };
+                let effective_price = adjusted.net_output_amount as f64 / probe_amount as f64;
                 let price_impact_limit_bps = Some(derive_price_impact_limit(
                     simulation.price_impact_bps,
                     state.volatility_bps,
                 ));
+
+                self.record_snapshot_issue(
+                    state,
+                    slot,
+                    base_to_quote,
+                    QuoteStatus::Ok,
+                    "ok",
+                    Some(probe_amount),
+                    None,
+                    None,
+                );
+
                 Some(PoolQuoteSide {
                     input_mint: input_mint.to_string(),
                     output_mint: output_mint.to_string(),
@@ -951,27 +1091,30 @@ impl LbClmmAdapter {
                 if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
                     self.refresh_window(state, err.missing_bin_id());
                 }
-                Some(PoolQuoteSide {
-                    input_mint: input_mint.to_string(),
-                    output_mint: output_mint.to_string(),
-                    notional: probe_amount,
-                    expected_output: 0,
-                    fee_bps,
-                    template_fee_bps,
-                    effective_price: 0.0,
-                    estimated_slippage_bps: err.observed_slippage_bps(),
-                    sqrt_price_limit: None,
-                    min_output_amount: None,
-                    limit_price,
-                    price_impact_limit_bps: None,
-                    amount_specified_is_input: true,
-                    context: ctx,
-                    status: err.into(),
-                    sqrt_price_before_x64: None,
-                    sqrt_price_after_x64: None,
-                    tick_arrays_used: Vec::new(),
-                    cache_slot: Some(slot),
-                })
+                let reason = match err {
+                    LbClmmSimulationError::MissingState => "missing_state",
+                    LbClmmSimulationError::InsufficientLiquidity => "insufficient_liquidity",
+                    LbClmmSimulationError::InsufficientBins { .. } => "insufficient_bins",
+                    LbClmmSimulationError::PriceImpactExceeded { .. } => "price_impact_exceeded",
+                };
+                let status: QuoteStatus = err.into();
+                let observed_slippage = err.observed_slippage_bps();
+                let observed_slippage = if observed_slippage == 0.0 {
+                    None
+                } else {
+                    Some(observed_slippage)
+                };
+                self.record_snapshot_issue(
+                    state,
+                    slot,
+                    base_to_quote,
+                    status,
+                    reason,
+                    Some(probe_amount),
+                    err.missing_bin_id(),
+                    observed_slippage,
+                );
+                None
             }
         }
     }
@@ -1117,12 +1260,26 @@ impl ProtocolAdapter for LbClmmAdapter {
     }
 
     fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
+        snapshot.hydration.require(HydrationComponent::Meta);
+        snapshot.hydration.require(HydrationComponent::BinWindow);
         let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
             return;
         };
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
+        if state.meta_ready() {
+            snapshot
+                .hydration
+                .mark_ready(HydrationComponent::Meta, state.last_update_slot);
+        }
+        if state.bin_window_ready() {
+            snapshot
+                .hydration
+                .mark_ready(HydrationComponent::BinWindow, state.last_update_slot);
+        } else {
+            self.refresh_window(&state, state.active_bin_id);
+        }
         let extras = snapshot
             .extensions
             .lb_clmm
@@ -1156,6 +1313,22 @@ impl ProtocolAdapter for LbClmmAdapter {
         extras
             .token_y_mint
             .get_or_insert_with(|| state.token_y_mint.to_string());
+    }
+
+    fn warm_components(&self, snapshot: &PoolSnapshot, components: &[HydrationComponent]) {
+        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
+            return;
+        };
+        if components.contains(&HydrationComponent::Meta) {
+            if let Some(hydrator) = self.hydrator.as_ref() {
+                hydrator.hydrate(pool_pubkey);
+            }
+        }
+        if components.contains(&HydrationComponent::BinWindow) {
+            if let Some(state) = self.get_state(&pool_pubkey) {
+                self.refresh_window(&state, state.active_bin_id);
+            }
+        }
     }
 
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
@@ -1289,9 +1462,35 @@ impl ProtocolAdapter for LbClmmAdapter {
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         let pool_pubkey = parse_pubkey(&snapshot.pool_id)?;
-        let state = self.get_state(&pool_pubkey)?;
+        let state = match self.get_state(&pool_pubkey) {
+            Some(state) => state,
+            None => {
+                self.log_state_cache_miss(pool_pubkey, snapshot.slot);
+                return None;
+            }
+        };
 
         if self.state_stale(&state, snapshot.slot) {
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                true,
+                QuoteStatus::StaleState,
+                "state_stale",
+                None,
+                None,
+                None,
+            );
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                false,
+                QuoteStatus::StaleState,
+                "state_stale",
+                None,
+                None,
+                None,
+            );
             return None;
         }
 
@@ -1300,9 +1499,39 @@ impl ProtocolAdapter for LbClmmAdapter {
 
         let utilization = self.config.max_swap_utilization_bps;
         let base_probe =
-            base_reserve.and_then(|reserve| snapshot_probe_amount(reserve, utilization))?;
+            match base_reserve.and_then(|reserve| snapshot_probe_amount(reserve, utilization)) {
+                Some(value) => value,
+                None => {
+                    self.record_snapshot_issue(
+                        &state,
+                        snapshot.slot,
+                        true,
+                        QuoteStatus::InsufficientLiquidity,
+                        "base_reserve_empty",
+                        None,
+                        None,
+                        None,
+                    );
+                    return None;
+                }
+            };
         let quote_probe =
-            quote_reserve.and_then(|reserve| snapshot_probe_amount(reserve, utilization))?;
+            match quote_reserve.and_then(|reserve| snapshot_probe_amount(reserve, utilization)) {
+                Some(value) => value,
+                None => {
+                    self.record_snapshot_issue(
+                        &state,
+                        snapshot.slot,
+                        false,
+                        QuoteStatus::InsufficientLiquidity,
+                        "quote_reserve_empty",
+                        None,
+                        None,
+                        None,
+                    );
+                    return None;
+                }
+            };
 
         let base_to_quote =
             self.build_snapshot_side(&state, pool_pubkey, snapshot.slot, true, base_probe)?;
@@ -1477,6 +1706,31 @@ impl LbClmmState {
         } else {
             None
         }
+    }
+
+    fn meta_ready(&self) -> bool {
+        self.reserve_x_balance.is_some()
+            && self.reserve_y_balance.is_some()
+            && self.active_bin_id.is_some()
+    }
+
+    fn bin_window_ready(&self) -> bool {
+        let active_bin = match self.active_bin_id {
+            Some(bin) => bin,
+            None => return false,
+        };
+        let Some(start_bin) = self.bin_liquidity.keys().next().copied() else {
+            return false;
+        };
+        let Some(end_bin) = self.bin_liquidity.keys().next_back().copied() else {
+            return false;
+        };
+        if active_bin < start_bin || active_bin > end_bin {
+            return false;
+        }
+        let left_margin = active_bin.saturating_sub(start_bin);
+        let right_margin = end_bin.saturating_sub(active_bin);
+        left_margin >= BIN_WINDOW_EDGE_BUFFER_BINS && right_margin >= BIN_WINDOW_EDGE_BUFFER_BINS
     }
 
     fn taker_fee_bps(&self) -> u64 {
@@ -3521,6 +3775,7 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
+            hydration: HydrationStatus::new(10_000),
             extensions: PoolUpdateExtensions::default(),
         };
 
