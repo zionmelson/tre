@@ -19,6 +19,17 @@ These sources drive both the adapter specification and the regression test vecto
 - Generate deterministic `SwapTemplate` payloads for both `swap_v2` and staged `two_hop_swap_v2`, ensuring account ordering, signer sets, and remaining accounts align with the IDL.
 - Emit fine-grained health signals tracking tick coverage, oracle freshness, adaptive-fee state, and rate limits so strategies can respond before submission failures occur.
 
+## Recent Fixes & Parity Work
+
+We audited every Whirlpool touchpoint in this stack and brought the implementation back in line with the upstream SDK by mirroring the exact wiring and state machines used in `swap.rs`, `swap_manager.rs`, and `swap_quote_by_*`. The most recent fixes are:
+
+- **Adaptive fee + oracle state** – `WhirlpoolState` now caches both the oracle PDA bytes and the adaptive-fee variables (fee rate manager inputs) alongside static pool metadata. Quote paths (`quote_exact_in` / `quote_exact_out`) load these snapshots and run the same `FeeRateManager` logic the Orca program uses, ensuring pools with adaptive tiers or trade-disable windows are priced with the correct dynamic fee and can only trade once `trade_enable_timestamp` has elapsed. Files: `src/hydration/adapters/whirlpool.rs` (state struct + oracle/adaptive hydration) and `src/strategy/whirlpool_math.rs` (fee manager replica).
+- **Transfer-hook authorities** – Transfer-hook context builders distinguish between input and output legs. The second leg now uses `{source = token_vault_{a|b}, authority = whirlpool PDA}` so Token-2022 hooks on the withdraw/vault side receive the signer they expect (matching the Orca SDK swap builder). File: `src/hydration/adapters/whirlpool.rs` (`attach_transfer_hook_accounts`).
+- **Exact-out bundling** – Planner → Stage2 plumbing preserves `amount_specified_is_input`, so exact-out quotes hydrate bundle templates with `false`, write the requested output into the Whirlpool `AmountOut` field, and respect the IDL’s `other_amount_threshold` semantics. Coverage: `src/planner/submit.rs`, `src/builder/bundle_builder.rs`, plus the integration test `builder::bundle_builder::tests::whirlpool_exact_out_plan_encodes_parameters` which verifies template data matches the quote.
+- **Oracle trade-enable gating** – Bundle readiness now checks the oracle snapshot before a pool is considered routable. If `trade_enable_timestamp` is still in the future (common after adaptive reconfig events), quotes degrade to a blocked status and Stage2 refuses to enqueue the template, mirroring `swap_quote_by_*`. The gating logic lives next to the adaptive-fee hydration inside `src/hydration/adapters/whirlpool.rs` and surfaces through `TemplateContext` health flags.
+
+Together these changes replicate the upstream SDK behavior end-to-end: we pull the same oracle/adaptive variables, run the identical fee manager/state transitions, honor transfer-hook authority expectations, and encode swap parameters exactly as `swap_v2` requires so bundles execute the trades we simulated.
+
 ## Adapter Responsibilities
 
 1. **State ingestion** – Parse CoreCast `PoolLiquidityChangeStreamMessage` and `DexBlockMessage` extras for Whirlpool pools (sqrt price, liquidity, fee growth globals, reward info snapshots, tick-array cursors) and hydrate a `WhirlpoolState` cache keyed by pool address.

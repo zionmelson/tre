@@ -18,15 +18,26 @@ use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
 use solana_client::rpc_response::{UiAccount, UiAccountData};
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use tracing::{debug, info, trace, warn};
+#[cfg(test)]
+use spl_token_2022::extension::transfer_fee::TransferFee;
 use uint::construct_uint;
 
 use crate::builder::{BuilderHandle, LbClmmPoolAccounts, LbClmmPoolMeta};
-use crate::hydration::types::{
-    compute_edge_bps, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras,
-    LbClmmPoolExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
-    LB_CLMM_INPUT_UTILIZATION_BPS,
+use crate::hydration::{
+    token_fees::{
+        apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
+    },
+    transfer_hooks::{TransferHookAccountContext, TransferHookAccountsResolver},
+    types::{
+        compute_edge_bps, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras,
+        LbClmmPoolExtras, LbClmmRewardExtras, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot,
+        PoolUpdate, LB_CLMM_INPUT_UTILIZATION_BPS,
+    },
 };
-use crate::template::TemplateContext;
+use crate::template::{
+    LbClmmAccountsType, LbClmmRemainingAccountsSlice, LbClmmRewardAccountContext,
+    TemplateContext, TransferFeeConfigHint,
+};
 
 use super::{
     build_quote_response, hydration::AsyncHydrator, ProtocolAdapter, QuoteRequest, QuoteResponse,
@@ -36,6 +47,7 @@ use super::{
 const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const SPL_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const BPS_DENOMINATOR: u64 = 10_000;
 const DEFAULT_DYNAMIC_FEE_BPS: u16 = 30;
 const MAX_BIN_PER_ARRAY: i32 = 70;
@@ -78,6 +90,10 @@ static SPL_TOKEN_2022_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
     Pubkey::from_str(SPL_TOKEN_2022_PROGRAM_ID)
         .expect("static spl token 2022 program id should be valid")
 });
+static ASSOCIATED_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID)
+        .expect("static associated token program id should be valid")
+});
 
 #[derive(Debug, Clone)]
 pub struct LbClmmAdapterConfig {
@@ -112,6 +128,8 @@ pub struct LbClmmAdapter {
     state: DashMap<Pubkey, LbClmmState>,
     config: LbClmmAdapterConfig,
     hydrator: Option<LbClmmPoolHydrator>,
+    transfer_fee_cache: Option<TokenTransferFeeHydrator>,
+    transfer_hook_resolver: Option<TransferHookAccountsResolver>,
     template_builder: Option<BuilderHandle>,
     registered_templates: DashSet<Pubkey>,
 }
@@ -121,6 +139,13 @@ impl LbClmmAdapter {
         let program_id = Pubkey::from_str(LB_CLMM_PROGRAM_ID)
             .expect("static lb_clmm program id should be valid");
         let hydrator = LbClmmPoolHydrator::new(program_id, &config);
+        let transfer_fee_cache = TokenTransferFeeHydrator::new(
+            &config.rpc_endpoints,
+            config.rpc_timeout_ms,
+            config.hydration_retry_ms,
+        );
+        let transfer_hook_resolver =
+            TransferHookAccountsResolver::new(&config.rpc_endpoints, config.rpc_timeout_ms);
         if let Some(hydrator_ref) = hydrator.as_ref() {
             info!(
                 target = "adapter::lb_clmm",
@@ -138,6 +163,8 @@ impl LbClmmAdapter {
             state: DashMap::new(),
             config,
             hydrator,
+            transfer_fee_cache,
+            transfer_hook_resolver,
             template_builder,
             registered_templates: DashSet::new(),
         }
@@ -199,7 +226,7 @@ impl LbClmmAdapter {
             bitmap.anchor_with_bin(active_bin);
         }
 
-        let state = LbClmmState {
+        let mut state = LbClmmState {
             lb_pair: pool_pubkey,
             token_x_mint,
             token_y_mint,
@@ -228,6 +255,28 @@ impl LbClmmAdapter {
                 .host_fee_account
                 .as_ref()
                 .and_then(|value| parse_pubkey(value)),
+            rewards: extras
+                .rewards
+                .iter()
+                .filter_map(|reward| {
+                    let mint = reward.mint.as_ref().and_then(|value| parse_pubkey(value))?;
+                    let vault = reward
+                        .vault
+                        .as_ref()
+                        .and_then(|value| parse_pubkey(value))?;
+                    let funder = reward
+                        .funder
+                        .as_ref()
+                        .and_then(|value| parse_pubkey(value))
+                        .unwrap_or_else(Pubkey::default);
+                    Some(LbClmmRewardInfo {
+                        index: reward.index,
+                        mint,
+                        vault,
+                        funder,
+                    })
+                })
+                .collect(),
             bin_step: extras.bin_step,
             active_bin_id: extras.active_bin_id,
             dynamic_fee_bps: extras.dynamic_fee_bps,
@@ -239,7 +288,11 @@ impl LbClmmAdapter {
             active_bitmap,
             last_update_slot: update.slot,
             last_update_at: Instant::now(),
+            token_x_transfer_fee: None,
+            token_y_transfer_fee: None,
         };
+        self.ensure_token_programs(&mut state);
+        self.attach_transfer_fees(&mut state);
         trace!(
             target = "adapter::lb_clmm",
             pool = %update.pool_id,
@@ -298,6 +351,18 @@ impl LbClmmAdapter {
             }
             if extras.active_bitmap.is_none() {
                 extras.active_bitmap = Some(meta.active_bitmap.clone());
+            }
+            if extras.rewards.is_empty() && !meta.rewards.is_empty() {
+                extras.rewards = meta
+                    .rewards
+                    .iter()
+                    .map(|reward| LbClmmRewardExtras {
+                        index: reward.index,
+                        mint: Some(reward.mint.to_string()),
+                        vault: Some(reward.vault.to_string()),
+                        funder: Some(reward.funder.to_string()),
+                    })
+                    .collect();
             }
         }
 
@@ -364,6 +429,44 @@ impl LbClmmAdapter {
         self.registered_templates.insert(state.lb_pair);
     }
 
+    fn ensure_token_programs(&self, state: &mut LbClmmState) {
+        if state.token_x_program.is_none() {
+            state.token_x_program = self.resolve_token_program(state.token_x_mint);
+        }
+        if state.token_y_program.is_none() {
+            state.token_y_program = self.resolve_token_program(state.token_y_mint);
+        }
+    }
+
+    fn attach_transfer_fees(&self, state: &mut LbClmmState) {
+        state.token_x_transfer_fee =
+            self.resolve_transfer_fee(state.token_x_mint, state.token_x_program);
+        state.token_y_transfer_fee =
+            self.resolve_transfer_fee(state.token_y_mint, state.token_y_program);
+    }
+
+    fn resolve_token_program(&self, mint: Pubkey) -> Option<Pubkey> {
+        self.transfer_fee_cache
+            .as_ref()
+            .and_then(|cache| cache.mint_program(mint))
+    }
+
+    fn resolve_transfer_fee(
+        &self,
+        mint: Pubkey,
+        program: Option<Pubkey>,
+    ) -> Option<TokenTransferFee> {
+        let cache = self.transfer_fee_cache.as_ref()?;
+        let program_id = match program {
+            Some(id) => id,
+            None => cache.mint_program(mint)?,
+        };
+        if program_id != *SPL_TOKEN_2022_PROGRAM_PUBKEY {
+            return None;
+        }
+        cache.hydrate(mint)
+    }
+
     fn decorate_swap_context(
         &self,
         state: &LbClmmState,
@@ -378,6 +481,14 @@ impl LbClmmAdapter {
         }
         if context.output_token_program.is_none() {
             context.output_token_program = Some(output_program);
+        }
+        if context.input_transfer_fee_config.is_none() {
+            context.input_transfer_fee_config =
+                transfer_fee_hint(state.transfer_fee_for_mint(input_mint));
+        }
+        if context.output_transfer_fee_config.is_none() {
+            context.output_transfer_fee_config =
+                transfer_fee_hint(state.transfer_fee_for_mint(output_mint));
         }
 
         let Some(builder) = self.template_builder.as_ref() else {
@@ -420,6 +531,289 @@ impl LbClmmAdapter {
         }
     }
 
+    fn attach_transfer_hook_accounts(
+        &self,
+        state: &LbClmmState,
+        context: &mut TemplateContext,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+    ) {
+        let builder = self.template_builder.as_ref();
+        if let Some(resolver) = self.transfer_hook_resolver.as_ref() {
+            let token_types = [
+                LbClmmAccountsType::TransferHookX,
+                LbClmmAccountsType::TransferHookY,
+            ];
+
+            for accounts_type in token_types {
+                if let Some((accounts, slice)) = self.collect_transfer_hook_accounts(
+                    resolver,
+                    state,
+                    context,
+                    accounts_type,
+                    input_mint,
+                    output_mint,
+                ) {
+                    if !accounts.is_empty() {
+                        context.remaining_accounts.extend(accounts.into_iter());
+                        context.lb_clmm_remaining_accounts.push(slice);
+                    }
+                }
+            }
+        }
+        self.attach_reward_transfer_hook_accounts(
+            builder,
+            self.transfer_hook_resolver.as_ref(),
+            state,
+            context,
+        );
+    }
+
+    fn collect_transfer_hook_accounts(
+        &self,
+        resolver: &TransferHookAccountsResolver,
+        state: &LbClmmState,
+        context: &TemplateContext,
+        accounts_type: LbClmmAccountsType,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+    ) -> Option<(Vec<AccountMeta>, LbClmmRemainingAccountsSlice)> {
+        let (mint, program_id, reserve) = match accounts_type {
+            LbClmmAccountsType::TransferHookX => {
+                (state.token_x_mint, state.token_x_program?, state.reserve_x?)
+            }
+            LbClmmAccountsType::TransferHookY => {
+                (state.token_y_mint, state.token_y_program?, state.reserve_y?)
+            }
+            _ => return None,
+        };
+
+        if program_id != *SPL_TOKEN_2022_PROGRAM_PUBKEY {
+            return None;
+        }
+
+        let mut hook_contexts = Vec::new();
+        if mint == input_mint {
+            let source = context.input_token_account?;
+            let destination = reserve;
+            let authority = context.payer?;
+            hook_contexts.push(TransferHookAccountContext {
+                source,
+                destination,
+                authority,
+            });
+        }
+        if mint == output_mint {
+            let destination = context.output_token_account?;
+            hook_contexts.push(TransferHookAccountContext {
+                source: reserve,
+                destination,
+                authority: state.lb_pair,
+            });
+        }
+
+        if hook_contexts.is_empty() {
+            return None;
+        }
+
+        let accounts = resolver.resolve_accounts(program_id, mint, &hook_contexts)?;
+        if accounts.is_empty() {
+            return None;
+        }
+
+        let slice = LbClmmRemainingAccountsSlice {
+            pool: state.lb_pair,
+            accounts_type,
+            length: accounts.len().min(u8::MAX as usize) as u8,
+        };
+        Some((accounts, slice))
+    }
+
+    fn attach_reward_transfer_hook_accounts(
+        &self,
+        builder: Option<&BuilderHandle>,
+        resolver: Option<&TransferHookAccountsResolver>,
+        state: &LbClmmState,
+        context: &mut TemplateContext,
+    ) {
+        if state.rewards.is_empty() {
+            return;
+        }
+
+        let mut rewards: Vec<_> = state.rewards.iter().collect();
+        rewards.sort_by_key(|reward| reward.index);
+
+        let reward_authority = context
+            .payer
+            .or_else(|| builder.map(|handle| handle.payer_pubkey()));
+        let mut token_2022_entries = Vec::new();
+        for reward in rewards {
+            let mut token_program = *SPL_TOKEN_PROGRAM_PUBKEY;
+            if let Some(resolver) = resolver {
+                if let Some(program_id) = resolver.mint_program(reward.mint) {
+                    token_program = program_id;
+                }
+            }
+
+            let mut user_token_account =
+                builder.and_then(|handle| handle.token_account_for_mint(&reward.mint));
+            if user_token_account.is_none() {
+                if let Some(owner) = reward_authority {
+                    user_token_account = Some(derive_associated_token_address(
+                        &owner,
+                        &reward.mint,
+                        &token_program,
+                    ));
+                }
+            }
+            let mut reward_context = LbClmmRewardAccountContext {
+                pool: state.lb_pair,
+                index: reward.index,
+                mint: reward.mint,
+                vault: reward.vault,
+                funder: reward.funder,
+                token_program,
+                user_token_account,
+                transfer_hook_accounts: Vec::new(),
+            };
+
+            if token_program == *SPL_TOKEN_2022_PROGRAM_PUBKEY {
+                if let Some(resolver) = resolver {
+                    if let Some(accounts) = self.resolve_reward_transfer_hook_accounts(
+                        resolver,
+                        state,
+                        reward,
+                        token_program,
+                        reward_authority,
+                        reward_context.user_token_account,
+                    ) {
+                        if !accounts.is_empty() {
+                            reward_context.transfer_hook_accounts = accounts.clone();
+                            token_2022_entries.push((reward.index, accounts));
+                        }
+                    }
+                }
+            }
+
+            self.upsert_reward_context(context, reward_context);
+        }
+
+        if token_2022_entries.is_empty() {
+            return;
+        }
+
+        let use_multi_variant = token_2022_entries.len() > 1;
+        for (index, accounts) in token_2022_entries {
+            let accounts_type = if use_multi_variant {
+                LbClmmAccountsType::TransferHookMultiReward(index)
+            } else {
+                LbClmmAccountsType::TransferHookReward
+            };
+            if self.reward_slice_exists(context, state.lb_pair, accounts_type) {
+                continue;
+            }
+            let slice = LbClmmRemainingAccountsSlice {
+                pool: state.lb_pair,
+                accounts_type,
+                length: accounts.len().min(u8::MAX as usize) as u8,
+            };
+            context.remaining_accounts.extend(accounts.into_iter());
+            context.lb_clmm_remaining_accounts.push(slice);
+        }
+    }
+
+    fn reward_slice_exists(
+        &self,
+        context: &TemplateContext,
+        pool_id: Pubkey,
+        accounts_type: LbClmmAccountsType,
+    ) -> bool {
+        context
+            .lb_clmm_remaining_accounts
+            .iter()
+            .any(|slice| slice.pool == pool_id && slice.accounts_type == accounts_type)
+    }
+
+    fn upsert_reward_context(
+        &self,
+        context: &mut TemplateContext,
+        reward_context: LbClmmRewardAccountContext,
+    ) {
+        if let Some(existing) = context
+            .lb_clmm_reward_accounts
+            .iter_mut()
+            .find(|entry| entry.pool == reward_context.pool && entry.index == reward_context.index)
+        {
+            if existing.user_token_account.is_none() {
+                existing.user_token_account = reward_context.user_token_account;
+            }
+            if existing.transfer_hook_accounts.is_empty()
+                && !reward_context.transfer_hook_accounts.is_empty()
+            {
+                existing.transfer_hook_accounts = reward_context.transfer_hook_accounts;
+            }
+            existing.mint = reward_context.mint;
+            existing.vault = reward_context.vault;
+            existing.funder = reward_context.funder;
+            existing.token_program = reward_context.token_program;
+            return;
+        }
+        context.lb_clmm_reward_accounts.push(reward_context);
+    }
+
+    fn resolve_reward_transfer_hook_accounts(
+        &self,
+        resolver: &TransferHookAccountsResolver,
+        state: &LbClmmState,
+        reward: &LbClmmRewardInfo,
+        token_program: Pubkey,
+        reward_authority: Option<Pubkey>,
+        user_token_account: Option<Pubkey>,
+    ) -> Option<Vec<AccountMeta>> {
+        let hook_contexts = self.build_reward_transfer_hook_contexts(
+            state,
+            reward,
+            reward_authority,
+            user_token_account,
+        );
+        if hook_contexts.is_empty() {
+            return None;
+        }
+        resolver.resolve_accounts(token_program, reward.mint, &hook_contexts)
+    }
+
+    fn build_reward_transfer_hook_contexts(
+        &self,
+        state: &LbClmmState,
+        reward: &LbClmmRewardInfo,
+        reward_authority: Option<Pubkey>,
+        user_token_account: Option<Pubkey>,
+    ) -> Vec<TransferHookAccountContext> {
+        let mut hook_contexts = Vec::new();
+        if let Some(user_account) = user_token_account {
+            hook_contexts.push(TransferHookAccountContext {
+                source: reward.vault,
+                destination: user_account,
+                authority: state.lb_pair,
+            });
+            if let Some(authority) = reward_authority {
+                hook_contexts.push(TransferHookAccountContext {
+                    source: user_account,
+                    destination: reward.vault,
+                    authority,
+                });
+            }
+            return hook_contexts;
+        }
+
+        hook_contexts.push(TransferHookAccountContext {
+            source: reward.vault,
+            destination: reward.vault,
+            authority: state.lb_pair,
+        });
+        hook_contexts
+    }
+
     fn refresh_window(&self, state: &LbClmmState, target_bin: Option<i32>) {
         let Some(bin_id) = target_bin.or(state.active_bin_id) else {
             return;
@@ -438,6 +832,32 @@ impl LbClmmAdapter {
         }
     }
 
+    fn clamp_request_output_amount(&self, state: &LbClmmState, req: &QuoteRequest) -> u64 {
+        match state.resolve_reserves(&req.input_mint, &req.output_mint) {
+            Some((_, reserve)) => {
+                clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps)
+            }
+            None => req.amount,
+        }
+    }
+
+    fn max_input_budget(&self, state: &LbClmmState, req: &QuoteRequest) -> u64 {
+        match state.resolve_reserves(&req.input_mint, &req.output_mint) {
+            Some((reserve, _)) => clamp_reserve_to_utilization(reserve, self.config.max_swap_utilization_bps)
+                .min(u64::MAX as u128) as u64,
+            None => u64::MAX,
+        }
+    }
+
+    fn state_stale(&self, state: &LbClmmState, request_slot: u64) -> bool {
+        let slot = if request_slot == 0 {
+            state.last_update_slot
+        } else {
+            request_slot
+        };
+        state.hydration_stale(slot, self.config.stale_slot_threshold, self.config.stale_after_ms)
+    }
+
     fn build_snapshot_side(
         &self,
         state: &LbClmmState,
@@ -447,6 +867,10 @@ impl LbClmmAdapter {
         probe_amount: u64,
     ) -> Option<PoolQuoteSide> {
         if probe_amount == 0 {
+            return None;
+        }
+
+        if self.state_stale(state, slot) {
             return None;
         }
 
@@ -475,19 +899,21 @@ impl LbClmmAdapter {
         if let Some(host_fee) = state.host_fee_account {
             ctx.host_fee_account = Some(host_fee);
         }
+        self.decorate_swap_context(state, &mut ctx, input_mint, output_mint);
+        self.attach_transfer_hook_accounts(state, &mut ctx, input_mint, output_mint);
         if let Some(extension) = state.bin_array_bitmap_extension {
             ctx.remaining_accounts
                 .push(AccountMeta::new_readonly(extension, false));
         }
-        self.decorate_swap_context(state, &mut ctx, input_mint, output_mint);
 
-        match simulate_lb_clmm_exact_in(&self.config, state, &req) {
-            Ok(simulation) => {
+        match self.simulate_exact_in_with_transfer_fees(state, &req) {
+            Ok(adjusted) => {
+                let simulation = adjusted.simulation;
                 ctx.expected_fee_amount = Some(simulation.taker_fee_amount);
                 let effective_price = if probe_amount == 0 {
                     0.0
                 } else {
-                    simulation.amount_out as f64 / probe_amount as f64
+                    adjusted.net_output_amount as f64 / probe_amount as f64
                 };
                 let price_impact_limit_bps = Some(derive_price_impact_limit(
                     simulation.price_impact_bps,
@@ -497,7 +923,7 @@ impl LbClmmAdapter {
                     input_mint: input_mint.to_string(),
                     output_mint: output_mint.to_string(),
                     notional: probe_amount,
-                    expected_output: simulation.amount_out,
+                    expected_output: adjusted.net_output_amount,
                     fee_bps,
                     template_fee_bps,
                     effective_price,
@@ -542,6 +968,120 @@ impl LbClmmAdapter {
                 })
             }
         }
+    }
+
+    fn simulate_exact_in_with_transfer_fees(
+        &self,
+        state: &LbClmmState,
+        req: &QuoteRequest,
+    ) -> Result<TransferFeeAdjustedSimulation, LbClmmSimulationError> {
+        let input_fee = state.transfer_fee_for_mint(req.input_mint);
+        let output_fee = state.transfer_fee_for_mint(req.output_mint);
+        let (post_fee_budget, _) = apply_post_fee_amount(req.amount, input_fee)
+            .ok_or(LbClmmSimulationError::InsufficientLiquidity)?;
+        if post_fee_budget == 0 {
+            return Err(LbClmmSimulationError::InsufficientLiquidity);
+        }
+
+        let mut adjusted_req = req.clone();
+        adjusted_req.amount = post_fee_budget;
+        let simulation = simulate_lb_clmm_exact_in(&self.config, state, &adjusted_req)?;
+        let (net_output_amount, _) = apply_post_fee_amount(simulation.amount_out, output_fee)
+            .ok_or(LbClmmSimulationError::InsufficientLiquidity)?;
+        if net_output_amount == 0 {
+            return Err(LbClmmSimulationError::InsufficientLiquidity);
+        }
+
+        let executed_input_amount = apply_pre_fee_amount(post_fee_budget, input_fee)
+            .map(|(gross, _)| gross)
+            .unwrap_or(req.amount);
+
+        Ok(TransferFeeAdjustedSimulation {
+            simulation,
+            net_input_amount: post_fee_budget,
+            net_output_amount,
+            executed_input_amount,
+        })
+    }
+
+    fn find_input_for_exact_out_with_transfer_fees(
+        &self,
+        state: &LbClmmState,
+        req: &QuoteRequest,
+        target_net_out: u64,
+    ) -> Result<(u64, TransferFeeAdjustedSimulation), LbClmmSimulationError> {
+        if target_net_out == 0 {
+            return Err(LbClmmSimulationError::InsufficientLiquidity);
+        }
+
+        let max_budget = self.max_input_budget(state, req);
+        if max_budget == 0 {
+            return Err(LbClmmSimulationError::InsufficientLiquidity);
+        }
+
+        let mut scoped_req = req.clone();
+        scoped_req.direction = SwapDirection::ExactIn;
+
+        let mut high = target_net_out.max(1).min(max_budget);
+        let mut best: Option<(u64, TransferFeeAdjustedSimulation)> = None;
+
+        while high > 0 {
+            scoped_req.amount = high;
+            match self.simulate_exact_in_with_transfer_fees(state, &scoped_req) {
+                Ok(simulation) => {
+                    if simulation.net_output_amount >= target_net_out {
+                        best = Some((high, simulation));
+                        break;
+                    }
+                }
+                Err(err) => {
+                    if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
+                        self.refresh_window(state, err.missing_bin_id());
+                    }
+                    return Err(err);
+                }
+            }
+
+            if high == max_budget {
+                break;
+            }
+
+            if high >= max_budget.saturating_div(2) {
+                high = max_budget;
+            } else {
+                high = (high.saturating_mul(2)).min(max_budget);
+            }
+        }
+
+        let (mut best_input, mut best_simulation) =
+            best.ok_or(LbClmmSimulationError::InsufficientLiquidity)?;
+
+        let mut low = 1u64;
+        while low < best_input {
+            let mid = low + (best_input - low) / 2;
+            scoped_req.amount = mid;
+            let simulation = match self.simulate_exact_in_with_transfer_fees(state, &scoped_req) {
+                Ok(sim) => sim,
+                Err(err) => {
+                    if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
+                        self.refresh_window(state, err.missing_bin_id());
+                    }
+                    return Err(err);
+                }
+            };
+
+            if simulation.net_output_amount >= target_net_out {
+                best_input = mid;
+                best_simulation = simulation;
+            } else {
+                if mid == u64::MAX {
+                    break;
+                }
+                low = mid.saturating_add(1);
+            }
+        }
+
+        Ok((best_input, best_simulation))
     }
 }
 
@@ -619,12 +1159,17 @@ impl ProtocolAdapter for LbClmmAdapter {
         }
         let state = self.get_state(&req.pool_id)?;
         let mut request = req;
+        if self.state_stale(&state, request.slot) {
+            let mut response = build_quote_response(request.clone(), 0);
+            response.status = QuoteStatus::StaleState;
+            return Some(response);
+        }
         let capped = self.clamp_request_amount(&state, &request);
         if capped == 0 {
             return None;
         }
         request.amount = capped;
-        let simulation = match simulate_lb_clmm_exact_in(&self.config, &state, &request) {
+        let adjusted = match self.simulate_exact_in_with_transfer_fees(&state, &request) {
             Ok(outcome) => outcome,
             Err(err) => {
                 if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
@@ -635,20 +1180,20 @@ impl ProtocolAdapter for LbClmmAdapter {
                 return Some(response);
             }
         };
-        let mut response = build_quote_response(request.clone(), simulation.amount_out);
+        let simulation = adjusted.simulation;
+        let mut response = build_quote_response(request.clone(), adjusted.net_output_amount);
         response.edge_bps = simulation.price_impact_bps;
-        response.min_output_amount = Some(simulation.amount_out);
+        response.min_output_amount = Some(adjusted.net_output_amount);
         response.context.compute_unit_limit = Some(LB_CLMM_DEFAULT_CU_LIMIT);
         response.context.compute_unit_price = Some(LB_CLMM_DEFAULT_CU_PRICE);
         response.context.expected_fee_amount = Some(simulation.taker_fee_amount);
+        if request.amount > adjusted.executed_input_amount {
+            response.context.partial_fill_remaining = Some(
+                request.amount.saturating_sub(adjusted.executed_input_amount),
+            );
+        }
         if let Some(host_fee) = state.host_fee_account {
             response.context.host_fee_account = Some(host_fee);
-        }
-        if let Some(extension) = state.bin_array_bitmap_extension {
-            response
-                .context
-                .remaining_accounts
-                .push(AccountMeta::new_readonly(extension, false));
         }
         self.decorate_swap_context(
             &state,
@@ -656,12 +1201,93 @@ impl ProtocolAdapter for LbClmmAdapter {
             request.input_mint,
             request.output_mint,
         );
+        self.attach_transfer_hook_accounts(
+            &state,
+            &mut response.context,
+            request.input_mint,
+            request.output_mint,
+        );
+        if let Some(extension) = state.bin_array_bitmap_extension {
+            response
+                .context
+                .remaining_accounts
+                .push(AccountMeta::new_readonly(extension, false));
+        }
+        Some(response)
+    }
+
+    fn quote_exact_out(&self, req: QuoteRequest) -> Option<QuoteResponse> {
+        if req.direction != SwapDirection::ExactOut {
+            return None;
+        }
+        let state = self.get_state(&req.pool_id)?;
+        let mut request = req;
+        if self.state_stale(&state, request.slot) {
+            let mut response = build_quote_response(request.clone(), 0);
+            response.status = QuoteStatus::StaleState;
+            return Some(response);
+        }
+        let capped = self.clamp_request_output_amount(&state, &request);
+        if capped == 0 {
+            return None;
+        }
+        request.amount = capped;
+        let (gross_input, adjusted) =
+            match self.find_input_for_exact_out_with_transfer_fees(&state, &request, capped) {
+                Ok(result) => result,
+                Err(err) => {
+                    if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
+                        self.refresh_window(&state, err.missing_bin_id());
+                    }
+                    let mut response = build_quote_response(request, 0);
+                    response.status = err.into();
+                    return Some(response);
+                }
+            };
+        let simulation = adjusted.simulation;
+        let mut response = build_quote_response(request.clone(), adjusted.net_output_amount);
+        response.amount_in = gross_input;
+        response.edge_bps = simulation.price_impact_bps;
+        response.min_output_amount = Some(adjusted.net_output_amount);
+        response.context.compute_unit_limit = Some(LB_CLMM_DEFAULT_CU_LIMIT);
+        response.context.compute_unit_price = Some(LB_CLMM_DEFAULT_CU_PRICE);
+        response.context.expected_fee_amount = Some(simulation.taker_fee_amount);
+        if gross_input > adjusted.executed_input_amount {
+            response.context.partial_fill_remaining = Some(
+                gross_input.saturating_sub(adjusted.executed_input_amount),
+            );
+        }
+        if let Some(host_fee) = state.host_fee_account {
+            response.context.host_fee_account = Some(host_fee);
+        }
+        self.decorate_swap_context(
+            &state,
+            &mut response.context,
+            request.input_mint,
+            request.output_mint,
+        );
+        self.attach_transfer_hook_accounts(
+            &state,
+            &mut response.context,
+            request.input_mint,
+            request.output_mint,
+        );
+        if let Some(extension) = state.bin_array_bitmap_extension {
+            response
+                .context
+                .remaining_accounts
+                .push(AccountMeta::new_readonly(extension, false));
+        }
         Some(response)
     }
 
     fn bidirectional_quotes(&self, snapshot: &PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         let pool_pubkey = parse_pubkey(&snapshot.pool_id)?;
         let state = self.get_state(&pool_pubkey)?;
+
+        if self.state_stale(&state, snapshot.slot) {
+            return None;
+        }
 
         let base_reserve = state.reserve_x_balance.or(Some(snapshot.base_post_amount));
         let quote_reserve = state.reserve_y_balance.or(Some(snapshot.quote_post_amount));
@@ -741,6 +1367,16 @@ fn token_program_for_mint(state: &LbClmmState, mint: &Pubkey) -> Pubkey {
     }
 }
 
+fn transfer_fee_hint(fee: Option<TokenTransferFee>) -> Option<TransferFeeConfigHint> {
+    let fee = fee?;
+    let config = fee.config();
+    Some(TransferFeeConfigHint {
+        epoch: config.epoch.into(),
+        maximum_fee: config.maximum_fee.into(),
+        basis_points: config.transfer_fee_basis_points.into(),
+    })
+}
+
 fn build_bin_liquidity_map(extras: &LbClmmPoolExtras) -> BTreeMap<i32, LbClmmBinSnapshot> {
     let mut map = BTreeMap::new();
     for array in &extras.bin_arrays {
@@ -765,11 +1401,14 @@ pub struct LbClmmState {
     pub token_y_mint: Pubkey,
     pub token_x_program: Option<Pubkey>,
     pub token_y_program: Option<Pubkey>,
+    pub token_x_transfer_fee: Option<TokenTransferFee>,
+    pub token_y_transfer_fee: Option<TokenTransferFee>,
     pub reserve_x: Option<Pubkey>,
     pub reserve_y: Option<Pubkey>,
     pub oracle: Option<Pubkey>,
     pub bin_array_bitmap_extension: Option<Pubkey>,
     pub host_fee_account: Option<Pubkey>,
+    pub rewards: Vec<LbClmmRewardInfo>,
     pub bin_step: Option<u16>,
     pub active_bin_id: Option<i32>,
     pub dynamic_fee_bps: Option<u16>,
@@ -783,6 +1422,14 @@ pub struct LbClmmState {
     pub last_update_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct LbClmmRewardInfo {
+    pub index: u8,
+    pub mint: Pubkey,
+    pub vault: Pubkey,
+    pub funder: Pubkey,
+}
+
 impl LbClmmState {
     pub fn mid_price(&self) -> Option<f64> {
         match (self.reserve_x_balance, self.reserve_y_balance) {
@@ -791,12 +1438,36 @@ impl LbClmmState {
         }
     }
 
+    fn hydration_stale(&self, current_slot: u64, slot_threshold: u64, ttl_ms: u64) -> bool {
+        let slot_stale = if slot_threshold == 0 {
+            false
+        } else {
+            current_slot.saturating_sub(self.last_update_slot) > slot_threshold
+        };
+        let time_stale = if ttl_ms == 0 {
+            false
+        } else {
+            self.last_update_at.elapsed().as_millis() as u64 > ttl_ms
+        };
+        slot_stale || time_stale
+    }
+
     fn resolve_reserves(&self, input_mint: &Pubkey, output_mint: &Pubkey) -> Option<(u128, u128)> {
         let (reserve_x, reserve_y) = (self.reserve_x_balance?, self.reserve_y_balance?);
         if *input_mint == self.token_x_mint && *output_mint == self.token_y_mint {
             Some((reserve_x, reserve_y))
         } else if *input_mint == self.token_y_mint && *output_mint == self.token_x_mint {
             Some((reserve_y, reserve_x))
+        } else {
+            None
+        }
+    }
+
+    fn transfer_fee_for_mint(&self, mint: Pubkey) -> Option<TokenTransferFee> {
+        if mint == self.token_x_mint {
+            self.token_x_transfer_fee
+        } else if mint == self.token_y_mint {
+            self.token_y_transfer_fee
         } else {
             None
         }
@@ -987,6 +1658,13 @@ struct LbClmmSimulationOutcome {
     protocol_fee_amount: u64,
     host_fee_amount: u64,
     lp_fee_amount: u64,
+}
+
+struct TransferFeeAdjustedSimulation {
+    simulation: LbClmmSimulationOutcome,
+    net_input_amount: u64,
+    net_output_amount: u64,
+    executed_input_amount: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1182,6 +1860,15 @@ fn derive_price_impact_limit(slippage_bps: f64, volatility_bps: Option<u16>) -> 
     let volatility = volatility_bps.unwrap_or(0) as u64;
     let total = base.saturating_add(volatility).saturating_add(headroom);
     total.min(u16::MAX as u64) as u16
+}
+
+fn derive_associated_token_address(
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Pubkey {
+    let seeds = &[owner.as_ref(), token_program.as_ref(), mint.as_ref()];
+    Pubkey::find_program_address(seeds, &ASSOCIATED_TOKEN_PROGRAM_PUBKEY).0
 }
 
 fn execute_bin_swap(
@@ -1411,6 +2098,14 @@ fn parse_pubkey(value: &str) -> Option<Pubkey> {
 }
 
 #[derive(Clone, Debug)]
+struct HydratedRewardInfo {
+    index: u8,
+    mint: Pubkey,
+    vault: Pubkey,
+    funder: Pubkey,
+}
+
+#[derive(Clone, Debug)]
 struct HydratedPoolMeta {
     token_x_mint: Pubkey,
     token_y_mint: Pubkey,
@@ -1423,6 +2118,7 @@ struct HydratedPoolMeta {
     active_bin_id: i32,
     bin_arrays: Vec<LbClmmBinArrayExtras>,
     active_bitmap: LbClmmBitmapExtras,
+    rewards: Vec<HydratedRewardInfo>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1619,7 +2315,8 @@ fn fetch_lb_clmm_meta(
     for client in clients {
         match client.get_account(&pool) {
             Ok(account) => {
-                if let Some(meta) = parse_lb_pair_account(&account.data) {
+                if let Some(mut meta) = parse_lb_pair_account(&account.data) {
+                    fill_missing_token_programs(&mut meta, clients, pool);
                     cache.insert(pool, meta.clone());
                     stream_lb_clmm_extensions(
                         program_id,
@@ -1650,6 +2347,47 @@ fn fetch_lb_clmm_meta(
         }
     }
 
+    None
+}
+
+fn fill_missing_token_programs(
+    meta: &mut HydratedPoolMeta,
+    clients: &[Arc<RpcClient>],
+    pool: Pubkey,
+) {
+    if meta.token_x_program.is_none() {
+        meta.token_x_program = fetch_mint_owner(clients, &meta.token_x_mint);
+        if meta.token_x_program.is_none() {
+            warn!(
+                target = "adapter::lb_clmm",
+                mint = %meta.token_x_mint,
+                pool = %pool,
+                "failed to resolve token_x program; swap templates may be unavailable"
+            );
+        }
+    }
+    if meta.token_y_program.is_none() {
+        meta.token_y_program = fetch_mint_owner(clients, &meta.token_y_mint);
+        if meta.token_y_program.is_none() {
+            warn!(
+                target = "adapter::lb_clmm",
+                mint = %meta.token_y_mint,
+                pool = %pool,
+                "failed to resolve token_y program; swap templates may be unavailable"
+            );
+        }
+    }
+}
+
+fn fetch_mint_owner(clients: &[Arc<RpcClient>], mint: &Pubkey) -> Option<Pubkey> {
+    for client in clients {
+        match client.get_account(mint) {
+            Ok(account) => return Some(account.owner),
+            Err(error) => {
+                debug!(target = "adapter::lb_clmm", %mint, %error, "rpc fetch failed for mint owner fallback")
+            }
+        }
+    }
     None
 }
 
@@ -1897,6 +2635,20 @@ const REWARD_INFO_LEN: usize = 144;
 const REWARD_INFO_COUNT: usize = 2;
 const BIN_ARRAY_BITMAP_BYTES: usize = 16 * 8;
 const PUBKEY_BYTES: usize = 32;
+const LB_PAIR_ACCOUNT_TAIL_LEN: usize = PUBKEY_BYTES
+    + BIN_ARRAY_BITMAP_BYTES
+    + 8 // last_updated_at
+    + 32 // _padding_2
+    + PUBKEY_BYTES // pre_activation_swap_address
+    + PUBKEY_BYTES // base_key
+    + 8 // activation_point
+    + 8 // pre_activation_duration
+    + 8 // _padding_3
+    + 8 // _padding_4
+    + PUBKEY_BYTES // creator
+    + 1 // token_mint_x_program_flag
+    + 1 // token_mint_y_program_flag
+    + 22; // _reserved
 const LB_PAIR_ACCOUNT_MIN_LEN: usize = STATIC_PARAMETERS_LEN
         + VARIABLE_PARAMETERS_LEN
         + 1 // bump_seed
@@ -1952,7 +2704,7 @@ fn parse_lb_pair_account(data: &[u8]) -> Option<HydratedPoolMeta> {
 
     skip_bytes(data, &mut cursor, PROTOCOL_FEE_LEN)?;
     skip_bytes(data, &mut cursor, 32)?; // _padding_1
-    skip_bytes(data, &mut cursor, REWARD_INFO_LEN * REWARD_INFO_COUNT)?;
+    let rewards = parse_reward_infos(data, &mut cursor)?;
     let oracle = read_pubkey_bytes(data, &mut cursor)?;
     let inline_bitmap = read_bytes(data, &mut cursor, BIN_ARRAY_BITMAP_BYTES)?;
     skip_bytes(data, &mut cursor, 8)?; // last_updated_at
@@ -1983,7 +2735,42 @@ fn parse_lb_pair_account(data: &[u8]) -> Option<HydratedPoolMeta> {
             anchor_bin_id: 0,
             bitmap: inline_bitmap,
         },
+        rewards,
     })
+}
+
+fn parse_reward_infos(data: &[u8], cursor: &mut usize) -> Option<Vec<HydratedRewardInfo>> {
+    if *cursor > data.len() {
+        return None;
+    }
+    let reward_section_end = data.len().checked_sub(LB_PAIR_ACCOUNT_TAIL_LEN)?;
+    if reward_section_end < *cursor {
+        return None;
+    }
+
+    let mut rewards = Vec::new();
+    let mut index: u16 = 0;
+    while (*cursor).saturating_add(REWARD_INFO_LEN) <= reward_section_end {
+        let mint = read_pubkey_bytes(data, cursor)?;
+        let vault = read_pubkey_bytes(data, cursor)?;
+        let funder = read_pubkey_bytes(data, cursor)?;
+        let remaining_len = REWARD_INFO_LEN.saturating_sub(PUBKEY_BYTES * 3);
+        skip_bytes(data, cursor, remaining_len)?;
+        if mint != Pubkey::default() && vault != Pubkey::default() {
+            if let Ok(idx) = u8::try_from(index) {
+                rewards.push(HydratedRewardInfo {
+                    index: idx,
+                    mint,
+                    vault,
+                    funder,
+                });
+            }
+        }
+        index = index.saturating_add(1);
+    }
+
+    *cursor = reward_section_end;
+    Some(rewards)
 }
 
 fn parse_bin_array_account(pool: Pubkey, data: &[u8]) -> Option<LbClmmBinArrayExtras> {
@@ -2135,7 +2922,129 @@ fn map_token_program_flag(flag: u8) -> Option<Pubkey> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
+    use std::time::Instant;
+
+    use crate::hydration::types::{PoolUpdateExtensions, SnapshotFreshness};
+
+    #[test]
+    fn reward_hook_contexts_fallback_to_vault() {
+        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let reward = LbClmmRewardInfo {
+            index: 0,
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+            funder: Pubkey::new_unique(),
+        };
+        let state = dummy_state_with_reward(reward.clone());
+        let contexts = adapter.build_reward_transfer_hook_contexts(&state, &reward, None, None);
+        assert_eq!(contexts.len(), 1);
+        let ctx = &contexts[0];
+        assert_eq!(ctx.source, reward.vault);
+        assert_eq!(ctx.destination, reward.vault);
+        assert_eq!(ctx.authority, state.lb_pair);
+    }
+
+    #[test]
+    fn reward_contexts_populate_without_resolver() {
+        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let reward = LbClmmRewardInfo {
+            index: 3,
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+            funder: Pubkey::new_unique(),
+        };
+        let state = dummy_state_with_reward(reward.clone());
+        let mut context = TemplateContext::default();
+        let owner = Pubkey::new_unique();
+        context.payer = Some(owner);
+
+        adapter.attach_reward_transfer_hook_accounts(None, None, &state, &mut context);
+
+        assert_eq!(context.lb_clmm_reward_accounts.len(), 1);
+        let entry = &context.lb_clmm_reward_accounts[0];
+        assert_eq!(entry.pool, state.lb_pair);
+        assert_eq!(entry.index, reward.index);
+        assert_eq!(entry.mint, reward.mint);
+        assert_eq!(entry.vault, reward.vault);
+        assert_eq!(entry.funder, reward.funder);
+        assert_eq!(entry.token_program, *SPL_TOKEN_PROGRAM_PUBKEY);
+        let expected_ata =
+            derive_associated_token_address(&owner, &reward.mint, &*SPL_TOKEN_PROGRAM_PUBKEY);
+        assert_eq!(entry.user_token_account, Some(expected_ata));
+        assert!(entry.transfer_hook_accounts.is_empty());
+        assert!(context.lb_clmm_remaining_accounts.is_empty());
+    }
+
+    #[test]
+    fn reward_contexts_deduplicate_when_reused() {
+        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let reward = LbClmmRewardInfo {
+            index: 5,
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+            funder: Pubkey::new_unique(),
+        };
+        let state = dummy_state_with_reward(reward.clone());
+        let mut context = TemplateContext::default();
+
+        adapter.attach_reward_transfer_hook_accounts(None, None, &state, &mut context);
+        adapter.attach_reward_transfer_hook_accounts(None, None, &state, &mut context);
+
+        assert_eq!(context.lb_clmm_reward_accounts.len(), 1);
+        let entry = &context.lb_clmm_reward_accounts[0];
+        assert_eq!(entry.pool, state.lb_pair);
+        assert_eq!(entry.index, reward.index);
+    }
+
+    #[test]
+    fn reward_contexts_skip_user_account_without_owner() {
+        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let reward = LbClmmRewardInfo {
+            index: 7,
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+            funder: Pubkey::new_unique(),
+        };
+        let state = dummy_state_with_reward(reward.clone());
+        let mut context = TemplateContext::default();
+
+        adapter.attach_reward_transfer_hook_accounts(None, None, &state, &mut context);
+
+        assert_eq!(context.lb_clmm_reward_accounts.len(), 1);
+        let entry = &context.lb_clmm_reward_accounts[0];
+        assert_eq!(entry.pool, state.lb_pair);
+        assert!(entry.user_token_account.is_none());
+    }
+
+    fn dummy_state_with_reward(reward: LbClmmRewardInfo) -> LbClmmState {
+        LbClmmState {
+            lb_pair: Pubkey::new_unique(),
+            token_x_mint: Pubkey::new_unique(),
+            token_y_mint: Pubkey::new_unique(),
+            token_x_program: Some(*SPL_TOKEN_PROGRAM_PUBKEY),
+            token_y_program: Some(*SPL_TOKEN_PROGRAM_PUBKEY),
+            token_x_transfer_fee: None,
+            token_y_transfer_fee: None,
+            reserve_x: Some(Pubkey::new_unique()),
+            reserve_y: Some(Pubkey::new_unique()),
+            oracle: None,
+            bin_array_bitmap_extension: None,
+            host_fee_account: None,
+            rewards: vec![reward],
+            bin_step: None,
+            active_bin_id: None,
+            dynamic_fee_bps: None,
+            protocol_fee_bps: None,
+            reserve_x_balance: None,
+            reserve_y_balance: None,
+            volatility_bps: None,
+            bin_liquidity: BTreeMap::new(),
+            active_bitmap: None,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+        }
+    }
 
     #[test]
     fn parses_lb_pair_account_static_fields() {
@@ -2146,8 +3055,14 @@ mod tests {
         let oracle = Pubkey::new_unique();
         let active_bin_id = 42;
         let bin_step = 25;
+        let reward_mint = Pubkey::new_unique();
+        let reward_vault = Pubkey::new_unique();
+        let reward_funder = Pubkey::new_unique();
+        let extra_reward_mint = Pubkey::new_unique();
+        let extra_reward_vault = Pubkey::new_unique();
+        let extra_reward_funder = Pubkey::new_unique();
 
-        let mut data = vec![0u8; LB_PAIR_ACCOUNT_MIN_LEN];
+        let mut data = vec![0u8; LB_PAIR_ACCOUNT_MIN_LEN + REWARD_INFO_LEN];
         let mut cursor = STATIC_PARAMETERS_LEN + VARIABLE_PARAMETERS_LEN;
         cursor += 1 + 2 + 1; // bump, seed, pair_type
         write_i32(&mut data, &mut cursor, active_bin_id);
@@ -2157,7 +3072,22 @@ mod tests {
         write_pubkey(&mut data, &mut cursor, token_y);
         write_pubkey(&mut data, &mut cursor, reserve_x);
         write_pubkey(&mut data, &mut cursor, reserve_y);
-        cursor += PROTOCOL_FEE_LEN + 32 + REWARD_INFO_LEN * REWARD_INFO_COUNT;
+        cursor += PROTOCOL_FEE_LEN + 32;
+        write_reward_entry(
+            &mut data,
+            &mut cursor,
+            reward_mint,
+            reward_vault,
+            reward_funder,
+        );
+        cursor += REWARD_INFO_LEN; // leave second reward empty
+        write_reward_entry(
+            &mut data,
+            &mut cursor,
+            extra_reward_mint,
+            extra_reward_vault,
+            extra_reward_funder,
+        );
         write_pubkey(&mut data, &mut cursor, oracle);
         cursor += BIN_ARRAY_BITMAP_BYTES + 8 + 32 + PUBKEY_BYTES * 2 + 8 + 8 + 8 + 8 + PUBKEY_BYTES;
         data[cursor] = 0;
@@ -2174,6 +3104,15 @@ mod tests {
         assert_eq!(meta.bin_step, bin_step);
         assert_eq!(meta.token_x_program, Some(*SPL_TOKEN_PROGRAM_PUBKEY));
         assert_eq!(meta.token_y_program, Some(*SPL_TOKEN_2022_PROGRAM_PUBKEY));
+        assert_eq!(meta.rewards.len(), 2);
+        assert_eq!(meta.rewards[0].index, 0);
+        assert_eq!(meta.rewards[0].mint, reward_mint);
+        assert_eq!(meta.rewards[0].vault, reward_vault);
+        assert_eq!(meta.rewards[0].funder, reward_funder);
+        assert_eq!(meta.rewards[1].index, 2);
+        assert_eq!(meta.rewards[1].mint, extra_reward_mint);
+        assert_eq!(meta.rewards[1].vault, extra_reward_vault);
+        assert_eq!(meta.rewards[1].funder, extra_reward_funder);
     }
 
     #[test]
@@ -2215,11 +3154,14 @@ mod tests {
             token_y_mint: token_y,
             token_x_program: None,
             token_y_program: None,
+            token_x_transfer_fee: None,
+            token_y_transfer_fee: None,
             reserve_x: None,
             reserve_y: None,
             oracle: None,
             bin_array_bitmap_extension: None,
             host_fee_account: None,
+            rewards: Vec::new(),
             bin_step: Some(100),
             active_bin_id: Some(0),
             dynamic_fee_bps: Some(0),
@@ -2279,11 +3221,14 @@ mod tests {
             token_y_mint: token_y,
             token_x_program: None,
             token_y_program: None,
+            token_x_transfer_fee: None,
+            token_y_transfer_fee: None,
             reserve_x: None,
             reserve_y: None,
             oracle: None,
             bin_array_bitmap_extension: None,
             host_fee_account: None,
+            rewards: Vec::new(),
             bin_step: Some(100),
             active_bin_id: Some(0),
             dynamic_fee_bps: Some(0),
@@ -2312,11 +3257,14 @@ mod tests {
             token_y_mint: Pubkey::new_unique(),
             token_x_program: None,
             token_y_program: None,
+            token_x_transfer_fee: None,
+            token_y_transfer_fee: None,
             reserve_x: None,
             reserve_y: None,
             oracle: None,
             bin_array_bitmap_extension: None,
             host_fee_account: None,
+            rewards: Vec::new(),
             bin_step: None,
             active_bin_id: None,
             dynamic_fee_bps: Some(9_900),
@@ -2422,6 +3370,172 @@ mod tests {
         assert!(context.output_token_account.is_none());
     }
 
+    #[test]
+    fn decorate_swap_context_sets_transfer_fee_hints() {
+        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let mut state = default_state();
+        state.token_x_transfer_fee = Some(TokenTransferFee::new(TransferFee {
+            epoch: 1.into(),
+            maximum_fee: 10.into(),
+            transfer_fee_basis_points: 25.into(),
+        }));
+        let mut context = TemplateContext::default();
+        adapter.decorate_swap_context(&state, &mut context, state.token_x_mint, state.token_y_mint);
+        let hint = context
+            .input_transfer_fee_config
+            .expect("expected transfer-fee hint");
+        assert_eq!(hint.epoch, 1);
+        assert_eq!(hint.maximum_fee, 10);
+        assert_eq!(hint.basis_points, 25);
+    }
+
+    #[test]
+    fn quote_exact_out_accounts_for_transfer_fees() {
+        let mut adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let mut state = swap_ready_state();
+        let pool = state.lb_pair;
+        let input_fee = TokenTransferFee::new(TransferFee {
+            epoch: 0.into(),
+            maximum_fee: 10_000.into(),
+            transfer_fee_basis_points: 100.into(),
+        });
+        let output_fee = TokenTransferFee::new(TransferFee {
+            epoch: 0.into(),
+            maximum_fee: 10_000.into(),
+            transfer_fee_basis_points: 200.into(),
+        });
+        state.token_x_transfer_fee = Some(input_fee);
+        state.token_y_transfer_fee = Some(output_fee);
+        adapter.state.insert(pool, state.clone());
+
+        let req = QuoteRequest {
+            pool_id: pool,
+            input_mint: state.token_x_mint,
+            output_mint: state.token_y_mint,
+            amount: 50_000,
+            slot: 0,
+            block_time: None,
+            direction: SwapDirection::ExactOut,
+        };
+
+        let quote = adapter.quote_exact_out(req.clone()).expect("exact-out quote");
+        assert_eq!(quote.request.amount, req.amount);
+        assert!(quote.amount_out >= req.amount, "net output should satisfy target");
+        assert_eq!(quote.min_output_amount, Some(quote.amount_out));
+
+        let (gross_output, _) = apply_pre_fee_amount(req.amount, state.token_y_transfer_fee)
+            .expect("output fee inversion");
+        let (expected_input, _) = apply_pre_fee_amount(gross_output, state.token_x_transfer_fee)
+            .expect("input fee inversion");
+        assert!(
+            quote.amount_in >= expected_input,
+            "input should cover net + transfer fees"
+        );
+    }
+
+    #[test]
+    fn quote_exact_in_returns_stale_state() {
+        let mut config = LbClmmAdapterConfig::default();
+        config.stale_after_ms = 1;
+        config.stale_slot_threshold = 1;
+        let mut adapter = LbClmmAdapter::new(config, None);
+        let mut state = swap_ready_state();
+        state.last_update_slot = 0;
+        state.last_update_at = Instant::now() - Duration::from_secs(60);
+        adapter.state.insert(state.lb_pair, state.clone());
+
+        let req = QuoteRequest {
+            pool_id: state.lb_pair,
+            input_mint: state.token_x_mint,
+            output_mint: state.token_y_mint,
+            amount: 1_000,
+            slot: 1_000,
+            block_time: None,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let response = adapter
+            .quote_exact_in(req)
+            .expect("stale quote should produce response");
+        assert_eq!(response.status, QuoteStatus::StaleState);
+        assert_eq!(response.amount_out, 0);
+    }
+
+    #[test]
+    fn quote_exact_out_returns_stale_state() {
+        let mut config = LbClmmAdapterConfig::default();
+        config.stale_after_ms = 1;
+        config.stale_slot_threshold = 1;
+        let mut adapter = LbClmmAdapter::new(config, None);
+        let mut state = swap_ready_state();
+        state.last_update_slot = 0;
+        state.last_update_at = Instant::now() - Duration::from_secs(60);
+        adapter.state.insert(state.lb_pair, state.clone());
+
+        let req = QuoteRequest {
+            pool_id: state.lb_pair,
+            input_mint: state.token_x_mint,
+            output_mint: state.token_y_mint,
+            amount: 1_000,
+            slot: 1_000,
+            block_time: None,
+            direction: SwapDirection::ExactOut,
+        };
+
+        let response = adapter
+            .quote_exact_out(req)
+            .expect("stale quote should produce response");
+        assert_eq!(response.status, QuoteStatus::StaleState);
+        assert_eq!(response.amount_out, 0);
+    }
+
+    #[test]
+    fn bidirectional_quotes_skip_stale_state() {
+        let mut adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let mut state = swap_ready_state();
+        state.last_update_slot = 0;
+        state.last_update_at = Instant::now() - Duration::from_secs(60);
+        adapter.state.insert(state.lb_pair, state.clone());
+
+        let snapshot = PoolSnapshot {
+            pool_id: state.lb_pair.to_string(),
+            program_id: LB_CLMM_PROGRAM_ID.to_string(),
+            slot: 10_000,
+            block_hash: None,
+            block_time_unix: None,
+            base_mint: state.token_x_mint.to_string(),
+            quote_mint: state.token_y_mint.to_string(),
+            base_post_amount: 1_000_000,
+            quote_post_amount: 2_000_000,
+            updated_at: Instant::now(),
+            freshness: SnapshotFreshness::LiveCorecast,
+            allow_reserve_backfill: true,
+            quotes: None,
+            extensions: PoolUpdateExtensions::default(),
+        };
+
+        assert!(adapter.bidirectional_quotes(&snapshot).is_none());
+    }
+
+    fn swap_ready_state() -> LbClmmState {
+        let mut state = default_state();
+        state.dynamic_fee_bps = Some(0);
+        state.protocol_fee_bps = Some(0);
+        state.reserve_x_balance = Some(1_000_000);
+        state.reserve_y_balance = Some(1_000_000);
+        let mut liquidity = BTreeMap::new();
+        liquidity.insert(
+            0,
+            LbClmmBinSnapshot {
+                bin_id: 0,
+                liquidity_x: 5_000_000,
+                liquidity_y: 5_000_000,
+            },
+        );
+        state.bin_liquidity = liquidity;
+        state
+    }
+
     fn default_state() -> LbClmmState {
         LbClmmState {
             lb_pair: Pubkey::new_unique(),
@@ -2429,11 +3543,14 @@ mod tests {
             token_y_mint: Pubkey::new_unique(),
             token_x_program: Some(*SPL_TOKEN_PROGRAM_PUBKEY),
             token_y_program: Some(*SPL_TOKEN_2022_PROGRAM_PUBKEY),
+            token_x_transfer_fee: None,
+            token_y_transfer_fee: None,
             reserve_x: None,
             reserve_y: None,
             oracle: None,
             bin_array_bitmap_extension: None,
             host_fee_account: None,
+            rewards: Vec::new(),
             bin_step: Some(10),
             active_bin_id: Some(0),
             dynamic_fee_bps: None,
@@ -2476,5 +3593,28 @@ mod tests {
         let end = *cursor + 8;
         data[*cursor..end].copy_from_slice(&value.to_le_bytes());
         *cursor = end;
+    }
+
+    fn write_u128(data: &mut [u8], cursor: &mut usize, value: u128) {
+        let end = *cursor + 16;
+        data[*cursor..end].copy_from_slice(&value.to_le_bytes());
+        *cursor = end;
+    }
+
+    fn write_reward_entry(
+        data: &mut [u8],
+        cursor: &mut usize,
+        mint: Pubkey,
+        vault: Pubkey,
+        funder: Pubkey,
+    ) {
+        write_pubkey(data, cursor, mint);
+        write_pubkey(data, cursor, vault);
+        write_pubkey(data, cursor, funder);
+        write_u64(data, cursor, 10);
+        write_u64(data, cursor, 11);
+        write_u128(data, cursor, 12);
+        write_u64(data, cursor, 13);
+        write_u64(data, cursor, 14);
     }
 }

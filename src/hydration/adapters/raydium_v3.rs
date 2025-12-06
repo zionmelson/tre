@@ -16,15 +16,23 @@ use solana_client::rpc_config::{
 use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
 use solana_client::rpc_response::{UiAccount, UiAccountData};
 use solana_sdk::pubkey::Pubkey;
+use spl_token_2022::extension::{
+    transfer_fee::{TransferFee as SplTokenTransferFee, TransferFeeConfig as SplTransferFeeConfig},
+    BaseStateWithExtensions, StateWithExtensionsOwned,
+};
+use spl_token_2022::state::Mint as Token2022Mint;
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
 use crate::builder::{AmmV3PoolMeta, BuilderHandle};
-use crate::hydration::types::{
-    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, RaydiumV3PoolExtras,
-    RAYDIUM_V3_INPUT_UTILIZATION_BPS,
+use crate::hydration::token_fees::{
+    apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee,
 };
-use crate::template::TemplateContext;
+use crate::hydration::types::{
+    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate, RaydiumTransferFeeConfig,
+    RaydiumV3PoolExtras, RAYDIUM_V3_INPUT_UTILIZATION_BPS,
+};
+use crate::template::{TemplateContext, TransferFeeConfigHint};
 
 use super::hydration::AsyncHydrator;
 use super::{
@@ -32,7 +40,10 @@ use super::{
 };
 
 const RAYDIUM_V3_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const RAYDIUM_CLMM_PROGRAM: Pubkey =
+    solana_sdk::pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 const POOL_VAULT_SEED: &[u8] = b"pool_vault";
+const POOL_TICK_ARRAY_BITMAP_SEED: &[u8] = b"pool_tick_array_bitmap_extension";
 const TICK_ARRAY_STATE_DISCRIMINATOR: [u8; 8] = [192, 155, 85, 205, 49, 249, 129, 42];
 const POOL_STATE_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
 const AMM_CONFIG_STATE_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 43, 111];
@@ -68,14 +79,11 @@ pub use u256::U256;
 
 #[derive(Debug, Clone, Copy)]
 struct ClmmSwapSimulation {
-    amount_out: u64,
+    executed_input_amount: u64,
+    net_output_amount: u64,
     sqrt_price_after: u128,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct QuoteOutcome {
-    amount_out: u64,
-    sqrt_price_limit: Option<u128>,
+    protocol_fee_amount: u64,
+    fund_fee_amount: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,6 +96,60 @@ struct TickArrayCache {
 struct TickArrayCacheEntry {
     hydrated_at: Instant,
     accounts: Vec<Pubkey>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransferFeeConfigSummary {
+    epoch: u64,
+    maximum_fee: u64,
+    basis_points: u16,
+}
+
+impl From<RaydiumTransferFeeConfig> for TransferFeeConfigSummary {
+    fn from(value: RaydiumTransferFeeConfig) -> Self {
+        Self {
+            epoch: value.epoch,
+            maximum_fee: value.maximum_fee,
+            basis_points: value.basis_points,
+        }
+    }
+}
+
+impl From<TransferFeeConfigSummary> for TransferFeeConfigHint {
+    fn from(value: TransferFeeConfigSummary) -> Self {
+        Self {
+            epoch: value.epoch,
+            maximum_fee: value.maximum_fee,
+            basis_points: value.basis_points,
+        }
+    }
+}
+
+impl From<TransferFeeConfigSummary> for RaydiumTransferFeeConfig {
+    fn from(value: TransferFeeConfigSummary) -> Self {
+        Self {
+            epoch: value.epoch,
+            maximum_fee: value.maximum_fee,
+            basis_points: value.basis_points,
+        }
+    }
+}
+
+impl From<TransferFeeConfigSummary> for TokenTransferFee {
+    fn from(value: TransferFeeConfigSummary) -> Self {
+        let fee = SplTokenTransferFee {
+            epoch: value.epoch.into(),
+            maximum_fee: value.maximum_fee.into(),
+            transfer_fee_basis_points: value.basis_points.into(),
+        };
+        TokenTransferFee::new(fee)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MintAccountMeta {
+    program: Pubkey,
+    transfer_fee_config: Option<TransferFeeConfigSummary>,
 }
 
 const DEFAULT_RAYDIUM_HYDRATION_RETRY_MS: u64 = 10_000;
@@ -208,12 +270,21 @@ impl RaydiumV3Adapter {
             observation_bump,
             vault_bumps,
             trade_fee_rate,
-            protocol_fee_rate: _,
+            protocol_fee_rate,
+            fund_fee_rate,
             base_token_program,
             quote_token_program,
+            tick_array_bitmap_extension,
+            pool_status,
+            base_transfer_fee_config,
+            quote_transfer_fee_config,
         } = extras;
 
         let trade_fee_bps = trade_fee_rate.map(fee_bps_from_hundredth_bip);
+        let protocol_fee_bps = protocol_fee_rate.and_then(fee_bps_from_hundredth_bip_u16);
+        let fund_fee_bps = fund_fee_rate.and_then(fee_bps_from_hundredth_bip_u16);
+        let base_transfer_fee = base_transfer_fee_config.map(TransferFeeConfigSummary::from);
+        let quote_transfer_fee = quote_transfer_fee_config.map(TransferFeeConfigSummary::from);
 
         let tick_array_cache = self
             .state
@@ -241,6 +312,12 @@ impl RaydiumV3Adapter {
             observation_bump,
             vault_bumps,
             trade_fee_bps,
+            protocol_fee_bps,
+            fund_fee_bps,
+            tick_array_bitmap_extension,
+            pool_status,
+            base_transfer_fee,
+            quote_transfer_fee,
             tick_array_cache,
         };
 
@@ -281,6 +358,11 @@ impl RaydiumV3Adapter {
             extras.pool_bump = extras.pool_bump.or(Some(meta.pool_bump));
             extras.trade_fee_rate = extras.trade_fee_rate.or(meta.trade_fee_rate);
             extras.protocol_fee_rate = extras.protocol_fee_rate.or(meta.protocol_fee_rate);
+            extras.fund_fee_rate = extras.fund_fee_rate.or(meta.fund_fee_rate);
+            extras.tick_array_bitmap_extension = extras
+                .tick_array_bitmap_extension
+                .or(Some(meta.tick_array_bitmap_extension));
+            extras.pool_status = extras.pool_status.or(Some(meta.pool_status));
         }
 
         extras.base_token_program = extras
@@ -289,6 +371,17 @@ impl RaydiumV3Adapter {
         extras.quote_token_program = extras
             .quote_token_program
             .or_else(|| hydrator.lookup_mint_program(quote_mint));
+
+        if extras.base_transfer_fee_config.is_none() {
+            extras.base_transfer_fee_config = hydrator
+                .mint_transfer_fee_config(base_mint)
+                .map(Into::into);
+        }
+        if extras.quote_transfer_fee_config.is_none() {
+            extras.quote_transfer_fee_config = hydrator
+                .mint_transfer_fee_config(quote_mint)
+                .map(Into::into);
+        }
 
         extras
     }
@@ -394,6 +487,14 @@ impl RaydiumV3Adapter {
     ) {
         context.requires_memo = false;
         context.requires_dont_front = false;
+        if context.raydium_tick_array_bitmap_extension.is_none() {
+            context.raydium_tick_array_bitmap_extension = state.tick_array_bitmap_extension;
+        }
+        context.raydium_pool_status = state.pool_status;
+        context.raydium_protocol_fee_bps = state.protocol_fee_bps;
+        context.raydium_fund_fee_bps = state.fund_fee_bps;
+        context.input_transfer_fee_config = Self::transfer_fee_hint_for_mint(state, input_mint);
+        context.output_transfer_fee_config = Self::transfer_fee_hint_for_mint(state, output_mint);
         if context.input_token_program.is_none() {
             context.input_token_program = self.mint_program_for(state, input_mint);
         }
@@ -455,7 +556,38 @@ impl RaydiumV3Adapter {
         }
     }
 
+    fn transfer_fee_hint_for_mint(
+        state: &RaydiumV3State,
+        mint: Pubkey,
+    ) -> Option<TransferFeeConfigHint> {
+        Self::transfer_fee_summary_for_mint(state, mint)
+            .map(TransferFeeConfigHint::from)
+    }
+
+    fn transfer_fee_model_for_mint(
+        state: &RaydiumV3State,
+        mint: Pubkey,
+    ) -> Option<TokenTransferFee> {
+        Self::transfer_fee_summary_for_mint(state, mint).map(TokenTransferFee::from)
+    }
+
+    fn transfer_fee_summary_for_mint(
+        state: &RaydiumV3State,
+        mint: Pubkey,
+    ) -> Option<TransferFeeConfigSummary> {
+        if mint == state.base_mint {
+            state.base_transfer_fee
+        } else if mint == state.quote_mint {
+            state.quote_transfer_fee
+        } else {
+            None
+        }
+    }
+
     fn clamp_request_amount(&self, state: &RaydiumV3State, req: &QuoteRequest) -> u64 {
+        if req.amount == 0 {
+            return 0;
+        }
         let reserve = if req.input_mint == state.base_mint {
             state.vault_base
         } else if req.input_mint == state.quote_mint {
@@ -463,17 +595,39 @@ impl RaydiumV3Adapter {
         } else {
             return req.amount;
         };
-        let capped = clamp_reserve_to_utilization(reserve, self.config.max_swap_utilization_bps);
+        let utilization_bps = self.config.max_swap_utilization_bps.min(10_000);
+        let capped = reserve.saturating_mul(utilization_bps as u128) / 10_000;
         if capped == 0 {
-            0
-        } else {
-            let limit = capped.min(u64::MAX as u128) as u64;
-            if limit == 0 {
-                0
-            } else {
-                req.amount.min(limit)
-            }
+            return 0;
         }
+        let limit = capped.min(u64::MAX as u128) as u64;
+        if limit == 0 {
+            return 0;
+        }
+        req.amount.min(limit)
+    }
+
+    fn clamp_request_output_amount(&self, state: &RaydiumV3State, req: &QuoteRequest) -> u64 {
+        if req.amount == 0 {
+            return 0;
+        }
+        let reserve = if req.output_mint == state.base_mint {
+            state.vault_base
+        } else if req.output_mint == state.quote_mint {
+            state.vault_quote
+        } else {
+            return 0;
+        };
+        let utilization_bps = self.config.max_swap_utilization_bps.min(10_000);
+        let capped = reserve.saturating_mul(utilization_bps as u128) / 10_000;
+        if capped == 0 {
+            return 0;
+        }
+        let limit = capped.min(u64::MAX as u128) as u64;
+        if limit == 0 {
+            return 0;
+        }
+        req.amount.min(limit)
     }
 
     fn resolve_tick_arrays(
@@ -542,20 +696,28 @@ impl RaydiumV3Adapter {
         &self,
         state: &RaydiumV3State,
         req: &QuoteRequest,
-    ) -> Option<ClmmSwapSimulation> {
-        let hydrator = self.hydrator.as_ref()?;
-        let tick_spacing = state.tick_spacing?;
-        let mut current_tick = state.current_tick?;
-        let sqrt_price_x64 = state.sqrt_price_x64?;
-        let mut liquidity = state.liquidity?;
+    ) -> Result<ClmmSwapSimulation, QuoteStatus> {
+        let hydrator = self.hydrator.as_ref().ok_or(QuoteStatus::MissingState)?;
+        let tick_spacing = state.tick_spacing.ok_or(QuoteStatus::MissingState)?;
+        let mut current_tick = state.current_tick.ok_or(QuoteStatus::MissingState)?;
+        let sqrt_price_x64 = state.sqrt_price_x64.ok_or(QuoteStatus::MissingState)?;
+        let mut liquidity = state.liquidity.ok_or(QuoteStatus::MissingState)?;
         if liquidity == 0 || req.amount == 0 {
-            return None;
+            return Err(QuoteStatus::InsufficientLiquidity);
         }
 
         let Some(zero_for_one) = classify_swap_direction(state, req.input_mint, req.output_mint)
         else {
-            return None;
+            return Err(QuoteStatus::MissingState);
         };
+
+        let input_transfer_fee = Self::transfer_fee_model_for_mint(state, req.input_mint);
+        let output_transfer_fee = Self::transfer_fee_model_for_mint(state, req.output_mint);
+        let (swap_budget, _) = apply_post_fee_amount(req.amount, input_transfer_fee)
+            .ok_or(QuoteStatus::TokenFeeUnsupported)?;
+        if swap_budget == 0 {
+            return Err(QuoteStatus::TokenFeeUnsupported);
+        }
 
         let mut sqrt_price_x96 = math::to_x96(sqrt_price_x64);
         let sqrt_limit_tick = if zero_for_one {
@@ -565,10 +727,17 @@ impl RaydiumV3Adapter {
         };
         let sqrt_price_limit_x96 = math::sqrt_price_at_tick_x96(sqrt_limit_tick)?;
 
-        let mut cursor = TickArrayCursor::new(hydrator, state.pool_id, tick_spacing)?;
-        let mut amount_remaining = req.amount as u128;
+        let mut cursor = TickArrayCursor::new(hydrator, state.pool_id, tick_spacing)
+            .ok_or(QuoteStatus::MissingTickArrays)?;
+        let mut amount_remaining = swap_budget as u128;
+        let mut pool_input_consumed = 0u128;
+        let mut trade_fee_total = 0u128;
         let mut amount_out_accum = 0u128;
+        let mut protocol_fee_total = 0u128;
+        let mut fund_fee_total = 0u128;
         let fee_bps = state.trade_fee_bps.unwrap_or(DEFAULT_FEE_BPS);
+        let protocol_rate = u128::from(state.protocol_fee_bps.unwrap_or(0));
+        let fund_rate = u128::from(state.fund_fee_bps.unwrap_or(0));
         let mut steps = 0usize;
 
         while amount_remaining > 0 && liquidity > 0 && sqrt_price_x96 != sqrt_price_limit_x96 {
@@ -599,17 +768,33 @@ impl RaydiumV3Adapter {
                 amount_remaining,
                 fee_bps,
                 zero_for_one,
-            )?;
+            ).ok_or(QuoteStatus::MissingTickArrays)?;
 
             if step.amount_in == 0 {
                 break;
             }
 
             sqrt_price_x96 = step.sqrt_price_next;
-            amount_remaining = amount_remaining
-                .saturating_sub(step.amount_in)
-                .saturating_sub(step.fee_amount);
+            let total_spent = step.amount_in.saturating_add(step.fee_amount);
+            amount_remaining = amount_remaining.saturating_sub(total_spent);
+            pool_input_consumed = pool_input_consumed.saturating_add(step.amount_in);
+            trade_fee_total = trade_fee_total.saturating_add(step.fee_amount);
             amount_out_accum = amount_out_accum.saturating_add(step.amount_out);
+
+            if protocol_rate > 0 {
+                let delta = step
+                    .fee_amount
+                    .saturating_mul(protocol_rate)
+                    / RAYDIUM_FEE_RATE_DENOMINATOR;
+                protocol_fee_total = protocol_fee_total.saturating_add(delta);
+            req.amount.min(cap.min(u64::MAX as u128) as u64)
+            if fund_rate > 0 {
+                let delta = step
+                    .fee_amount
+                    .saturating_mul(fund_rate)
+                    / RAYDIUM_FEE_RATE_DENOMINATOR;
+                fund_fee_total = fund_fee_total.saturating_add(delta);
+            }
 
             if sqrt_price_x96 == target_price {
                 if let Some(init_tick) = crossing {
@@ -619,7 +804,8 @@ impl RaydiumV3Adapter {
                         init_tick.index
                     };
                     liquidity =
-                        apply_liquidity_delta(liquidity, init_tick.liquidity_net, zero_for_one)?;
+                        apply_liquidity_delta(liquidity, init_tick.liquidity_net, zero_for_one)
+                            .map_err(|_| QuoteStatus::InsufficientLiquidity)?;
                 } else {
                     break;
                 }
@@ -628,24 +814,99 @@ impl RaydiumV3Adapter {
             }
         }
 
-        if amount_out_accum == 0 {
-            None
-        } else {
-            let amount_out = amount_out_accum.min(u64::MAX as u128) as u64;
-            let sqrt_price_after = sqrt_price_x64_from_x96(&sqrt_price_x96);
-            Some(ClmmSwapSimulation {
-                amount_out,
-                sqrt_price_after,
-            })
+        if amount_out_accum == 0 || pool_input_consumed == 0 {
+            return Err(QuoteStatus::InsufficientLiquidity);
         }
+
+        let amount_including_fees = pool_input_consumed.saturating_add(trade_fee_total);
+        if amount_including_fees == 0 {
+            return None;
+        }
+        let amount_including_fees_u64 = amount_including_fees.min(u64::MAX as u128) as u64;
+        let (executed_input_amount, _input_fee_amount) =
+            apply_pre_fee_amount(amount_including_fees_u64, input_transfer_fee)
+                .ok_or(QuoteStatus::TokenFeeUnsupported)?;
+
+        let raw_output = amount_out_accum.min(u64::MAX as u128) as u64;
+        let (net_output_amount, _output_fee_amount) =
+            apply_post_fee_amount(raw_output, output_transfer_fee)
+                .ok_or(QuoteStatus::TokenFeeUnsupported)?;
+        if net_output_amount == 0 {
+            return Err(QuoteStatus::InsufficientLiquidity);
+        }
+
+        let sqrt_price_after = sqrt_price_x64_from_x96(&sqrt_price_x96);
+        Ok(ClmmSwapSimulation {
+            executed_input_amount,
+            net_output_amount,
+            sqrt_price_after,
+            protocol_fee_amount: protocol_fee_total.min(u64::MAX as u128) as u64,
+            fund_fee_amount: fund_fee_total.min(u64::MAX as u128) as u64,
+        })
     }
 
-    fn quote_amount_out(&self, state: &RaydiumV3State, req: &QuoteRequest) -> Option<QuoteOutcome> {
-        let simulation = self.simulate_clmm_exact_in(state, req)?;
-        Some(QuoteOutcome {
-            amount_out: simulation.amount_out,
-            sqrt_price_limit: Some(simulation.sqrt_price_after),
-        })
+    fn quote_amount_out(&self, state: &RaydiumV3State, req: &QuoteRequest) -> Result<ClmmSwapSimulation, QuoteStatus> {
+        self.simulate_clmm_exact_in(state, req)
+    }
+
+    fn quote_amount_out_exact_out(
+        &self,
+        state: &RaydiumV3State,
+        req: &QuoteRequest,
+    ) -> Result<ClmmSwapSimulation, QuoteStatus> {
+        if req.amount == 0 {
+            return Err(QuoteStatus::InsufficientLiquidity);
+        }
+        let mut trial_req = QuoteRequest {
+            pool_id: req.pool_id,
+            input_mint: req.input_mint,
+            output_mint: req.output_mint,
+            amount: u64::MAX,
+            slot: req.slot,
+            block_time: req.block_time,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let max_input = self.clamp_request_amount(state, &trial_req);
+        if max_input == 0 {
+            return Err(QuoteStatus::InsufficientLiquidity);
+        }
+
+        trial_req.amount = 0;
+
+        let target = req.amount;
+        let mut low = 1u64;
+        let mut high = max_input;
+        let mut best: Option<ClmmSwapSimulation> = None;
+        let mut last_error = QuoteStatus::InsufficientLiquidity;
+
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            trial_req.amount = mid;
+            match self.quote_amount_out(state, &trial_req) {
+                Ok(sim) if sim.net_output_amount >= target => {
+                    best = Some(sim);
+                    if mid == 0 {
+                        break;
+                    }
+                    high = mid.saturating_sub(1);
+                }
+                Ok(_) => {
+                    low = mid.saturating_add(1);
+                }
+                Err(status) => {
+                    last_error = status;
+                    if mid == 0 {
+                        break;
+                    }
+                    high = mid.saturating_sub(1);
+                }
+            }
+        }
+
+        let mut simulation = best.ok_or(last_error)?;
+        simulation.net_output_amount = target;
+        Ok(simulation)
     }
 
     fn build_snapshot_side(
@@ -668,6 +929,27 @@ impl RaydiumV3Adapter {
             (state.quote_mint, state.base_mint)
         };
 
+        if state.is_disabled() {
+            return Some(self.unavailable_snapshot_side(
+                input_mint,
+                output_mint,
+                slot,
+                fee_bps,
+                template_fee_bps,
+                QuoteStatus::TradingDisabled,
+            ));
+        }
+        if state.is_stale(Some(slot), &self.config) {
+            return Some(self.unavailable_snapshot_side(
+                input_mint,
+                output_mint,
+                slot,
+                fee_bps,
+                template_fee_bps,
+                QuoteStatus::StaleState,
+            ));
+        }
+
         let req = QuoteRequest {
             pool_id,
             input_mint,
@@ -678,12 +960,19 @@ impl RaydiumV3Adapter {
             direction: SwapDirection::ExactIn,
         };
 
-        let quote = self.quote_amount_out(state, &req)?;
-        let execution_price = if probe_amount == 0 {
-            0.0
-        } else {
-            quote.amount_out as f64 / probe_amount as f64
+        let simulation = match self.quote_amount_out(state, &req) {
+            Ok(sim) => sim,
+            Err(status) => {
+                let mut response = build_quote_response(req, 0);
+                response.status = status;
+                return Some(response);
+            }
         };
+        if simulation.executed_input_amount == 0 {
+            return None;
+        }
+        let execution_price = simulation.net_output_amount as f64
+            / simulation.executed_input_amount as f64;
 
         let reference_price = match state.mid_price() {
             Some(mid) if mid > 0.0 => {
@@ -703,13 +992,13 @@ impl RaydiumV3Adapter {
         Some(PoolQuoteSide {
             input_mint: input_mint.to_string(),
             output_mint: output_mint.to_string(),
-            notional: probe_amount,
-            expected_output: quote.amount_out,
+            notional: simulation.executed_input_amount,
+            expected_output: simulation.net_output_amount,
             fee_bps,
             template_fee_bps,
             effective_price: execution_price,
             estimated_slippage_bps: slippage,
-            sqrt_price_limit: quote.sqrt_price_limit,
+            sqrt_price_limit: Some(simulation.sqrt_price_after),
             min_output_amount: None,
             limit_price: None,
             price_impact_limit_bps: None,
@@ -721,6 +1010,11 @@ impl RaydiumV3Adapter {
                     ..Default::default()
                 };
                 self.decorate_quote_context(&mut context, state, input_mint, output_mint);
+                context.expected_fee_amount = Some(
+                    simulation
+                        .protocol_fee_amount
+                        .saturating_add(simulation.fund_fee_amount),
+                );
                 context
             },
             status: QuoteStatus::Ok,
@@ -729,6 +1023,38 @@ impl RaydiumV3Adapter {
             tick_arrays_used: Vec::new(),
             cache_slot: Some(slot),
         })
+    }
+
+    fn unavailable_snapshot_side(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        slot: u64,
+        fee_bps: u64,
+        template_fee_bps: u16,
+        status: QuoteStatus,
+    ) -> PoolQuoteSide {
+        PoolQuoteSide {
+            input_mint: input_mint.to_string(),
+            output_mint: output_mint.to_string(),
+            notional: 0,
+            expected_output: 0,
+            fee_bps,
+            template_fee_bps,
+            effective_price: 0.0,
+            estimated_slippage_bps: 0.0,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            amount_specified_is_input: true,
+            context: TemplateContext::default(),
+            status,
+            sqrt_price_before_x64: None,
+            sqrt_price_after_x64: None,
+            tick_arrays_used: Vec::new(),
+            cache_slot: Some(slot),
+        }
     }
 }
 
@@ -758,22 +1084,87 @@ impl ProtocolAdapter for RaydiumV3Adapter {
         self.upsert_state(update, RaydiumV3PoolExtras::default());
     }
 
-    fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
+    fn quote_exact_in(&self, mut req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
         }
         let state = self.get_state(&req.pool_id)?;
-        let mut clamped_req = req;
-        clamped_req.amount = self.clamp_request_amount(&state, &clamped_req);
-        if clamped_req.amount == 0 {
+        if state.is_disabled() {
+            let mut response = build_quote_response(req, 0);
+            response.status = QuoteStatus::TradingDisabled;
+            return Some(response);
+        }
+        if state.is_stale(Some(req.slot), &self.config) {
+            let mut response = build_quote_response(req, 0);
+            response.status = QuoteStatus::StaleState;
+            return Some(response);
+        }
+        req.amount = self.clamp_request_amount(&state, &req);
+        if req.amount == 0 {
             return None;
         }
-        let quote = self.quote_amount_out(&state, &clamped_req)?;
-        let mut response = build_quote_response(clamped_req, quote.amount_out);
-        response.sqrt_price_limit = quote.sqrt_price_limit;
-        response.min_output_amount = Some(quote.amount_out);
+        let simulation = self.quote_amount_out(&state, &req)?;
+        let mut response = build_quote_response(req, simulation.net_output_amount);
+        response.amount_in = simulation.executed_input_amount;
+        response.sqrt_price_limit = Some(simulation.sqrt_price_after);
+        response.min_output_amount = Some(simulation.net_output_amount);
         response.context.compute_unit_limit = Some(RAYDIUM_DEFAULT_CU_LIMIT);
         response.context.compute_unit_price = Some(RAYDIUM_DEFAULT_CU_PRICE);
+        response.context.expected_fee_amount = Some(
+            simulation
+                .protocol_fee_amount
+                .saturating_add(simulation.fund_fee_amount),
+        );
+        self.decorate_quote_context(
+            &mut response.context,
+            &state,
+            response.request.input_mint,
+            response.request.output_mint,
+        );
+        Some(response)
+    }
+
+    fn quote_exact_out(&self, mut req: QuoteRequest) -> Option<QuoteResponse> {
+        if req.direction != SwapDirection::ExactOut {
+            return None;
+        }
+        let state = self.get_state(&req.pool_id)?;
+        if state.is_disabled() {
+            let mut response = build_quote_response(req, 0);
+            response.status = QuoteStatus::TradingDisabled;
+            return Some(response);
+        }
+        if state.is_stale(Some(req.slot), &self.config) {
+            let mut response = build_quote_response(req, 0);
+            response.status = QuoteStatus::StaleState;
+            return Some(response);
+        }
+
+        req.amount = self.clamp_request_output_amount(&state, &req);
+        if req.amount == 0 {
+            return None;
+        }
+
+        let simulation = match self.quote_amount_out_exact_out(&state, &req) {
+            Ok(sim) => sim,
+            Err(status) => {
+                let mut response = build_quote_response(req, 0);
+                response.status = status;
+                return Some(response);
+            }
+        };
+        let mut response = build_quote_response(req, req.amount);
+        response.amount_in = simulation.executed_input_amount;
+        response.amount_out = req.amount;
+        response.sqrt_price_limit = Some(simulation.sqrt_price_after);
+        response.min_output_amount = Some(req.amount);
+        response.context.compute_unit_limit = Some(RAYDIUM_DEFAULT_CU_LIMIT);
+        response.context.compute_unit_price = Some(RAYDIUM_DEFAULT_CU_PRICE);
+        response.context.expected_fee_amount = Some(
+            simulation
+                .protocol_fee_amount
+                .saturating_add(simulation.fund_fee_amount),
+        );
         self.decorate_quote_context(
             &mut response.context,
             &state,
@@ -811,6 +1202,7 @@ const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
 const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
 const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const BPS_DENOMINATOR_U128: u128 = 10_000;
+const RAYDIUM_FEE_RATE_DENOMINATOR: u128 = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct RaydiumV3State {
@@ -833,6 +1225,12 @@ pub struct RaydiumV3State {
     pub observation_bump: Option<u8>,
     pub vault_bumps: Option<[u8; 2]>,
     pub trade_fee_bps: Option<u64>,
+    pub protocol_fee_bps: Option<u16>,
+    pub fund_fee_bps: Option<u16>,
+    pub tick_array_bitmap_extension: Option<Pubkey>,
+    pub pool_status: Option<u8>,
+    pub base_transfer_fee: Option<TransferFeeConfigSummary>,
+    pub quote_transfer_fee: Option<TransferFeeConfigSummary>,
     tick_array_cache: TickArrayCache,
 }
 
@@ -842,6 +1240,19 @@ impl RaydiumV3State {
             return None;
         }
         Some(self.vault_quote as f64 / self.vault_base as f64)
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        matches!(self.pool_status, Some(status) if status != 0)
+    }
+
+    pub fn is_stale(&self, current_slot: Option<u64>, config: &RaydiumV3AdapterConfig) -> bool {
+        let slot_fresh = current_slot
+            .map(|slot| slot.saturating_sub(self.last_update_slot) <= config.stale_slot_threshold)
+            .unwrap_or(true);
+        let instant_fresh =
+            self.last_update_at.elapsed().as_millis() as u64 <= config.stale_after_ms;
+        !(slot_fresh && instant_fresh)
     }
 }
 
@@ -898,6 +1309,14 @@ fn order_mints_with_programs(
 fn derive_pool_vault_address(program_id: &Pubkey, pool_state: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[POOL_VAULT_SEED, pool_state.as_ref(), mint.as_ref()],
+        program_id,
+    )
+    .0
+}
+
+fn derive_tick_array_bitmap_extension(program_id: &Pubkey, pool_state: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[POOL_TICK_ARRAY_BITMAP_SEED, pool_state.as_ref()],
         program_id,
     )
     .0
@@ -1013,6 +1432,10 @@ fn fee_bps_from_hundredth_bip(rate: u32) -> u64 {
     ((rate as u64).saturating_add(50)) / 100
 }
 
+fn fee_bps_from_hundredth_bip_u16(rate: u32) -> Option<u16> {
+    u16::try_from(fee_bps_from_hundredth_bip(rate)).ok()
+}
+
 #[derive(Clone, Debug)]
 struct HydratedPoolMeta {
     amm_config: Pubkey,
@@ -1024,12 +1447,16 @@ struct HydratedPoolMeta {
     pool_bump: u8,
     trade_fee_rate: Option<u32>,
     protocol_fee_rate: Option<u32>,
+    fund_fee_rate: Option<u32>,
+    tick_array_bitmap_extension: Pubkey,
+    pool_status: u8,
 }
 
 #[derive(Clone, Debug)]
 struct HydratedAmmConfig {
     trade_fee_rate: u32,
     protocol_fee_rate: u32,
+    fund_fee_rate: u32,
 }
 
 #[allow(dead_code)]
@@ -1186,7 +1613,7 @@ struct RaydiumPoolHydrator {
     pool_cache: AsyncHydrator<Pubkey, HydratedPoolMeta>,
     tick_array_cache: DashMap<(Pubkey, i32), HydratedTickArray>,
     hydrated_tick_sets: DashSet<Pubkey>,
-    mint_program_cache: DashMap<Pubkey, Pubkey>,
+    mint_metadata_cache: DashMap<Pubkey, MintAccountMeta>,
     missing_mints: DashMap<Pubkey, Instant>,
     retry_backoff: Duration,
 }
@@ -1229,7 +1656,7 @@ impl RaydiumPoolHydrator {
             pool_cache,
             tick_array_cache: DashMap::new(),
             hydrated_tick_sets: DashSet::new(),
-            mint_program_cache: DashMap::new(),
+            mint_metadata_cache: DashMap::new(),
             missing_mints: DashMap::new(),
             retry_backoff,
         })
@@ -1244,7 +1671,16 @@ impl RaydiumPoolHydrator {
     }
 
     fn lookup_mint_program(&self, mint: Pubkey) -> Option<Pubkey> {
-        if let Some(entry) = self.mint_program_cache.get(&mint) {
+        self.mint_metadata(mint).map(|meta| meta.program)
+    }
+
+    fn mint_transfer_fee_config(&self, mint: Pubkey) -> Option<TransferFeeConfigSummary> {
+        self.mint_metadata(mint)
+            .and_then(|meta| meta.transfer_fee_config)
+    }
+
+    fn mint_metadata(&self, mint: Pubkey) -> Option<MintAccountMeta> {
+        if let Some(entry) = self.mint_metadata_cache.get(&mint) {
             return Some(*entry.value());
         }
         if self.should_skip_missing_mint(&mint) {
@@ -1255,9 +1691,18 @@ impl RaydiumPoolHydrator {
             match client.get_account(&mint) {
                 Ok(account) => {
                     let program = account.owner;
-                    self.mint_program_cache.insert(mint, program);
+                    let transfer_fee_config = if program == SPL_TOKEN_2022_PROGRAM_ID {
+                        parse_transfer_fee_config(&account.data)
+                    } else {
+                        None
+                    };
+                    let meta = MintAccountMeta {
+                        program,
+                        transfer_fee_config,
+                    };
+                    self.mint_metadata_cache.insert(mint, meta);
                     self.missing_mints.remove(&mint);
-                    return Some(program);
+                    return Some(meta);
                 }
                 Err(error) => {
                     if is_account_not_found(&error) {
@@ -1459,7 +1904,7 @@ impl RaydiumPoolHydrator {
     }
 }
 
-const MIN_RAYDIUM_POOL_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN + 261;
+const MIN_RAYDIUM_POOL_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN + 390;
 
 fn parse_amm_config_account(data: &[u8]) -> Option<HydratedAmmConfig> {
     if data.len() < MIN_RAYDIUM_AMM_CONFIG_ACCOUNT_LEN {
@@ -1477,14 +1922,17 @@ fn parse_amm_config_account(data: &[u8]) -> Option<HydratedAmmConfig> {
     skip_pubkey(data, &mut cursor)?; // owner
     let protocol_fee_rate = read_u32(data, &mut cursor)?;
     let trade_fee_rate = read_u32(data, &mut cursor)?;
+    skip_bytes(data, &mut cursor, 2)?; // tick_spacing
+    let fund_fee_rate = read_u32(data, &mut cursor)?;
 
     Some(HydratedAmmConfig {
         trade_fee_rate,
         protocol_fee_rate,
+        fund_fee_rate,
     })
 }
 
-fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
+fn parse_pool_account(data: &[u8], program_id: &Pubkey, pool_id: &Pubkey) -> Option<HydratedPoolMeta> {
     if data.len() < MIN_RAYDIUM_POOL_ACCOUNT_LEN {
         return None;
     }
@@ -1513,6 +1961,17 @@ fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
     let liquidity = read_u128(data, &mut cursor)?;
     let sqrt_price_x64 = read_u128(data, &mut cursor)?;
     let current_tick = read_i32(data, &mut cursor)?;
+    skip_bytes(data, &mut cursor, 2)?; // padding3
+    skip_bytes(data, &mut cursor, 2)?; // padding4
+    skip_bytes(data, &mut cursor, 16)?; // fee_growth_global_0_x64
+    skip_bytes(data, &mut cursor, 16)?; // fee_growth_global_1_x64
+    skip_bytes(data, &mut cursor, 8)?; // protocol_fees_token_0
+    skip_bytes(data, &mut cursor, 8)?; // protocol_fees_token_1
+    skip_bytes(data, &mut cursor, 16)?; // swap_in_amount_token_0
+    skip_bytes(data, &mut cursor, 16)?; // swap_out_amount_token_1
+    skip_bytes(data, &mut cursor, 16)?; // swap_in_amount_token_1
+    skip_bytes(data, &mut cursor, 16)?; // swap_out_amount_token_0
+    let pool_status = read_u8(data, &mut cursor)?;
 
     Some(HydratedPoolMeta {
         amm_config,
@@ -1524,6 +1983,9 @@ fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
         pool_bump,
         trade_fee_rate: None,
         protocol_fee_rate: None,
+        fund_fee_rate: None,
+        tick_array_bitmap_extension: derive_tick_array_bitmap_extension(program_id, pool_id),
+        pool_status,
     })
 }
 
@@ -1537,7 +1999,7 @@ fn fetch_raydium_pool_meta(
     for client in clients {
         match client.get_account(&pool) {
             Ok(account) => {
-                if let Some(mut meta) = parse_pool_account(&account.data) {
+                if let Some(mut meta) = parse_pool_account(&account.data, &RAYDIUM_CLMM_PROGRAM, &pool) {
                     attach_config_fees_from_cache(
                         &mut meta,
                         clients,
@@ -1577,7 +2039,8 @@ fn attach_config_fees_from_cache(
 ) {
     let trade_missing = meta.trade_fee_rate.is_none();
     let protocol_missing = meta.protocol_fee_rate.is_none();
-    if !(trade_missing || protocol_missing) {
+    let fund_missing = meta.fund_fee_rate.is_none();
+    if !(trade_missing || protocol_missing || fund_missing) {
         return;
     }
 
@@ -1593,6 +2056,9 @@ fn attach_config_fees_from_cache(
         }
         if protocol_missing {
             meta.protocol_fee_rate = Some(config.protocol_fee_rate);
+        }
+        if fund_missing {
+            meta.fund_fee_rate = Some(config.fund_fee_rate);
         }
     }
 }
@@ -1705,6 +2171,17 @@ fn decode_ui_account_bytes(account: &UiAccount) -> Option<Vec<u8>> {
         | UiAccountData::LegacyBinary(data) => BASE64_STANDARD.decode(data).ok(),
         _ => None,
     }
+}
+
+fn parse_transfer_fee_config(data: &[u8]) -> Option<TransferFeeConfigSummary> {
+    let state = StateWithExtensionsOwned::<Token2022Mint>::unpack(data.to_vec()).ok()?;
+    let config = state.get_extension::<SplTransferFeeConfig>().ok()?;
+    let fee = config.newer_transfer_fee;
+    Some(TransferFeeConfigSummary {
+        epoch: fee.epoch.into(),
+        maximum_fee: fee.maximum_fee.into(),
+        basis_points: fee.transfer_fee_basis_points.into(),
+    })
 }
 
 fn skip_pubkey(data: &[u8], cursor: &mut usize) -> Option<()> {
@@ -2100,13 +2577,19 @@ mod tests {
         let current_tick: i32 = -64;
         data[cursor..cursor + 4].copy_from_slice(&current_tick.to_le_bytes());
 
-        let meta = parse_pool_account(&data).expect("meta should parse");
+        let pool = Pubkey::new_unique();
+        let meta = parse_pool_account(&data, &RAYDIUM_CLMM_PROGRAM, &pool).expect("meta should parse");
         assert_eq!(meta.pool_bump, 5);
         assert_eq!(meta.tick_spacing, tick_spacing as i32);
         assert_eq!(meta.liquidity, liquidity);
         assert_eq!(meta.sqrt_price_x64, sqrt_price_x64);
         assert_eq!(meta.current_tick, current_tick);
         assert_eq!(meta.observation_state, observation);
+        assert_eq!(meta.pool_status, 0);
+        assert_eq!(
+            meta.tick_array_bitmap_extension,
+            derive_tick_array_bitmap_extension(&RAYDIUM_CLMM_PROGRAM, &pool)
+        );
     }
 
     #[test]

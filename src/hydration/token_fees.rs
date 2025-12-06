@@ -35,6 +35,10 @@ impl TokenTransferFee {
         let fee_amount = gross.checked_sub(post_fee_amount)?;
         Some((gross, fee_amount))
     }
+
+    pub fn config(&self) -> TransferFee {
+        self.fee
+    }
 }
 
 pub fn apply_post_fee_amount(amount: u64, fee: Option<TokenTransferFee>) -> Option<(u64, u64)> {
@@ -206,4 +210,28 @@ fn parse_transfer_fee_extension(
     let config = state.get_extension::<TransferFeeConfig>().ok()?;
     let fee = *config.get_epoch_fee(epoch);
     Some(TokenTransferFee::new(fee))
+}
+
+#[cfg(test)]
+impl TokenTransferFeeHydrator {
+    pub fn with_static(entries: Vec<(Pubkey, Option<TokenTransferFee>, Option<Pubkey>, Pubkey)>) -> Self {
+        let cache = Arc::new(DashMap::new());
+        for (mint, fee, hook_program, token_program) in entries {
+            cache.insert(
+                mint,
+                TransferFeeMeta {
+                    fee,
+                    transfer_hook_program_id: hook_program,
+                    token_program,
+                    hydrated_at: Instant::now(),
+                },
+            );
+        }
+        let hydrator = AsyncHydrator::with_cache("token_fee_static", 1, |_| None, cache);
+        Self {
+            hydrator,
+            retry_backoff: Duration::from_secs(1),
+            last_attempts: DashMap::new(),
+        }
+    }
 }

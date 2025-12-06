@@ -14,11 +14,12 @@ pub use self::cp_amm::{
 };
 pub use self::lb_clmm::{
     LbClmmBinArrayExtras, LbClmmBinLiquidityExtras, LbClmmBitmapExtras, LbClmmPoolExtras,
-    LB_CLMM_INPUT_UTILIZATION_BPS, LB_CLMM_PROGRAM_ID,
+    LbClmmRewardExtras, LB_CLMM_INPUT_UTILIZATION_BPS, LB_CLMM_PROGRAM_ID,
 };
 
 pub use self::raydium_v3::{
-    RaydiumV3PoolExtras, RAYDIUM_V3_INPUT_UTILIZATION_BPS, RAYDIUM_V3_PROGRAM_ID,
+    RaydiumTransferFeeConfig, RaydiumV3PoolExtras, RAYDIUM_V3_INPUT_UTILIZATION_BPS,
+    RAYDIUM_V3_PROGRAM_ID,
 };
 pub use self::whirlpool::{
     WhirlpoolAdaptiveFeeConstants, WhirlpoolAdaptiveFeeInfo, WhirlpoolAdaptiveFeeVariables,
@@ -108,8 +109,20 @@ mod raydium_v3 {
         pub vault_bumps: Option<[u8; 2]>,
         pub trade_fee_rate: Option<u32>,
         pub protocol_fee_rate: Option<u32>,
+        pub fund_fee_rate: Option<u32>,
         pub base_token_program: Option<Pubkey>,
         pub quote_token_program: Option<Pubkey>,
+        pub tick_array_bitmap_extension: Option<Pubkey>,
+        pub pool_status: Option<u8>,
+        pub base_transfer_fee_config: Option<RaydiumTransferFeeConfig>,
+        pub quote_transfer_fee_config: Option<RaydiumTransferFeeConfig>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct RaydiumTransferFeeConfig {
+        pub epoch: u64,
+        pub maximum_fee: u64,
+        pub basis_points: u16,
     }
 
     pub(crate) fn parse_extras(event: &PoolLiquidityChangeEvent) -> Option<RaydiumV3PoolExtras> {
@@ -516,6 +529,7 @@ mod lb_clmm {
         pub volatility_bps: Option<u16>,
         pub bin_arrays: Vec<LbClmmBinArrayExtras>,
         pub active_bitmap: Option<LbClmmBitmapExtras>,
+        pub rewards: Vec<LbClmmRewardExtras>,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -535,6 +549,14 @@ mod lb_clmm {
     pub struct LbClmmBitmapExtras {
         pub anchor_bin_id: i32,
         pub bitmap: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct LbClmmRewardExtras {
+        pub index: u8,
+        pub mint: Option<String>,
+        pub vault: Option<String>,
+        pub funder: Option<String>,
     }
 
     pub(crate) fn parse_extras(event: &PoolLiquidityChangeEvent) -> Option<LbClmmPoolExtras> {

@@ -551,6 +551,16 @@ impl CpAmmAdapter {
         false
     }
 
+    fn cache_stale(&self, state: &CpAmmState, current_slot: u64) -> bool {
+        let slot_stale = self.config.stale_slot_threshold > 0
+            && current_slot
+                .saturating_sub(state.last_update_slot)
+                > self.config.stale_slot_threshold;
+        let time_stale = self.config.stale_after_ms > 0
+            && state.last_update_at.elapsed().as_millis() as u64 > self.config.stale_after_ms;
+        slot_stale || time_stale
+    }
+
     fn build_snapshot_side(
         &self,
         state: &CpAmmState,
@@ -711,11 +721,14 @@ impl ProtocolAdapter for CpAmmAdapter {
             return None;
         }
         let state = self.get_state(&req.pool_id)?;
+        if self.cache_stale(&state, req.slot) {
+            return Some(quote_status_response(req, QuoteStatus::StaleState));
+        }
         if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
-            return None;
+            return Some(quote_status_response(req, QuoteStatus::StaleState));
         }
         if !state.swap_enabled(req.slot, req.block_time_u64()) {
-            return None;
+            return Some(quote_status_response(req, QuoteStatus::TradingDisabled));
         }
         let mut request = req;
         let capped = self.clamp_request_amount(&state, &request);
@@ -759,11 +772,14 @@ impl ProtocolAdapter for CpAmmAdapter {
             return None;
         }
         let state = self.get_state(&req.pool_id)?;
+        if self.cache_stale(&state, req.slot) {
+            return Some(quote_status_response(req, QuoteStatus::StaleState));
+        }
         if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
-            return None;
+            return Some(quote_status_response(req, QuoteStatus::StaleState));
         }
         if !state.swap_enabled(req.slot, req.block_time_u64()) {
-            return None;
+            return Some(quote_status_response(req, QuoteStatus::TradingDisabled));
         }
         let mut request = req;
         let capped = self.clamp_request_output_amount(&state, &request);
@@ -787,7 +803,7 @@ impl ProtocolAdapter for CpAmmAdapter {
             amount_out: simulation.output_amount,
             edge_bps: simulation.edge_bps,
             sqrt_price_limit: Some(simulation.sqrt_price_after),
-            min_output_amount: None,
+            min_output_amount: Some(simulation.output_amount),
             status: QuoteStatus::Ok,
             request,
             context: TemplateContext::default(),
@@ -811,6 +827,9 @@ impl ProtocolAdapter for CpAmmAdapter {
         let pool_pubkey = parse_pubkey(&snapshot.pool_id)?;
         let state = self.get_state(&pool_pubkey)?;
         if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
+            return None;
+        }
+        if self.cache_stale(&state, snapshot.slot) {
             return None;
         }
         let snapshot_block_time = normalize_block_time(snapshot.block_time_unix);
@@ -844,6 +863,12 @@ impl ProtocolAdapter for CpAmmAdapter {
             quote_to_base,
         })
     }
+}
+
+fn quote_status_response(req: QuoteRequest, status: QuoteStatus) -> QuoteResponse {
+    let mut response = build_quote_response(req, 0);
+    response.status = status;
+    response
 }
 
 #[derive(Debug, Clone)]
@@ -4386,5 +4411,171 @@ mod tests {
         let quote = adapter.quote_exact_in(req).expect("quote produced");
         assert_eq!(quote.status, QuoteStatus::Ok);
         assert!(quote.amount_out > 0);
+    }
+
+    #[test]
+    fn quote_exact_in_reports_stale_state_status() {
+        let mut config = CpAmmAdapterConfig::default();
+        config.hydration_meta_ttl_ms = 1;
+        let adapter = CpAmmAdapter::new(config, None);
+
+        let mut state = fixture_rate_limiter_state();
+        state.last_hydrated_at = Some(Instant::now() - Duration::from_millis(10));
+        adapter.state.insert(state.pool, state.clone());
+
+        let req = QuoteRequest {
+            pool_id: state.pool,
+            input_mint: state.token_a_mint,
+            output_mint: state.token_b_mint,
+            amount: 1_000,
+            slot: 5,
+            block_time: None,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let quote = adapter.quote_exact_in(req).expect("quote produced");
+        assert_eq!(quote.status, QuoteStatus::StaleState);
+        assert_eq!(quote.amount_out, 0);
+    }
+
+    #[test]
+    fn quote_exact_in_reports_slot_staleness() {
+        let mut config = CpAmmAdapterConfig::default();
+        config.stale_slot_threshold = 1;
+        let adapter = CpAmmAdapter::new(config, None);
+
+        let mut state = fixture_rate_limiter_state();
+        state.last_update_slot = 5;
+        adapter.state.insert(state.pool, state.clone());
+
+        let req = QuoteRequest {
+            pool_id: state.pool,
+            input_mint: state.token_a_mint,
+            output_mint: state.token_b_mint,
+            amount: 2_000,
+            slot: 10,
+            block_time: None,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let quote = adapter.quote_exact_in(req).expect("quote produced");
+        assert_eq!(quote.status, QuoteStatus::StaleState);
+        assert_eq!(quote.amount_out, 0);
+    }
+
+    #[test]
+    fn quote_exact_out_sets_min_output_amount() {
+        let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default(), None);
+
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let req = QuoteRequest {
+            pool_id: pool,
+            input_mint: mint_a,
+            output_mint: mint_b,
+            amount: 150_000,
+            slot: 12,
+            block_time: None,
+            direction: SwapDirection::ExactOut,
+        };
+
+        let state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            whitelisted_vault: None,
+            partner: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            token_a_decimals: Some(6),
+            token_b_decimals: Some(6),
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            amp: None,
+            lp_fee_bps: Some(30),
+            protocol_fee_bps: Some(5),
+            referral_bps: None,
+            referral_token_account: None,
+            collect_fee_mode: Some(CollectFeeModeFlag::BothToken as u8),
+            activation_point: Some(0),
+            activation_type: Some(ActivationType::Slot as u8),
+            pool_status: Some(PoolStatusFlag::Enable as u8),
+            pool_type: None,
+            pool_version: None,
+            token_a_flag: None,
+            token_b_flag: None,
+            permanent_lock_liquidity: None,
+            pool_fees: None,
+            sqrt_price_x64: Some(1_u128 << 64),
+            liquidity: Some(6_000_000_000),
+            sqrt_min_price_x64: Some(1_u128 << 60),
+            sqrt_max_price_x64: Some(1_u128 << 70),
+            vault_a_balance: 2_000_000,
+            vault_b_balance: 2_000_000,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+            last_hydrated_at: Some(Instant::now()),
+            last_block_time_unix: None,
+        };
+
+        adapter.state.insert(pool, state);
+        let quote = adapter.quote_exact_out(req).expect("quote produced");
+        assert_eq!(quote.status, QuoteStatus::Ok);
+        assert!(quote.amount_out > 0);
+        assert_eq!(quote.min_output_amount, Some(quote.amount_out));
+    }
+
+    #[test]
+    fn quote_exact_out_reports_trading_disabled_status() {
+        let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default(), None);
+
+        let mut state = fixture_rate_limiter_state();
+        state.pool_status = Some(PoolStatusFlag::Disable as u8);
+        adapter.state.insert(state.pool, state.clone());
+
+        let requested_amount = 5_000;
+        let req = QuoteRequest {
+            pool_id: state.pool,
+            input_mint: state.token_a_mint,
+            output_mint: state.token_b_mint,
+            amount: requested_amount,
+            slot: 10,
+            block_time: None,
+            direction: SwapDirection::ExactOut,
+        };
+
+        let quote = adapter.quote_exact_out(req).expect("quote produced");
+        assert_eq!(quote.status, QuoteStatus::TradingDisabled);
+        assert_eq!(quote.amount_out, 0);
+        assert_eq!(quote.amount_in, requested_amount);
+    }
+
+    #[test]
+    fn quote_exact_out_reports_time_staleness() {
+        let mut config = CpAmmAdapterConfig::default();
+        config.stale_after_ms = 1;
+        let adapter = CpAmmAdapter::new(config, None);
+
+        let mut state = fixture_rate_limiter_state();
+        state.last_update_at = Instant::now() - Duration::from_millis(10);
+        adapter.state.insert(state.pool, state.clone());
+
+        let req = QuoteRequest {
+            pool_id: state.pool,
+            input_mint: state.token_a_mint,
+            output_mint: state.token_b_mint,
+            amount: 4_000,
+            slot: 2,
+            block_time: None,
+            direction: SwapDirection::ExactOut,
+        };
+
+        let quote = adapter.quote_exact_out(req).expect("quote produced");
+        assert_eq!(quote.status, QuoteStatus::StaleState);
+        assert_eq!(quote.amount_out, 0);
     }
 }

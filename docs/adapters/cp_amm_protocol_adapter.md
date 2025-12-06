@@ -27,10 +27,13 @@ Any upstream change in those files should be reflected here and in `docs/swaps/c
 | ------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------- |
 | Vault balances, mints, slot           | CoreCast `PoolLiquidityChangeStreamMessage`          | Parsed via `PoolUpdate::extensions.cp_amm`.                     |
 | Amp curve + dynamic fee data          | CoreCast extras, fallback to on-chain `Pool` account | `CpAmmPoolExtras` in `src/hydration/types/protocols.rs`.        |
-| Token program IDs (SPL vs Token-2022) | RPC fetch per mint                                   | Matches Anchor `InterfaceAccount` requirements in `ix_swap.rs`. |
+| Block time (unix)                     | CoreCast snapshot → `QuoteRequest.block_time`        | Drives activation gating via `ActivationHandler::get_current_point`. |
+| Mint metadata + owner program         | Mint-metadata hydrator (`HydratedMintMeta`)          | Provides decimals + canonical SPL vs Token-2022 program IDs.    |
+| Transfer-fee program hints            | Transfer-fee hydrator                                | Secondary source when metadata misses owner program.            |
+| Token program IDs (SPL vs Token-2022) | Builder hint, metadata fallback, then RPC            | Matches Anchor `InterfaceAccount` requirements in `ix_swap.rs`. |
 | Referral ATA                          | CoreCast metadata or config override                 | Optional account in `SwapCtx`.                                  |
 
-`CpAmmState` stores mutable balances + fee params along with a static `PoolMeta` bundle (pool authority `HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC`, vault/mint pubkeys, referral ATA). The cache is backed by a `DashMap<Pubkey, CpAmmState>`; eviction is based on `config.stale_slot_threshold` and `config.stale_after_ms`.
+`CpAmmState` stores mutable balances + fee params along with a static `PoolMeta` bundle (pool authority `HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC`, vault/mint pubkeys, referral ATA). When metadata is missing we hydrate decimals + owner program directly from mint accounts, then store them on the state so every subsequent quote has the same inputs the Meteora SDK would have pulled. The cache is backed by a `DashMap<Pubkey, CpAmmState>`; eviction is based on `config.stale_slot_threshold` and `config.stale_after_ms`.
 
 ## Instruction Semantics (`swap2`)
 
@@ -41,6 +44,7 @@ Any upstream change in those files should be reflected here and in `docs/swaps/c
   - Single-swap-per-transaction via `validate_single_swap_instruction` (instructions sysvar + sibling inspection). Our templates must include the instructions sysvar when rate limiter is active.
   - Rate limiter guard derived from `pool.pool_fees.base_fee`. When triggered, the instruction requires `validate_single_swap_instruction` to ensure no batching; our adapter should surface `RateLimited` status if we detect previous failures for the same pool.
 - Referral payouts: if `referral_token_account` is present, `transfer_from_pool` pays `referral_fee` in whichever token the fee mode indicates. Missing referral ATA will cause `requires` failures, so quotes must mark status `MissingAccounts` when the state lacks a referral target for referral-enabled pools.
+- Activation handler parity: `ActivationHandler::get_current_point` evaluates both slot and Unix timestamp. We normalize `QuoteRequest.block_time` (seconds) and pass it through `CpAmmState::current_point`, ensuring pools that are time-gated (e.g., Meteora launches) only quote after both constraints clear. If CoreCast omits a block time we still fall back to slot-only behavior, matching on-chain defaulting.
 
 ## Pricing Architecture
 
@@ -60,7 +64,7 @@ Any upstream change in those files should be reflected here and in `docs/swaps/c
 
 - Convert desired output to “fee-included” units, run `Pool::get_swap_result_from_exact_output`, then ensure the required input (after adding token-program transfer fees) is ≤ `maximum_amount_in`.
 
-6. **Fees** – `FeeMode::get_fee_mode` selects protocol/LP/referral fee configuration per direction. `Pool::apply_swap_result` mutates reserves; our adapter mirrors this in simulation so `vault_a/b_balance` stay aligned.
+6. **Fees** – `FeeMode::get_fee_mode` selects protocol/LP/referral fee configuration per direction. `Pool::apply_swap_result` mutates reserves; our adapter mirrors this in simulation so `vault_a/b_balance` stay aligned. We also sanitize Meteora’s dynamic fee schedule (clamping numerators/denominators to on-chain bounds) so quotation never exceeds what the program would accept, mirroring the SDK’s fallback to “legacy” fees when metadata is malformed.
 7. **Edge calculation** – Mid-price comes from the hydrated CLMM state, not raw vault ratios. Convert `sqrt_price_x64` (already cached in `CpAmmState`) to an f64, square it, then adjust for the mint decimal delta:
 
 ```
@@ -87,6 +91,18 @@ This mirrors `Pool::get_price()` in Meteora’s program and stays accurate even 
 - Suggested compute budget (cp_amm swaps with high amp often need > 50k CU).
 - `expected_fee_tokens` (protocol/referral sum) for downstream accounting.
 - `partial_fill_expected_remaining` for `SwapMode::PartialFill`.
+- `input_token_program`/`output_token_program` derived from builder hints, mint metadata, or transfer-fee hydrator so downstream signers never have to guess SPL Token vs Token-2022. This matches how Meteora’s SDK (`@meteora-ag/damm-sdk`) derives interface accounts and prevents Token-2022 pools from defaulting to the legacy program.
+
+## SDK Parity & Token Program Handling
+
+Everything in this adapter is now sourced the same way Meteora’s TypeScript SDK does:
+
+1. **Builder-first token programs** – When the template builder provides explicit token programs we trust them, mirroring SDK behavior. If the builder is absent (dashboard, tests, dry runs) we fall back to hydrated mint metadata, then transfer-fee records, and finally RPC introspection.
+2. **Mint metadata cache** – `HydratedMintMeta` stores decimals + owner program alongside the mint pubkey so every future quote reuses identical inputs. This avoids “first quote wins” drift when CoreCast lags behind.
+3. **Transfer-fee synchronization** – The transfer-fee hydrator exposes the mint’s token program plus per-direction fee config, which we apply before/after curve math exactly like the SDK’s `simulateExactIn/Out` helpers.
+4. **Template context completeness** – `TemplateContext` always includes both token programs, referral requirements, and memo/compute hints so any consumer (bot, planner, dashboard) can take the output blob and hit `swap2` without copying SDK logic.
+
+If you change how the SDK derives mint/program metadata, update `CpAmmAdapter::decorate_template_context` and this section in lockstep.
 
 ## Validation & Telemetry
 
@@ -109,9 +125,9 @@ This mirrors `Pool::get_price()` in Meteora’s program and stays accurate even 
 
 ## Known Gaps / TODOs
 
-- Model Meteora’s “activation point” behavior (see `ActivationHandler::get_current_point`) to avoid quoting pools before they are live.
 - Persist rate-limiter cooldown timing in state so strategies can skip pools for a few slots after a limiter trip.
 - Improve referral ATA discovery (maybe query Meteora’s registry) to avoid repetitive `MissingReferral` statuses.
 - Add end-to-end tests that run `swap_partial_fill` to verify `amount_left` arithmetic under real Token-2022 fee schedules.
+- Backfill block-time data for historical CoreCast snapshots so activation gating stays accurate even when the upstream feed omits timestamps.
 
 Keep this document synchronized with the GitHub references above and with `docs/swaps/cp_amm_swap.md`; they collectively define the cp_amm adapter contract.

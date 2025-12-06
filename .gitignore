@@ -2,6 +2,7 @@
 certs/
 target/
 tests/
+tmp/
 alt_registry.json
 config.json
 output.txt

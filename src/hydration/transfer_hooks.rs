@@ -13,11 +13,16 @@ use spl_transfer_hook_interface::{
 };
 use tracing::{debug, warn};
 
+use crate::telemetry::{
+    record_transfer_hook_event, TransferHookEvent, TransferHookFailureReason,
+};
+
 /// Resolves the on-chain accounts required to satisfy TransferHook CPI checks
 /// for a specific mint/program pair.
 pub struct TransferHookAccountsResolver {
     clients: Arc<Vec<Arc<RpcClient>>>,
     validate_cache: DashMap<(Pubkey, Pubkey), Vec<u8>>,
+    mint_program_cache: DashMap<Pubkey, Pubkey>,
 }
 
 #[derive(Clone, Copy)]
@@ -43,7 +48,40 @@ impl TransferHookAccountsResolver {
         Some(Self {
             clients: Arc::new(clients),
             validate_cache: DashMap::new(),
+            mint_program_cache: DashMap::new(),
         })
+    }
+
+    pub fn mint_program(&self, mint: Pubkey) -> Option<Pubkey> {
+        if let Some(entry) = self.mint_program_cache.get(&mint) {
+            return Some(*entry);
+        }
+        for client in self.clients.iter() {
+            match client.get_account(&mint) {
+                Ok(account) => {
+                    let owner = account.owner;
+                    self.mint_program_cache.insert(mint, owner);
+                    return Some(owner);
+                }
+                Err(error) => {
+                    debug!(
+                        target = "transfer_hook",
+                        mint = %mint,
+                        %error,
+                        "rpc fetch failed for mint owner"
+                    );
+                }
+            }
+        }
+        warn!(
+            target = "transfer_hook",
+            mint = %mint,
+            "unable to resolve mint owner for transfer-hook"
+        );
+        record_transfer_hook_event(TransferHookEvent::ResolveFailure(
+            TransferHookFailureReason::MintOwnerLookup,
+        ));
+        None
     }
 
     pub fn resolve_accounts(
@@ -114,6 +152,9 @@ impl TransferHookAccountsResolver {
                 %error,
                 "failed to resolve transfer-hook extra accounts"
             );
+            record_transfer_hook_event(TransferHookEvent::ResolveFailure(
+                TransferHookFailureReason::ExtraAccountBuild,
+            ));
             return None;
         }
 
@@ -123,6 +164,7 @@ impl TransferHookAccountsResolver {
             .map(hook_meta_to_sdk)
             .collect();
         extras.push(AccountMeta::new_readonly(program_id, false));
+        record_transfer_hook_event(TransferHookEvent::ResolveSuccess);
         Some(extras)
     }
 
@@ -135,7 +177,15 @@ impl TransferHookAccountsResolver {
         if let Some(entry) = self.validate_cache.get(&(program_id, mint)) {
             return Some(entry.clone());
         }
-        let data = self.fetch_account_data(&validate_pubkey)?;
+        let data = match self.fetch_account_data(&validate_pubkey) {
+            Some(data) => data,
+            None => {
+                record_transfer_hook_event(TransferHookEvent::ResolveFailure(
+                    TransferHookFailureReason::ValidationAccountMissing,
+                ));
+                return None;
+            }
+        };
         self.validate_cache.insert((program_id, mint), data.clone());
         Some(data)
     }
@@ -154,6 +204,9 @@ impl TransferHookAccountsResolver {
             %key,
             "unable to fetch account data for transfer hook resolver"
         );
+        record_transfer_hook_event(TransferHookEvent::ResolveFailure(
+            TransferHookFailureReason::AccountFetch,
+        ));
         None
     }
 }

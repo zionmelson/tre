@@ -297,6 +297,38 @@ fn hydrate_amm_v3_accounts(
     )?;
     let context_input_account = plan.context.input_token_account;
     let context_output_account = plan.context.output_token_account;
+    if plan.context.whirlpool_tick_arrays.len() < 3 {
+        bail!(
+            "plan for pool {} missing Raydium tick arrays",
+            plan.pool_id
+        );
+    }
+    let tick_arrays = &plan.context.whirlpool_tick_arrays;
+    let bitmap_extension = plan.context.raydium_tick_array_bitmap_extension;
+    let input_transfer_mint = if plan.context.input_transfer_fee_config.is_some() {
+        Some(
+            Pubkey::from_str(&plan.input_mint).with_context(|| {
+                format!(
+                    "invalid input mint {} for pool {}",
+                    plan.input_mint, plan.pool_id
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    let output_transfer_mint = if plan.context.output_transfer_fee_config.is_some() {
+        Some(
+            Pubkey::from_str(&plan.output_mint).with_context(|| {
+                format!(
+                    "invalid output mint {} for pool {}",
+                    plan.output_mint, plan.pool_id
+                )
+            })?,
+        )
+    } else {
+        None
+    };
 
     for (index, (meta, spec)) in accounts.iter_mut().zip(specs.iter()).enumerate() {
         if spec.address.is_some() {
@@ -362,6 +394,30 @@ fn hydrate_amm_v3_accounts(
                 })?;
                 meta.pubkey = pool_accounts.mint_for_role(role);
             }
+            "tick_array_bitmap_extension" => {
+                if let Some(ext) = bitmap_extension {
+                    meta.pubkey = ext;
+                }
+            }
+            "tick_array_0" => {
+                meta.pubkey = tick_arrays[0];
+            }
+            "tick_array_1" => {
+                meta.pubkey = tick_arrays[1];
+            }
+            "tick_array_2" => {
+                meta.pubkey = tick_arrays[2];
+            }
+            "input_transfer_hook_mint" => {
+                if let Some(mint) = input_transfer_mint {
+                    meta.pubkey = mint;
+                }
+            }
+            "output_transfer_hook_mint" => {
+                if let Some(mint) = output_transfer_mint {
+                    meta.pubkey = mint;
+                }
+            }
             _ => {}
         }
     }
@@ -413,18 +469,22 @@ fn hydrate_cp_amm_accounts(
         .context
         .input_token_program
         .or(pool_accounts.token_a_program)
-        .ok_or_else(|| anyhow!(
-            "template for pool {} missing input token program",
-            plan.pool_id
-        ))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "template for pool {} missing input token program",
+                plan.pool_id
+            )
+        })?;
     let output_token_program = plan
         .context
         .output_token_program
         .or(pool_accounts.token_b_program)
-        .ok_or_else(|| anyhow!(
-            "template for pool {} missing output token program",
-            plan.pool_id
-        ))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "template for pool {} missing output token program",
+                plan.pool_id
+            )
+        })?;
 
     for (meta, spec) in accounts.iter_mut().zip(specs.iter()) {
         if spec.address.is_some() {
@@ -773,6 +833,9 @@ fn apply_patch(
                     write_u128(limit as u128, slice);
                 }
             }
+            LbClmmField::RemainingAccountsInfo => {
+                encode_lb_clmm_remaining_accounts(plan, data, offset, length)?;
+            }
         },
 
         TemplateFieldKind::Whirlpool(field) => match field {
@@ -840,6 +903,48 @@ fn encode_whirlpool_remaining_accounts(
     payload.extend_from_slice(&(slice_count as u32).to_le_bytes());
     for slice in &plan.context.whirlpool_remaining_accounts {
         payload.push(slice.accounts_type.discriminant());
+        payload.push(slice.length);
+    }
+    data.extend_from_slice(&payload);
+    Ok(())
+}
+
+fn encode_lb_clmm_remaining_accounts(
+    plan: &BundleInstructionPlan,
+    data: &mut Vec<u8>,
+    offset: usize,
+    length: usize,
+) -> Result<()> {
+    if length != 4 {
+        bail!("expected 4-byte length prefix for remaining accounts info");
+    }
+
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| anyhow!("remaining accounts slice overflow"))?;
+    if end > data.len() {
+        bail!("template patch out of bounds for remaining accounts info");
+    }
+
+    let slice_count = plan.context.lb_clmm_remaining_accounts.len();
+    if slice_count > u32::MAX as usize {
+        bail!("remaining accounts slice overflow");
+    }
+
+    let len_bytes = (slice_count as u32).to_le_bytes();
+    data[offset..end].copy_from_slice(&len_bytes);
+    data.truncate(end);
+
+    if slice_count == 0 {
+        return Ok(());
+    }
+
+    let mut payload = Vec::with_capacity(slice_count.saturating_mul(3));
+    for slice in &plan.context.lb_clmm_remaining_accounts {
+        payload.push(slice.accounts_type.discriminant());
+        if let Some(index) = slice.accounts_type.reward_index() {
+            payload.push(index);
+        }
         payload.push(slice.length);
     }
     data.extend_from_slice(&payload);
@@ -1083,7 +1188,10 @@ mod tests {
     use super::*;
     use crate::builder::templates::{AccountSpec, SwapMintRole};
     use crate::config::AppConfig;
-    use crate::template::{WhirlpoolRemainingAccountsSlice, WhirlpoolRemainingAccountsType};
+    use crate::template::{
+        LbClmmAccountsType, LbClmmRemainingAccountsSlice, TransferFeeConfigHint,
+        WhirlpoolRemainingAccountsSlice, WhirlpoolRemainingAccountsType,
+    };
     use serde_json::json;
     use solana_sdk::instruction::AccountMeta;
     use std::convert::TryInto;
@@ -1196,6 +1304,63 @@ mod tests {
 
         assert_eq!(data.len(), offset + length);
         assert_eq!(data[offset], 0);
+    }
+
+    #[test]
+    fn encodes_lb_clmm_remaining_accounts_payload() {
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let context = TemplateContext {
+            lb_clmm_remaining_accounts: vec![
+                LbClmmRemainingAccountsSlice {
+                    pool: pool_a,
+                    accounts_type: LbClmmAccountsType::TransferHookX,
+                    length: 2,
+                },
+                LbClmmRemainingAccountsSlice {
+                    pool: pool_b,
+                    accounts_type: LbClmmAccountsType::TransferHookMultiReward(7),
+                    length: 4,
+                },
+            ],
+            ..TemplateContext::default()
+        };
+        let plan = basic_plan(context);
+        let offset = 5usize;
+        let length = 4usize;
+        let mut data = vec![0u8; offset + length];
+
+        encode_lb_clmm_remaining_accounts(&plan, &mut data, offset, length)
+            .expect("encode lb_clmm remaining accounts");
+
+        let slice_count_bytes = &data[offset..offset + length];
+        let expected = (2u32).to_le_bytes();
+        assert_eq!(slice_count_bytes, &expected);
+        let payload = &data[offset + length..];
+        assert_eq!(payload.len(), 5);
+        assert_eq!(payload[0], LbClmmAccountsType::TransferHookX.discriminant());
+        assert_eq!(payload[1], 2);
+        assert_eq!(
+            payload[2],
+            LbClmmAccountsType::TransferHookMultiReward(0).discriminant()
+        );
+        assert_eq!(payload[3], 7);
+        assert_eq!(payload[4], 4);
+    }
+
+    #[test]
+    fn encode_lb_clmm_remaining_accounts_handles_empty() {
+        let plan = basic_plan(TemplateContext::default());
+        let offset = 1usize;
+        let length = 4usize;
+        let mut data = vec![0u8; offset + length];
+
+        encode_lb_clmm_remaining_accounts(&plan, &mut data, offset, length)
+            .expect("encode lb_clmm remaining accounts none");
+
+        assert_eq!(data.len(), offset + length);
+        let expected = (0u32).to_le_bytes();
+        assert_eq!(data[offset..offset + length], expected);
     }
 
     #[test]
@@ -1319,7 +1484,10 @@ mod tests {
             u64::from_le_bytes(amount_out_bytes),
             plan.min_output_amount.unwrap()
         );
-        assert_eq!(data[16], 0u8, "amount_specified_is_input flag should be false");
+        assert_eq!(
+            data[16], 0u8,
+            "amount_specified_is_input flag should be false"
+        );
     }
 
     #[test]
@@ -1969,6 +2137,11 @@ mod tests {
             pool_accounts.clone(),
         );
 
+        let tick_arrays = vec![
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
         let plan = BundleInstructionPlan {
             pool_id: pool.to_string(),
             program_id: program_id.to_string(),
@@ -1986,7 +2159,10 @@ mod tests {
             limit_price: None,
             price_impact_limit_bps: None,
             slot_padding: None,
-            context: TemplateContext::default(),
+            context: TemplateContext {
+                whirlpool_tick_arrays: tick_arrays,
+                ..TemplateContext::default()
+            },
             lookup_table: None,
         };
 
@@ -2053,6 +2229,11 @@ mod tests {
             pool_accounts.clone(),
         );
 
+        let tick_arrays = vec![
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
         let override_payer = Pubkey::new_unique();
         let plan = BundleInstructionPlan {
             pool_id: pool.to_string(),
@@ -2073,6 +2254,7 @@ mod tests {
             slot_padding: None,
             context: TemplateContext {
                 payer: Some(override_payer),
+                whirlpool_tick_arrays: tick_arrays,
                 ..TemplateContext::default()
             },
             lookup_table: None,
@@ -2202,6 +2384,159 @@ mod tests {
         assert_eq!(hydrated[tick0_idx].pubkey, tick_arrays[0]);
         assert_eq!(hydrated[tick1_idx].pubkey, tick_arrays[1]);
         assert_eq!(hydrated[tick2_idx].pubkey, tick_arrays[2]);
+    }
+
+    #[test]
+    fn hydrates_amm_v3_tick_arrays_via_templates() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let specs = amm_v3_account_specs();
+        let pool_accounts = AmmV3PoolAccounts {
+            amm_config: Pubkey::new_unique(),
+            observation_state: Pubkey::new_unique(),
+            mint0: Pubkey::new_unique(),
+            mint1: Pubkey::new_unique(),
+            mint0_program: Pubkey::new_unique(),
+            mint1_program: Pubkey::new_unique(),
+            vault0: Pubkey::new_unique(),
+            vault1: Pubkey::new_unique(),
+        };
+        insert_amm_v3_template(
+            &cache,
+            pool,
+            program_id,
+            SwapTemplateDirection::BaseIn,
+            specs,
+            pool_accounts.clone(),
+        );
+
+        let bitmap = Pubkey::new_unique();
+        let tick_arrays = vec![
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        let mut token_atas = HashMap::new();
+        let owner0 = Pubkey::new_unique();
+        let owner1 = Pubkey::new_unique();
+        token_atas.insert(pool_accounts.mint0, owner0);
+        token_atas.insert(pool_accounts.mint1, owner1);
+
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: pool_accounts.mint0.to_string(),
+            output_mint: pool_accounts.mint1.to_string(),
+            amount_in: 1,
+            input_amount: 1,
+            expected_output_amount: 1,
+            amount_specified_is_input: true,
+            fee_bps: 5,
+            template_fee_bps: 5,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context: TemplateContext {
+                raydium_tick_array_bitmap_extension: Some(bitmap),
+                whirlpool_tick_arrays: tick_arrays.clone(),
+                input_transfer_fee_config: Some(TransferFeeConfigHint {
+                    epoch: 1,
+                    maximum_fee: 25,
+                    basis_points: 50,
+                }),
+                output_transfer_fee_config: Some(TransferFeeConfigHint {
+                    epoch: 2,
+                    maximum_fee: 30,
+                    basis_points: 75,
+                }),
+                ..TemplateContext::default()
+            },
+            lookup_table: None,
+        };
+
+        let hydrated = hydrate_accounts_for_plan(
+            &cache,
+            &plan,
+            Pubkey::new_unique(),
+            &token_atas,
+        )
+        .expect("amm_v3 accounts");
+
+        let bitmap_idx = find_account_index(specs, "tick_array_bitmap_extension");
+        assert_eq!(hydrated[bitmap_idx].pubkey, bitmap);
+
+        for (i, pk) in tick_arrays.iter().enumerate() {
+            let name = format!("tick_array_{}", i);
+            let idx = find_account_index(specs, &name);
+            assert_eq!(hydrated[idx].pubkey, *pk);
+            assert!(hydrated[idx].is_writable);
+        }
+
+        let input_mint_idx = find_account_index(specs, "input_transfer_hook_mint");
+        assert_eq!(hydrated[input_mint_idx].pubkey, pool_accounts.mint0);
+        assert!(!hydrated[input_mint_idx].is_writable);
+
+        let output_mint_idx = find_account_index(specs, "output_transfer_hook_mint");
+        assert_eq!(hydrated[output_mint_idx].pubkey, pool_accounts.mint1);
+    }
+
+    #[test]
+    fn amm_v3_tick_arrays_required() {
+        let cache = TemplateCache::new(test_config());
+        let pool = Pubkey::new_unique();
+        let specs = amm_v3_account_specs();
+        let pool_accounts = AmmV3PoolAccounts {
+            amm_config: Pubkey::new_unique(),
+            observation_state: Pubkey::new_unique(),
+            mint0: Pubkey::new_unique(),
+            mint1: Pubkey::new_unique(),
+            mint0_program: Pubkey::new_unique(),
+            mint1_program: Pubkey::new_unique(),
+            vault0: Pubkey::new_unique(),
+            vault1: Pubkey::new_unique(),
+        };
+        let program_id = Pubkey::new_unique();
+        insert_amm_v3_template(
+            &cache,
+            pool,
+            program_id,
+            SwapTemplateDirection::BaseIn,
+            specs,
+            pool_accounts.clone(),
+        );
+
+        let plan = BundleInstructionPlan {
+            pool_id: pool.to_string(),
+            program_id: program_id.to_string(),
+            input_mint: pool_accounts.mint0.to_string(),
+            output_mint: pool_accounts.mint1.to_string(),
+            amount_in: 1,
+            input_amount: 1,
+            expected_output_amount: 1,
+            amount_specified_is_input: true,
+            fee_bps: 5,
+            template_fee_bps: 5,
+            direction: SwapTemplateDirection::BaseIn,
+            sqrt_price_limit: None,
+            min_output_amount: None,
+            limit_price: None,
+            price_impact_limit_bps: None,
+            slot_padding: None,
+            context: TemplateContext::default(),
+            lookup_table: None,
+        };
+
+        let result = hydrate_accounts_for_plan(
+            &cache,
+            &plan,
+            Pubkey::new_unique(),
+            &HashMap::new(),
+        );
+        assert!(result.is_err(), "missing tick arrays should error");
     }
 
     fn insert_template(
@@ -2448,6 +2783,60 @@ mod tests {
                         address: None,
                         pda: None,
                         mint_role: Some(SwapMintRole::Mint1),
+                    },
+                    AccountSpec {
+                        name: "tick_array_bitmap_extension",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: true,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "tick_array_0",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "tick_array_1",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "tick_array_2",
+                        is_signer: false,
+                        is_writable: true,
+                        is_optional: false,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "input_transfer_hook_mint",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: true,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
+                    },
+                    AccountSpec {
+                        name: "output_transfer_hook_mint",
+                        is_signer: false,
+                        is_writable: false,
+                        is_optional: true,
+                        address: None,
+                        pda: None,
+                        mint_role: None,
                     },
                 ];
                 Box::leak(specs.into_boxed_slice())

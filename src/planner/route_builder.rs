@@ -125,15 +125,16 @@ impl RouteBuilder {
             context.template_ready = readiness.template_ready;
             context.alt_ready = readiness.alt_ready;
             if let Some(side) = quote_side {
+                if let (Some(fee), notional) = (context.expected_fee_amount, side.notional) {
+                    let scaled = scale_partial_fill_remaining(fee, current_amount, notional);
+                    context.expected_fee_amount = (scaled > 0).then_some(scaled);
+                }
                 if let Some(leftover) = context.partial_fill_remaining {
                     if side.notional == 0 {
                         context.partial_fill_remaining = None;
                     } else {
-                        let scaled = scale_partial_fill_remaining(
-                            leftover,
-                            current_amount,
-                            side.notional,
-                        );
+                        let scaled =
+                            scale_partial_fill_remaining(leftover, current_amount, side.notional);
                         context.partial_fill_remaining = (scaled > 0).then_some(scaled);
                     }
                 }
@@ -222,10 +223,11 @@ fn scale_partial_fill_remaining(leftover: u64, target_amount: u64, reference_not
     if leftover == 0 || target_amount == 0 || reference_notional == 0 {
         return 0;
     }
-    let scaled = u128::from(leftover)
-        .saturating_mul(u128::from(target_amount))
+    let scaled = u128::from(leftover).saturating_mul(u128::from(target_amount))
         / u128::from(reference_notional);
-    scaled.min(u128::from(target_amount)).min(u128::from(u64::MAX)) as u64
+    scaled
+        .min(u128::from(target_amount))
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]

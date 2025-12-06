@@ -165,6 +165,25 @@ fn render_amm_v3_template(
         let rendered = render_account(account, direction)?;
         snippet.push_str(&rendered);
     }
+    let extra_accounts = [
+        ("tick_array_bitmap_extension", false, false, true),
+        ("tick_array_0", false, true, false),
+        ("tick_array_1", false, true, false),
+        ("tick_array_2", false, true, false),
+        ("input_transfer_hook_mint", false, false, true),
+        ("output_transfer_hook_mint", false, false, true),
+    ];
+    for (name, is_signer, is_writable, is_optional) in extra_accounts {
+        writeln!(snippet, "            AccountSpec {{")?;
+        writeln!(snippet, "                name: {:?},", name)?;
+        writeln!(snippet, "                is_signer: {is_signer},")?;
+        writeln!(snippet, "                is_writable: {is_writable},")?;
+        writeln!(snippet, "                is_optional: {is_optional},")?;
+        writeln!(snippet, "                address: None,")?;
+        writeln!(snippet, "                pda: None,")?;
+        writeln!(snippet, "                mint_role: None,")?;
+        snippet.push_str("            },\n");
+    }
     writeln!(snippet, "        ],")?;
     writeln!(snippet, "        args: &[")?;
     for arg in &ix.args {

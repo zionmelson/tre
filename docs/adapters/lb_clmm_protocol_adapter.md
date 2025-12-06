@@ -21,7 +21,8 @@ Any upstream change across those modules should be mirrored here and in the hydr
 
 1. Quote lb_clmm pools exactly like `LbPairExtension::swap` would, including variable fee adjustments, host/referral fee distribution, and bitmap-assisted bin traversal.
 2. Emit deterministic `SwapTemplate` payloads for all supported instructions (`swap2`, `swap_with_price_impact2`, `swap_exact_out2`) so fast execution never re-derives PDAs or account order.
-3. Surface adapter-specific health signals (`PreActivation`, `VolatilityClamp`, `InsufficientBins`, `MissingBitmapExtension`) plus structured telemetry for state freshness and template composition.
+3. Mirror Meteora SDK semantics for SPL Token vs Token-2022 pools, including transfer-hook account resolution for swap legs and reward harvests.
+4. Surface adapter-specific health signals (`PreActivation`, `VolatilityClamp`, `InsufficientBins`, `MissingBitmapExtension`) plus structured telemetry for state freshness, template composition, and transfer-hook success/failure.
 
 ## Data Inputs & Cached State
 
@@ -48,6 +49,17 @@ Any upstream change across those modules should be mirrored here and in the hydr
 - `u64x64_math.rs::pow` defines the exponential limits; its `MAX_EXPONENTIAL` guard is why we cap bin traversal ranges and reject quotes when a request spans beyond the supported exponent window.
 - `u128x128_math.rs` plus `utils.rs` provide `mul_div`, `mul_shr`, `shl_div`, and the `safe_*` wrappers used heavily inside `Bin::swap`. Our pricing code sticks to those helpers (or reuses identical Rust equivalents) so rounding/overflow behavior matches on-chain outcomes bit-for-bit.
 
+## SDK Logic Parity in Rust
+
+The Rust adapter now mirrors the Meteora SDK entry points directly instead of re-implementing simplified math:
+
+- `LbClmmState::simulate_lb_clmm_exact_in` calls the same sequence of helpers as `LbPairExtension::swap`, including `update_volatility_accumulator`, `compute_fee`, `compute_protocol_fee`, and the host-fee split. Every intermediate calculation is clamped with the same `safe_*` arithmetic to avoid drift.
+- Bin traversal respects the SDK’s `next_bin_array_index_with_liquidity_internal` contract. When the CoreCast snapshot lacks a required array, we hydrate it through the same PDA derivations defined in `extensions/bin_array.rs` so bin windows line up with on-chain expectations.
+- Price projections reuse `price_math::get_price_from_id` for the pre/post trade guardrails. We cache the Q64.64 outputs just like `BinCache` inside the SDK so hot pools avoid redundant pow/mul work without changing math results.
+- The host-fee, referral, and volatility adjustments now follow the SDK’s switch statements verbatim. Each branch in the Rust enum wrappers points to the corresponding upstream variant so any divergence shows up as a unit-test failure against the golden SDK fixtures.
+
+Whenever upstream adds a new helper in `commons/src/extensions`, we stub a Rust adaptor that forwards to the same semantics before wiring it into simulation or template building. The `tests/hydration::adapters::lb_clmm::*` suite executes captured SDK fixtures to spot regressions quickly.
+
 ## Pricing Architecture
 
 1. **Direction resolution** – Compare `QuoteRequest.input_mint` against `token_x_mint` cached in state. This maps directly to the `swap_for_y` boolean used by `Bin::swap` and determines whether we decrement or increment `active_bin_id`.
@@ -64,6 +76,15 @@ Any upstream change across those modules should be mirrored here and in the hydr
 - Token program IDs (`spl_token::ID` vs `spl_token_2022::ID`) come straight from `TokenProgramFlagWrapper`; template builders must use those rather than inferring from mint decimals.
 - Remaining accounts: assemble `BinArray` PDAs covering the highest/lowest bin touched, append oracle account, optional host-fee ATA, memo program, and any Token-2022 transfer-hook accounts that the hydration cache marked as required.
 - Arguments (`SwapParameters`, `SwapExactOutParams`, etc.) should include the `active_id`, `max_price_impact_bps`, and the computed guardrails our simulator derived. We also attach a compute-budget recommendation (300k–500k CU range) when the bin walk crosses many arrays or when Token-2022 hooks are active.
+
+## Transfer-Hook Resolution & Telemetry
+
+- **Mint-program discovery** – The adapter caches the owner program for every mint via `TransferHookAccountsResolver::mint_program`. We hit the same RPC endpoints used for hydration; failures increment the `hydration_transfer_hook_events_total{reason="mint_owner_lookup"}` counter so operators can spot missing metadata before swaps fail on-chain.
+- **Swap contexts** – For each swap leg we build `TransferHookAccountContext` structs that match the SDK’s execute instruction inputs (payer ➝ reserve for input, reserve ➝ ATA for output). `ExtraAccountMetaList::add_to_instruction` runs inside a sandboxed Tokio executor so we get identical CPI account ordering.
+- **Reward hooks** – Reward harvests now mirror Meteora’s `collect_reward` flow. We derive (or fetch from the builder) the payer’s ATA for each reward mint, generate the bidirectional hook contexts (vault ➝ user and optional user ➝ vault), and deduplicate the remaining-accounts slices so swap templates reuse them across rewards with identical hooks.
+- **Telemetry** – Every resolve attempt emits either `reason="success"` or a failure label (`validation_missing`, `account_fetch`, `extra_account_build`). We intentionally keep the `event="resolve"` dimension fixed so Grafana queries can aggregate across swap vs reward contexts. Pool- and mint-specific context still lives in tracing logs, but the metric lets us alert on sustained failures quickly.
+
+If both mint legs are SPL Token (non-2022), the resolver returns `None` and the template builder omits transfer-hook slices entirely, keeping CU limits tight for legacy pools.
 
 ## Validation & Telemetry Hooks
 

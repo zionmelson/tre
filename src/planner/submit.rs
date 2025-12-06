@@ -29,6 +29,7 @@ use crate::planner::types::{
     BundleCandidate, FlashLoanSummary, PlannedInstruction, PlannedLookupTable, RouteLegPlan,
     RoutePlan,
 };
+use crate::template::TemplateContext;
 
 pub fn spawn_submit_stage(
     stop: Arc<AtomicBool>,
@@ -410,8 +411,18 @@ impl<'a> InstructionPlanner<'a> {
         for leg in &route.legs {
             self.ensure_leg_ready(leg)?;
             let mut context = leg.context.clone();
+            let (estimated_output_amount, min_output_amount) = fee_aware_outputs(
+                leg.estimated_output_amount,
+                leg.min_output_amount,
+                &context,
+                leg.amount_specified_is_input,
+            );
             if context.slippage_tolerance_bps.is_none() {
-                context.slippage_tolerance_bps = derive_slippage_tolerance_bps(leg);
+                context.slippage_tolerance_bps = derive_slippage_tolerance_bps(
+                    estimated_output_amount,
+                    min_output_amount,
+                    leg.estimated_slippage_bps,
+                );
             }
             let amount_specified = if leg.amount_specified_is_input {
                 leg.input_amount
@@ -426,13 +437,13 @@ impl<'a> InstructionPlanner<'a> {
                 input_amount: leg.input_amount,
                 amount_specified,
                 amount_specified_is_input: leg.amount_specified_is_input,
-                estimated_output_amount: leg.estimated_output_amount,
+                estimated_output_amount,
                 fee_bps: leg.fee_bps,
                 template_fee_bps: leg.template_fee_bps,
                 direction: leg.direction,
                 lookup_table: self.lookup_table_for_leg(leg),
                 sqrt_price_limit: leg.sqrt_price_limit,
-                min_output_amount: leg.min_output_amount,
+                min_output_amount,
                 limit_price: leg.limit_price,
                 price_impact_limit_bps: leg.price_impact_limit_bps,
                 context,
@@ -639,13 +650,36 @@ impl<'a> InstructionPlanner<'a> {
     }
 }
 
-fn derive_slippage_tolerance_bps(leg: &RouteLegPlan) -> Option<u16> {
-    if let Some(min_output) = leg.min_output_amount {
-        let estimated = leg.estimated_output_amount;
-        if estimated > 0 {
-            let slip = estimated.saturating_sub(min_output);
+fn fee_aware_outputs(
+    estimated_output_amount: u64,
+    min_output_amount: Option<u64>,
+    context: &TemplateContext,
+    amount_specified_is_input: bool,
+) -> (u64, Option<u64>) {
+    if !amount_specified_is_input {
+        return (estimated_output_amount, min_output_amount);
+    }
+
+    let fee = context.expected_fee_amount.unwrap_or(0);
+    if fee == 0 {
+        return (estimated_output_amount, min_output_amount);
+    }
+
+    let adjusted_estimated = estimated_output_amount.saturating_sub(fee);
+    let adjusted_min = min_output_amount.map(|value| value.saturating_sub(fee));
+    (adjusted_estimated, adjusted_min)
+}
+
+fn derive_slippage_tolerance_bps(
+    estimated_output_amount: u64,
+    min_output_amount: Option<u64>,
+    estimated_slippage_bps: f64,
+) -> Option<u16> {
+    if let Some(min_output) = min_output_amount {
+        if estimated_output_amount > 0 {
+            let slip = estimated_output_amount.saturating_sub(min_output);
             let numerator = u128::from(slip).saturating_mul(10_000);
-            let denom = u128::from(estimated);
+            let denom = u128::from(estimated_output_amount);
             if denom > 0 {
                 let mut bps = numerator / denom;
                 if numerator % denom != 0 {
@@ -657,9 +691,11 @@ fn derive_slippage_tolerance_bps(leg: &RouteLegPlan) -> Option<u16> {
         }
     }
 
-    let estimate = leg.estimated_slippage_bps;
-    if estimate.is_finite() && estimate >= 0.0 {
-        let ceil = estimate.ceil().min(f64::from(u16::MAX)).max(0.0) as u16;
+    if estimated_slippage_bps.is_finite() && estimated_slippage_bps >= 0.0 {
+        let ceil = estimated_slippage_bps
+            .ceil()
+            .min(f64::from(u16::MAX))
+            .max(0.0) as u16;
         return Some(ceil);
     }
 
@@ -1073,6 +1109,49 @@ mod tests {
             planned.swap_instructions[0].context.slippage_tolerance_bps,
             Some(500)
         );
+    }
+
+    #[test]
+    fn planner_applies_fee_aware_min_output() {
+        let mut ctx = TemplateContext::default();
+        ctx.expected_fee_amount = Some(200);
+        let leg = RouteLegPlan {
+            pool_id: "pool-fee".into(),
+            program_id: "prog".into(),
+            input_mint: "A".into(),
+            output_mint: "B".into(),
+            input_amount: 1_000,
+            available_input_liquidity: 10_000,
+            estimated_output_amount: 10_000,
+            amount_specified_is_input: true,
+            effective_price: 10.0,
+            fee_bps: 30,
+            template_fee_bps: 30,
+            estimated_slippage_bps: 4.0,
+            direction: PoolQuoteDirection::BaseToQuote,
+            sqrt_price_limit: None,
+            min_output_amount: Some(9_500),
+            limit_price: None,
+            price_impact_limit_bps: None,
+            context: ctx,
+            template_ready: true,
+            alt_ready: true,
+        };
+
+        let route = RoutePlan {
+            start_mint: "A".into(),
+            end_mint: "B".into(),
+            legs: vec![leg],
+            estimated_final_output_amount: Some(9_500),
+            flash_loan_permitted: false,
+        };
+
+        let planner = InstructionPlanner::new(None);
+        let planned = planner.plan(&route, 0, None).expect("fee-aware plan");
+        let ix = &planned.swap_instructions[0];
+        assert_eq!(ix.estimated_output_amount, 9_800);
+        assert_eq!(ix.min_output_amount, Some(9_300));
+        assert_eq!(ix.context.slippage_tolerance_bps, Some(511));
     }
 
     #[test]

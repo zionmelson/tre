@@ -704,6 +704,7 @@ fn encode_lb_clmm_args(
     let mut amount_out = None;
     let mut limit_price = None;
     let mut price_impact_limit = None;
+    let mut remaining_accounts_info = None;
 
     let requires_min_out = !template.name.contains("price_impact");
 
@@ -726,7 +727,8 @@ fn encode_lb_clmm_args(
                 limit_price = Some(slice);
             }
             "remaining_accounts_info" => {
-                write_remaining_accounts_info(buffer)?;
+                let slice = write_remaining_accounts_info(buffer)?;
+                remaining_accounts_info = Some(slice);
             }
             _ if arg.ty == "u64" => {
                 let _ = write_u64(buffer, 0)?;
@@ -742,7 +744,8 @@ fn encode_lb_clmm_args(
                 ));
             }
             _ if arg.ty == "RemainingAccountsInfo" => {
-                write_remaining_accounts_info(buffer)?;
+                let slice = write_remaining_accounts_info(buffer)?;
+                remaining_accounts_info = Some(slice);
             }
             other => {
                 return Err(anyhow!("unsupported lb_clmm arg {}", other));
@@ -768,6 +771,7 @@ fn encode_lb_clmm_args(
         amount_out,
         limit_price,
         price_impact_bps: price_impact_limit,
+        remaining_accounts_info,
     })
 }
 
@@ -842,9 +846,10 @@ fn write_option_i32_none(buffer: &mut Vec<u8>) -> Result<TemplateSlice> {
     make_slice(offset, 5)
 }
 
-fn write_remaining_accounts_info(buffer: &mut Vec<u8>) -> Result<()> {
+fn write_remaining_accounts_info(buffer: &mut Vec<u8>) -> Result<TemplateSlice> {
+    let offset = buffer.len();
     buffer.extend_from_slice(&0u32.to_le_bytes());
-    Ok(())
+    make_slice(offset, 4)
 }
 
 fn write_option_remaining_accounts_info(buffer: &mut Vec<u8>) -> Result<TemplateSlice> {

@@ -18,18 +18,21 @@ This document is the single source of truth for our Raydium CLMM adapter. It tie
 
 ## Data Inputs & State Enrichment
 
-| Source                                      | Purpose                                                                    | Implementation Notes                                                          |
-| ------------------------------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| CoreCast `PoolLiquidityChangeStreamMessage` | Vault balances, mint pairs, slot, fee deltas                               | Parsed in `PoolUpdate::from_corecast` (`src/hydration/types.rs`).             |
-| Protocol extras (`RaydiumV3PoolExtras`)     | Tick spacing, sqrt_price_x64, liquidity, PDA bumps                         | Populated via `parse_raydium_v3_extras` (`src/hydration/types/protocols.rs`). |
-| On-chain hydration (`RaydiumPoolHydrator`)  | Ground-truth pool accounts, AMM config fees, tick arrays, mint program IDs | See `src/hydration/adapters/raydium_v3.rs`, section `RaydiumPoolHydrator`.    |
+| Source                                      | Purpose                                                                                  | Implementation Notes                                                                                      |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| CoreCast `PoolLiquidityChangeStreamMessage` | Vault balances, mint pairs, slot, fee deltas                                             | Parsed in `PoolUpdate::from_corecast` (`src/hydration/types.rs`).                                         |
+| Protocol extras (`RaydiumV3PoolExtras`)     | Tick spacing, sqrt_price_x64, liquidity, PDA bumps, AMM config fee numerators            | Populated via `parse_raydium_v3_extras` (`src/hydration/types/protocols.rs`).                             |
+| On-chain hydration (`RaydiumPoolHydrator`)  | Ground-truth pool accounts, AMM config fees, tick arrays, mint program IDs, Token-2022 fee configs | See `src/hydration/adapters/raydium_v3.rs`, section `RaydiumPoolHydrator`.                                |
+| Mint metadata cache                         | Token-2022 transfer-fee config + owner program, reused by adapter + transfer-hook resolver | Stored in `RaydiumPoolHydrator::mint_metadata`; avoids repeated RPCs and keeps hints aligned with SDK.    |
 
 `RaydiumV3State` caches:
 
 - Pool + mint pubkeys, associated token program IDs (needed for Token-2022 transfers copied from `swap_v2.rs`).
 - Vault balances (`vault_base`, `vault_quote`) for snapshot pricing and XYK fallback.
 - Tick metadata (`tick_spacing`, `current_tick`, `sqrt_price_x64`, `liquidity`).
-- Fee tiers (`trade_fee_bps`, and soon `protocol_fee_rate` / `fund_fee_rate`).
+- Fee tiers (`trade_fee_bps`, `protocol_fee_bps`, `fund_fee_bps`) exactly as parsed from AMM config PDA.
+- Tick-array bitmap extension address and `pool_status` byte (needed for SDK-style remaining-account slices).
+- Transfer-fee summaries for each mint (epoch/max/bps); used both for hinting template hydration and for the simulation math.
 - Hydrated tick-array cache (3 accounts per direction) plus TTL, matching router expectations.
 
 Eviction happens whenever `slot` drift exceeds `config.stale_slot_threshold` or wall-clock age exceeds `config.stale_after_ms`.
@@ -38,29 +41,38 @@ Eviction happens whenever `slot` drift exceeds `config.stale_slot_threshold` or 
 
 ### Simulation Path
 
-1. Clamp request size via `clamp_request_amount` (max `RAYDIUM_V3_INPUT_UTILIZATION_BPS`, currently 40% of the input-side vault).
-2. Determine direction with `classify_swap_direction` (mirrors mint ordering logic from `swap_v2.rs`).
-3. Fetch tick arrays through `RaydiumPoolHydrator::preferred_tick_arrays_for_swap`, ensuring the same 3-array window `swap_internal` expects.
-4. Run `simulate_clmm_exact_in`, our Rust port of `swap_internal` + `swap_math::compute_swap_step`:
-   - Iterates up to 512 steps, same guard as upstream.
-   - Applies `liquidity_net` when crossing initialized ticks.
-   - Computes `sqrt_price_after` so we can set `QuoteResponse.sqrt_price_limit`.
-5. Return `QuoteOutcome` with `amount_out` + post-trade sqrt price. If simulation preconditions are not met (missing hydrations, zero liquidity, etc.) the adapter declines to quote rather than approximating with XYK math.
+The adapter now mirrors the Raydium TypeScript SDK (`@raydium-io/raydium-sdk`, `Clmm.fetchMultiplePoolInfos` + `Clmm.computeAmountOut`) in addition to the on-chain `swap_internal` routine. The flow is:
+
+1. Clamp request size via `clamp_request_amount` (max `RAYDIUM_V3_INPUT_UTILIZATION_BPS`, currently 40% of the input-side vault). This matches the SDK’s `computeMaxAmountIn` guard so we will never issue quotes that the signer cannot submit.
+2. Determine direction with `classify_swap_direction` (mirrors mint ordering logic from `swap_v2.rs` / SDK’s `ClmmPoolInfo`).
+3. Fetch tick arrays through `RaydiumPoolHydrator::preferred_tick_arrays_for_swap`, ensuring the identical 3-array window (`current`, `next`, `prev`) that `swap_internal` and the SDK require.
+4. Run `simulate_clmm_exact_in`, our Rust port of `swap_internal` + `swap_math::compute_swap_step`, but now instrumented to match SDK bookkeeping:
+  - Iterates up to 512 steps, same guard as upstream.
+  - Applies `liquidity_net` when crossing initialized ticks.
+  - Tracks pool-input consumed vs. swap-budget so partial fills surface the exact `executed_input_amount` the SDK would emit.
+  - Computes per-step trade fees, then allocates protocol + fund splits using `RAYDIUM_FEE_RATE_DENOMINATOR`, identical to `swap.rs`.
+  - Applies Token-2022 transfer fees both pre-swap (input mint) and post-swap (output mint) using cached configs, reproducing the SDK’s `TokenAmount.applyFee` helpers.
+  - Computes `sqrt_price_after` so we can set `QuoteResponse.sqrt_price_limit` and propagate router hints.
+5. Emit `ClmmSwapSimulation` containing `executed_input_amount`, `net_output_amount`, protocol/fund fee totals, and the post-trade sqrt price. The adapter declines to quote rather than approximating when simulation prerequisites fail (missing hydration, zero liquidity, incomplete tick arrays), keeping parity with SDK fallbacks.
 
 ### Fees & Limits
 
 - Trade fee tier comes from AMM config (`trade_fee_rate` / `fee_bps`).
-- Protocol/fund fees are available on-chain (see `swap.rs`), but we currently ignore them in simulation. TODO: copy the proportional deductions so `amount_out` matches on-chain reality even when those knobs are non-zero.
-- `sqrt_price_limit` defaults to 0 (meaning “best effort”) unless simulation provides a bound. This behavior matches `swap_v2.rs`’s clamp to MIN/MAX tick when 0 is supplied.
+- Protocol + fund fees are applied per-step and surfaced via `TemplateContext.expected_fee_amount`. Downstream legs subtract this value when deriving min-output/slippage, so bundle plans match on-chain behavior even when Raydium’s operator toggles those knobs.
+- Token-2022 transfer fees are modeled by `apply_post_fee_amount` / `apply_pre_fee_amount`; quoted outputs always represent the *net* amount that final token accounts will receive.
+- `sqrt_price_limit` defaults to 0 (meaning “best effort”) unless simulation provides a bound. We now always populate it with `sqrt_price_after` so router callers can enforce deterministic slippage clamps the same way the SDK does.
 
 ## Instruction Templates & Routing
 
 - Accounts and arguments must match the `SwapSingleV2` struct exactly; `docs/swaps/amm_v3_swaps.md` stays in sync with upstream.
-- Template context includes:
+- Template context now carries every hint the SDK requires to build router hops:
   - Program IDs: Raydium v3, SPL Token, Token-2022, Memo (see `SWAP_MEMO_MSG`).
   - User ATAs resolved via `BuilderHandle::token_account_for_mint`.
-  - Tick-array accounts in the order produced by hydrator (current + two lookahead/behind depending on direction).
+  - Tick-array accounts in the order produced by hydrator (current + two lookahead/behind depending on direction) plus the optional tick-array bitmap extension PDA.
   - PDA bumps for `pool`, `vault_0/1`, `observation`.
+  - Token-2022 transfer-fee config hints (epoch/max_fee/bps) for both input and output mints so Stage 2 can pre-build CPI metadata without re-reading mints.
+  - Raydium pool status byte, protocol/fund fee bps, and `expected_fee_amount` (protocol + fund aggregate) allowing the planner to subtract non-trade fees before computing slippage tolerances.
+  - Remaining-account slices for LB/transfer-hook parity are untouched, but we now reuse the same `MintAccountMeta` cache the transfer-hook resolver uses, ensuring Token-2022 owners stay consistent across components.
 - Templates are registered with the builder (`register_amm_v3_pool`) once fee tier + PDA data exist. The builder also seeds ALT entries so the fast lane discovers the same account layout the router expects.
 - For router-style multi-hop flows, the outgoing token account from hop _n_ becomes the input ATA for hop _n + 1_. Because our context stores both mint + ATA for every leg, we can chain templates without recomputation.
 
@@ -71,7 +83,9 @@ Eviction happens whenever `slot` drift exceeds `config.stale_slot_threshold` or 
   - `MissingTickArrays` – hydrator could not fetch 3 arrays (quote will be XYK-based).
   - `StaleState` – TTL eviction flagged the pool before quoting.
   - `InsufficientLiquidity` – `simulate_clmm_exact_in` exhausted liquidity before finishing.
+  - `TokenFeeUnsupported` – raised when transfer-fee math produces zero executable budget (mirrors SDK guardrails).
 - Metrics/logs (tracing target `adapter::raydium_v3`): hydration retries, cache hits, XYK fallback rate, ALT registration failures.
+- Transfer-hook telemetry (`hydration_transfer_hook_events_total`) now records mint-owner lookup failures, validation account fetch errors, and success paths so we can alert when Token-2022 hooks degrade quoting.
 - When hydrator repeatedly fails to fetch AMM configs/mints, `missing_*` maps enforce an exponential backoff so we do not DOS RPC.
 
 ## Integration & Testing Checklist
@@ -84,8 +98,8 @@ Eviction happens whenever `slot` drift exceeds `config.stale_slot_threshold` or 
 
 ## Known Gaps / TODOs
 
-- Model protocol + fund fees exactly as `swap.rs` does (they currently reduce pool-level fee growth but not our quote output).
-- Add `sqrt_price_limit` clamping for strategies that want partial-fill protection instead of best-effort.
+- Export the SDK-style “remaining accounts bitmap” info so the dashboard can show when pools are ejected for maintenance.
+- Add `sqrt_price_limit` overrides for strategies that want tighter-than-SDK clamps (we currently mirror Raydium defaults).
 - Improve visibility when hydrator re-registers templates because builder ALTs missed a pool.
 - Consider caching router-ready account lists (input/output mint order) to reduce per-quote decoration time.
 

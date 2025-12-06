@@ -53,6 +53,7 @@ struct TelemetryState {
     hydration_adapter_ingest: Family<HydrationAdapterLabels, Counter>,
     hydration_rpc_refresh_success: Family<HydrationAdapterLabels, Counter>,
     hydration_rpc_refresh_failure: Family<HydrationAdapterLabels, Counter>,
+    hydration_transfer_hook_events: Family<TransferHookEventLabels, Counter>,
     hydration_pool_price_scaled: Family<HydrationPoolLabels, Gauge>,
     hydration_pool_slot: Family<HydrationPoolLabels, Gauge>,
     hydration_pool_base_liquidity: Family<HydrationPoolLabels, Gauge>,
@@ -240,6 +241,13 @@ impl TelemetryState {
             hydration_rpc_refresh_failure.clone(),
         );
 
+        let hydration_transfer_hook_events = Family::default();
+        registry.register(
+            "hydration_transfer_hook_events_total",
+            "Transfer-hook resolver lifecycle events grouped by reason",
+            hydration_transfer_hook_events.clone(),
+        );
+
         let hydration_pool_price_scaled = Family::default();
         registry.register(
             "hydration_pool_price_scaled",
@@ -413,6 +421,7 @@ impl TelemetryState {
             hydration_adapter_ingest,
             hydration_rpc_refresh_success,
             hydration_rpc_refresh_failure,
+            hydration_transfer_hook_events,
             hydration_pool_price_scaled,
             hydration_pool_slot,
             hydration_pool_base_liquidity,
@@ -635,6 +644,12 @@ struct HydrationPoolLabels {
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct TransferHookEventLabels {
+    event: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 struct WatcherUpdateLabels {
     adapter: String,
 }
@@ -651,6 +666,19 @@ pub enum Stage2PlanEvent {
     PrepareFailed,
 }
 
+pub enum TransferHookEvent {
+    ResolveSuccess,
+    ResolveFailure(TransferHookFailureReason),
+}
+
+#[derive(Clone, Copy)]
+pub enum TransferHookFailureReason {
+    MintOwnerLookup,
+    ValidationAccountMissing,
+    AccountFetch,
+    ExtraAccountBuild,
+}
+
 impl Stage2PlanEvent {
     fn event(&self) -> &'static str {
         "failure"
@@ -660,6 +688,30 @@ impl Stage2PlanEvent {
         match self {
             Stage2PlanEvent::PlanFailed => "plan_failed",
             Stage2PlanEvent::PrepareFailed => "prepare_failed",
+        }
+    }
+}
+
+impl TransferHookEvent {
+    fn event(&self) -> &'static str {
+        "resolve"
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            TransferHookEvent::ResolveSuccess => "success",
+            TransferHookEvent::ResolveFailure(reason) => reason.label(),
+        }
+    }
+}
+
+impl TransferHookFailureReason {
+    fn label(&self) -> &'static str {
+        match self {
+            TransferHookFailureReason::MintOwnerLookup => "mint_owner_lookup",
+            TransferHookFailureReason::ValidationAccountMissing => "validation_missing",
+            TransferHookFailureReason::AccountFetch => "account_fetch",
+            TransferHookFailureReason::ExtraAccountBuild => "extra_account_build",
         }
     }
 }
@@ -866,6 +918,19 @@ pub fn record_hydration_rpc_refresh_failure(adapter: &str) {
         };
         state
             .hydration_rpc_refresh_failure
+            .get_or_create(&labels)
+            .inc();
+    }
+}
+
+pub fn record_transfer_hook_event(event: TransferHookEvent) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = TransferHookEventLabels {
+            event: event.event(),
+            reason: event.reason(),
+        };
+        state
+            .hydration_transfer_hook_events
             .get_or_create(&labels)
             .inc();
     }

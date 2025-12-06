@@ -471,6 +471,7 @@ pub enum LbClmmField {
     AmountOut,
     LimitPrice,
     PriceImpactLimit,
+    RemainingAccountsInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -554,11 +555,12 @@ pub struct LbClmmFieldLayout {
     pub amount_out: Option<TemplateSlice>,
     pub limit_price: Option<TemplateSlice>,
     pub price_impact_bps: Option<TemplateSlice>,
+    pub remaining_accounts_info: Option<TemplateSlice>,
 }
 
 impl LbClmmFieldLayout {
     fn into_patches(self) -> Vec<TemplatePatch> {
-        let mut patches = Vec::with_capacity(4);
+        let mut patches = Vec::with_capacity(5);
         patches.push(TemplatePatch {
             offset: self.amount_in.offset,
             length: self.amount_in.length,
@@ -583,6 +585,13 @@ impl LbClmmFieldLayout {
                 offset: slice.offset,
                 length: slice.length,
                 kind: TemplateFieldKind::LbClmm(LbClmmField::PriceImpactLimit),
+            });
+        }
+        if let Some(slice) = self.remaining_accounts_info {
+            patches.push(TemplatePatch {
+                offset: slice.offset,
+                length: slice.length,
+                kind: TemplateFieldKind::LbClmm(LbClmmField::RemainingAccountsInfo),
             });
         }
         patches
