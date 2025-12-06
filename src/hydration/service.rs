@@ -207,6 +207,7 @@ impl HydrationService {
                 None
             }
         });
+        let slot_lag = self.config.watcher.pool_stale_slot_lag;
         let sweep = Duration::from_millis(self.config.watcher.pool_stale_sweep_ms.max(50));
         let builder = self.builder.clone();
         let require_alt_ready = self.alt_required_for_readiness;
@@ -225,6 +226,7 @@ impl HydrationService {
                     adapter_book,
                     refresher,
                     ttl,
+                    slot_lag,
                     sweep,
                     builder,
                     require_alt_ready,
@@ -499,26 +501,29 @@ fn run_pool_maintenance_loop(
     adapter_book: Arc<AdapterBook>,
     refresher: Arc<RpcRefresher>,
     ttl: Option<Duration>,
+    slot_lag: Option<u64>,
     sweep: Duration,
     builder: BuilderHandle,
     require_alt_ready: bool,
 ) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        let Some(ttl_value) = ttl else {
-            thread::sleep(sweep);
-            continue;
-        };
-        let stale = pool_store.collect_stale(ttl_value);
-        if stale.is_empty() {
+        pool_store.flag_stale_candidates(ttl, slot_lag);
+        let pending = pool_store.drain_refresh_queue();
+        if pending.is_empty() {
             thread::sleep(sweep);
             continue;
         }
-        for state in stale {
+        for (state, min_slot) in pending {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             let protocol = state.program_id.clone();
             if let Some(mut refreshed) = refresher.refresh(&state.snapshot) {
+                if refreshed.slot < min_slot {
+                    pool_store.queue_refresh(&state.pool_id, min_slot);
+                    telemetry::record_hydration_rpc_refresh_failure(&protocol);
+                    continue;
+                }
                 if let Some(quotes) = adapter_book.snapshot_quotes(&mut refreshed) {
                     refreshed.quotes = Some(quotes);
                 }
@@ -527,9 +532,8 @@ fn run_pool_maintenance_loop(
                 telemetry::record_hydration_rpc_refresh(&protocol);
             } else {
                 telemetry::record_hydration_rpc_refresh_failure(&protocol);
-                if pool_store.mark_snapshot_stale(&state.pool_id) {
-                    telemetry::record_hydration_stale_pools(1);
-                }
+                pool_store.queue_refresh(&state.pool_id, min_slot);
+                telemetry::record_hydration_stale_pools(1);
             }
         }
         thread::sleep(sweep);

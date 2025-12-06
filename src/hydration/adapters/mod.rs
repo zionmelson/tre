@@ -11,7 +11,7 @@ mod lb_clmm;
 mod raydium_v3;
 mod whirlpool;
 
-pub(crate) use hydration::AsyncHydrator;
+pub(crate) use hydration::{AsyncHydrator, HydratedValue};
 
 pub use crate::template::TemplateContext;
 pub use cp_amm::{CpAmmAdapter, CpAmmAdapterConfig, CpAmmState};

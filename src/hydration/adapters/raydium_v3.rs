@@ -15,7 +15,7 @@ use solana_client::rpc_config::{
 };
 use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
 use solana_client::rpc_response::{UiAccount, UiAccountData};
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{account::Account, pubkey::Pubkey};
 use spl_token_2022::extension::{
     transfer_fee::{TransferFee as SplTokenTransferFee, TransferFeeConfig as SplTransferFeeConfig},
     BaseStateWithExtensions, StateWithExtensionsOwned,
@@ -31,8 +31,9 @@ use crate::hydration::types::{
     RaydiumTransferFeeConfig, RaydiumV3PoolExtras, RAYDIUM_V3_INPUT_UTILIZATION_BPS,
 };
 use crate::template::{TemplateContext, TransferFeeConfigHint};
+use crate::telemetry;
 
-use super::hydration::AsyncHydrator;
+use super::hydration::{AsyncHydrator, HydratedValue};
 use super::{
     build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, SwapDirection,
 };
@@ -93,6 +94,7 @@ struct TickArrayCache {
 #[derive(Debug, Clone)]
 struct TickArrayCacheEntry {
     hydrated_at: Instant,
+    hydrated_slot: u64,
     accounts: Vec<Pubkey>,
 }
 
@@ -270,7 +272,8 @@ impl RaydiumV3Adapter {
             return;
         };
 
-        let extras = self.enrich_extras(pool_pubkey, base_mint, quote_mint, extras);
+        let (extras, hydrated_meta_slot) =
+            self.enrich_extras(pool_pubkey, base_mint, quote_mint, extras);
         let RaydiumV3PoolExtras {
             tick_spacing,
             sqrt_price_x64,
@@ -298,11 +301,54 @@ impl RaydiumV3Adapter {
         let base_transfer_fee = base_transfer_fee_config.map(TransferFeeConfigSummary::from);
         let quote_transfer_fee = quote_transfer_fee_config.map(TransferFeeConfigSummary::from);
 
-        let tick_array_cache = self
-            .state
-            .get(&pool_pubkey)
+        let previous_state = self.state.get(&pool_pubkey);
+        let mut tick_array_cache = previous_state
+            .as_ref()
             .map(|entry| entry.tick_array_cache.clone())
             .unwrap_or_default();
+        let mut recorded_meta_slot = hydrated_meta_slot;
+        let mut recorded_tick_slot = previous_state
+            .as_ref()
+            .and_then(|entry| entry.hydrated_tick_arrays_slot);
+
+        if recorded_meta_slot.is_none() {
+            if let Some(prev) = previous_state.as_ref() {
+                if prev
+                    .hydrated_meta_slot
+                    .map(|slot| slot >= update.slot)
+                    .unwrap_or(false)
+                {
+                    recorded_meta_slot = prev.hydrated_meta_slot;
+                }
+            }
+        }
+
+        if recorded_meta_slot
+            .map(|slot| slot < update.slot)
+            .unwrap_or(true)
+        {
+            recorded_meta_slot = None;
+            if let Some(hydrator) = self.hydrator.as_ref() {
+                hydrator.refresh_pool_meta(pool_pubkey);
+            }
+        }
+
+        let mut refreshed_tick_arrays = false;
+        if recorded_tick_slot
+            .map(|slot| slot < update.slot)
+            .unwrap_or(true)
+        {
+            tick_array_cache = TickArrayCache::default();
+            recorded_tick_slot = None;
+            refreshed_tick_arrays = true;
+        }
+        if refreshed_tick_arrays {
+            if let Some(hydrator) = self.hydrator.as_ref() {
+                hydrator.refresh_tick_arrays(pool_pubkey);
+            }
+        }
+
+        drop(previous_state);
 
         let state = RaydiumV3State {
             pool_id: pool_pubkey,
@@ -320,6 +366,7 @@ impl RaydiumV3Adapter {
             vault_quote: update.quote_post_amount,
             last_update_slot: update.slot,
             last_update_at: Instant::now(),
+            corecast_slot: update.slot,
             pool_bump,
             observation_bump,
             vault_bumps,
@@ -330,6 +377,8 @@ impl RaydiumV3Adapter {
             pool_status,
             base_transfer_fee,
             quote_transfer_fee,
+            hydrated_meta_slot: recorded_meta_slot,
+            hydrated_tick_arrays_slot: recorded_tick_slot,
             tick_array_cache,
         };
 
@@ -344,6 +393,7 @@ impl RaydiumV3Adapter {
 
         self.register_templates_with_builder(&state);
         self.request_tick_arrays(&state);
+        self.record_hydration_metrics(&state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
     }
@@ -355,17 +405,18 @@ impl RaydiumV3Adapter {
             && state.current_tick.is_some()
     }
 
-    fn tick_arrays_ready(&self, state: &RaydiumV3State) -> bool {
-        let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
-        Self::tick_cache_entry_ready(state.tick_array_cache.zero_for_one.as_ref(), ttl)
-            && Self::tick_cache_entry_ready(state.tick_array_cache.one_for_zero.as_ref(), ttl)
-    }
-
-    fn tick_cache_entry_ready(entry: Option<&TickArrayCacheEntry>, ttl: Duration) -> bool {
+    fn tick_cache_entry_ready(
+        entry: Option<&TickArrayCacheEntry>,
+        ttl: Duration,
+        target_slot: u64,
+    ) -> bool {
         let Some(cache) = entry else {
             return false;
         };
         if cache.accounts.len() < REQUIRED_TICK_ARRAYS_PER_SIDE {
+            return false;
+        }
+        if cache.hydrated_slot < target_slot {
             return false;
         }
         ttl.as_millis() == 0 || cache.hydrated_at.elapsed() <= ttl
@@ -379,16 +430,40 @@ impl RaydiumV3Adapter {
         }
     }
 
+    fn eager_hydration(
+        &self,
+        pool: Pubkey,
+        base_mint: Option<Pubkey>,
+        quote_mint: Option<Pubkey>,
+    ) {
+        if let Some(hydrator) = self.hydrator.as_ref() {
+            hydrator.hydrate(pool);
+            if let Some(base) = base_mint {
+                hydrator.lookup_mint_program(base);
+                let _ = hydrator.mint_transfer_fee_config(base);
+            }
+            if let Some(quote) = quote_mint {
+                hydrator.lookup_mint_program(quote);
+                let _ = hydrator.mint_transfer_fee_config(quote);
+            }
+        }
+        if let Some(state) = self.get_state(&pool) {
+            self.request_tick_arrays(&state);
+        }
+    }
+
     fn enrich_extras(
         &self,
         pool: Pubkey,
         base_mint: Pubkey,
         quote_mint: Pubkey,
         mut extras: RaydiumV3PoolExtras,
-    ) -> RaydiumV3PoolExtras {
+    ) -> (RaydiumV3PoolExtras, Option<u64>) {
         let Some(hydrator) = self.hydrator.as_ref() else {
-            return extras;
+            return (extras, None);
         };
+
+        let mut hydrated_slot = None;
 
         if let Some(meta) = hydrator.hydrate(pool) {
             extras.tick_spacing = extras.tick_spacing.or(Some(meta.tick_spacing));
@@ -407,6 +482,7 @@ impl RaydiumV3Adapter {
                 .tick_array_bitmap_extension
                 .or(Some(meta.tick_array_bitmap_extension));
             extras.pool_status = extras.pool_status.or(Some(meta.pool_status));
+            hydrated_slot = Some(meta.slot);
         }
 
         extras.base_token_program = extras
@@ -426,7 +502,7 @@ impl RaydiumV3Adapter {
                 .map(Into::into);
         }
 
-        extras
+        (extras, hydrated_slot)
     }
 
     fn register_templates_with_builder(&self, state: &RaydiumV3State) {
@@ -634,6 +710,34 @@ impl RaydiumV3Adapter {
         );
     }
 
+    fn record_hydration_metrics(&self, state: &RaydiumV3State) {
+        let adapter = self.name();
+        let meta_slot = state.hydrated_meta_slot.unwrap_or(0);
+        let tick_slot = state.hydrated_tick_arrays_slot.unwrap_or(0);
+        let meta_delta = state.corecast_slot.saturating_sub(meta_slot);
+        let tick_delta = state.corecast_slot.saturating_sub(tick_slot);
+        telemetry::record_hydration_component_slot_delta(
+            adapter,
+            HydrationComponent::Meta.as_str(),
+            meta_delta,
+        );
+        telemetry::record_hydration_component_slot_delta(
+            adapter,
+            HydrationComponent::TickArrays.as_str(),
+            tick_delta,
+        );
+
+        let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
+        let stage = if !state.meta_ready_for_slot(state.corecast_slot) {
+            0
+        } else if !state.tick_arrays_ready_for_slot(state.corecast_slot, ttl) {
+            1
+        } else {
+            2
+        };
+        telemetry::record_hydration_stage(adapter, &state.pool_id.to_string(), stage);
+    }
+
     fn decorate_quote_context(
         &self,
         context: &mut TemplateContext,
@@ -795,33 +899,72 @@ impl RaydiumV3Adapter {
             if let (Some(tick_spacing), Some(current_tick)) =
                 (state.tick_spacing, state.current_tick)
             {
-                if let Some(arrays) = hydrator.preferred_tick_arrays_for_swap(
+                if let Some(selection) = hydrator.preferred_tick_arrays_for_swap(
                     state.pool_id,
                     tick_spacing,
                     current_tick,
                     zero_for_one,
                 ) {
-                    self.update_tick_array_cache(state.pool_id, zero_for_one, arrays.clone());
-                    return Some(arrays);
+                    if selection.slot < state.corecast_slot {
+                        hydrator.refresh_tick_arrays(state.pool_id);
+                        self.request_tick_arrays(state);
+                    } else {
+                        self.update_tick_array_cache(
+                            state.pool_id,
+                            zero_for_one,
+                            selection.accounts.clone(),
+                            selection.slot,
+                        );
+                        return Some(selection.accounts);
+                    }
                 }
             }
         }
-        self.cached_tick_arrays(state.pool_id, zero_for_one, ttl)
+        self.cached_tick_arrays(state.pool_id, zero_for_one, ttl, state.corecast_slot)
     }
 
-    fn update_tick_array_cache(&self, pool_id: Pubkey, zero_for_one: bool, accounts: Vec<Pubkey>) {
+    fn update_tick_array_cache(
+        &self,
+        pool_id: Pubkey,
+        zero_for_one: bool,
+        accounts: Vec<Pubkey>,
+        slot: u64,
+    ) {
         if accounts.is_empty() {
             return;
         }
         if let Some(mut entry) = self.state.get_mut(&pool_id) {
             let cache_entry = TickArrayCacheEntry {
                 hydrated_at: Instant::now(),
+                hydrated_slot: slot,
                 accounts,
             };
             if zero_for_one {
                 entry.tick_array_cache.zero_for_one = Some(cache_entry);
             } else {
                 entry.tick_array_cache.one_for_zero = Some(cache_entry);
+            }
+            let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
+            if Self::tick_cache_entry_ready(
+                entry.tick_array_cache.zero_for_one.as_ref(),
+                ttl,
+                entry.corecast_slot,
+            ) && Self::tick_cache_entry_ready(
+                entry.tick_array_cache.one_for_zero.as_ref(),
+                ttl,
+                entry.corecast_slot,
+            ) {
+                let zero_slot = entry
+                    .tick_array_cache
+                    .zero_for_one
+                    .as_ref()
+                    .map(|cache| cache.hydrated_slot);
+                let one_slot = entry
+                    .tick_array_cache
+                    .one_for_zero
+                    .as_ref()
+                    .map(|cache| cache.hydrated_slot);
+                entry.hydrated_tick_arrays_slot = zero_slot.zip(one_slot).map(|(a, b)| a.min(b));
             }
         }
     }
@@ -831,6 +974,7 @@ impl RaydiumV3Adapter {
         pool_id: Pubkey,
         zero_for_one: bool,
         ttl: Duration,
+        target_slot: u64,
     ) -> Option<Vec<Pubkey>> {
         let entry = self.state.get(&pool_id)?;
         let cache_opt = if zero_for_one {
@@ -839,6 +983,9 @@ impl RaydiumV3Adapter {
             entry.tick_array_cache.one_for_zero.as_ref()
         }?;
         if cache_opt.accounts.is_empty() {
+            return None;
+        }
+        if cache_opt.hydrated_slot < target_slot {
             return None;
         }
         if ttl.as_millis() > 0 && cache_opt.hydrated_at.elapsed() > ttl {
@@ -1095,6 +1242,26 @@ impl RaydiumV3Adapter {
             (state.quote_mint, state.base_mint)
         };
 
+        let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
+        if !state.meta_ready_for_slot(slot) || !state.tick_arrays_ready_for_slot(slot, ttl) {
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::HydrationPending,
+                "hydration_pending",
+                Some(probe_amount),
+            );
+            return Some(self.unavailable_snapshot_side(
+                input_mint,
+                output_mint,
+                slot,
+                fee_bps,
+                template_fee_bps,
+                QuoteStatus::HydrationPending,
+            ));
+        }
+
         if state.is_disabled() {
             self.record_snapshot_issue(
                 state,
@@ -1292,8 +1459,14 @@ impl ProtocolAdapter for RaydiumV3Adapter {
             return;
         }
 
+        let pool_pubkey = parse_pubkey(&update.pool_id);
+        let base_mint = parse_pubkey(&update.base_mint);
+        let quote_mint = parse_pubkey(&update.quote_mint);
         // CoreCast metadata is often stale; rely solely on on-chain hydration.
         self.upsert_state(update, RaydiumV3PoolExtras::default());
+        if let Some(pool) = pool_pubkey {
+            self.eager_hydration(pool, base_mint, quote_mint);
+        }
     }
 
     fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
@@ -1305,15 +1478,20 @@ impl ProtocolAdapter for RaydiumV3Adapter {
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
-        if Self::meta_ready(&state) {
-            snapshot
-                .hydration
-                .mark_ready(HydrationComponent::Meta, state.last_update_slot);
+        if state.meta_ready_for_slot(snapshot.slot) {
+            if let Some(slot) = state.hydrated_meta_slot {
+                snapshot
+                    .hydration
+                    .mark_ready(HydrationComponent::Meta, slot);
+            }
         }
-        if self.tick_arrays_ready(&state) {
-            snapshot
-                .hydration
-                .mark_ready(HydrationComponent::TickArrays, state.last_update_slot);
+        let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
+        if state.tick_arrays_ready_for_slot(snapshot.slot, ttl) {
+            if let Some(slot) = state.hydrated_tick_arrays_slot {
+                snapshot
+                    .hydration
+                    .mark_ready(HydrationComponent::TickArrays, slot);
+            }
         } else {
             self.request_tick_arrays(&state);
         }
@@ -1348,6 +1526,12 @@ impl ProtocolAdapter for RaydiumV3Adapter {
         if state.is_stale(Some(req.slot), &self.config) {
             let mut response = build_quote_response(req, 0);
             response.status = QuoteStatus::StaleState;
+            return Some(response);
+        }
+        let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
+        if !state.meta_ready_for_slot(req.slot) || !state.tick_arrays_ready_for_slot(req.slot, ttl) {
+            let mut response = build_quote_response(req, 0);
+            response.status = QuoteStatus::HydrationPending;
             return Some(response);
         }
         req.amount = self.clamp_request_amount(&state, &req);
@@ -1395,6 +1579,12 @@ impl ProtocolAdapter for RaydiumV3Adapter {
         if state.is_stale(Some(req.slot), &self.config) {
             let mut response = build_quote_response(req, 0);
             response.status = QuoteStatus::StaleState;
+            return Some(response);
+        }
+        let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
+        if !state.meta_ready_for_slot(req.slot) || !state.tick_arrays_ready_for_slot(req.slot, ttl) {
+            let mut response = build_quote_response(req, 0);
+            response.status = QuoteStatus::HydrationPending;
             return Some(response);
         }
 
@@ -1513,6 +1703,7 @@ pub struct RaydiumV3State {
     pub vault_quote: u128,
     pub last_update_slot: u64,
     pub last_update_at: Instant,
+    pub corecast_slot: u64,
     pub pool_bump: Option<u8>,
     pub observation_bump: Option<u8>,
     pub vault_bumps: Option<[u8; 2]>,
@@ -1523,6 +1714,8 @@ pub struct RaydiumV3State {
     pub pool_status: Option<u8>,
     pub base_transfer_fee: Option<TransferFeeConfigSummary>,
     pub quote_transfer_fee: Option<TransferFeeConfigSummary>,
+    pub hydrated_meta_slot: Option<u64>,
+    pub hydrated_tick_arrays_slot: Option<u64>,
     tick_array_cache: TickArrayCache,
 }
 
@@ -1532,6 +1725,33 @@ impl RaydiumV3State {
             return None;
         }
         Some(self.vault_quote as f64 / self.vault_base as f64)
+    }
+
+    pub fn meta_ready_for_slot(&self, slot: u64) -> bool {
+        self.hydrated_meta_slot
+            .map(|value| value >= slot)
+            .unwrap_or(false)
+            && RaydiumV3Adapter::meta_ready(self)
+    }
+
+    pub fn tick_arrays_ready_for_slot(
+        &self,
+        slot: u64,
+        ttl: Duration,
+    ) -> bool {
+        self.hydrated_tick_arrays_slot
+            .map(|value| value >= slot)
+            .unwrap_or(false)
+            && RaydiumV3Adapter::tick_cache_entry_ready(
+                self.tick_array_cache.zero_for_one.as_ref(),
+                ttl,
+                slot,
+            )
+            && RaydiumV3Adapter::tick_cache_entry_ready(
+                self.tick_array_cache.one_for_zero.as_ref(),
+                ttl,
+                slot,
+            )
     }
 
     pub fn is_disabled(&self) -> bool {
@@ -1674,6 +1894,17 @@ fn tick_in_span(start: i32, span: i32, tick: i32) -> bool {
     tick_i64 >= start_i64 && tick_i64 < end_i64
 }
 
+fn push_tick_array_unique(
+    selected: &mut Vec<Pubkey>,
+    min_slot: &mut u64,
+    array: &HydratedTickArray,
+) {
+    if !selected.iter().any(|item| *item == array.address) {
+        selected.push(array.address);
+    }
+    *min_slot = (*min_slot).min(array.hydrated_slot);
+}
+
 fn clamp_to_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
@@ -1744,6 +1975,7 @@ struct HydratedPoolMeta {
     fund_fee_rate: Option<u32>,
     tick_array_bitmap_extension: Pubkey,
     pool_status: u8,
+    slot: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1762,6 +1994,13 @@ struct HydratedTickArray {
     ticks: Vec<HydratedTick>,
     initialized_tick_count: u8,
     recent_epoch: u64,
+    hydrated_slot: u64,
+}
+
+#[derive(Clone, Debug)]
+struct HydratedTickArraySelection {
+    accounts: Vec<Pubkey>,
+    slot: u64,
 }
 
 #[allow(dead_code)]
@@ -1942,6 +2181,10 @@ impl RaydiumPoolHydrator {
                 retry_backoff,
                 pool,
             )
+            .map(|meta| {
+                let slot = Some(meta.slot);
+                HydratedValue::with_timestamp(meta, slot, Instant::now())
+            })
         });
 
         Some(Self {
@@ -1962,6 +2205,10 @@ impl RaydiumPoolHydrator {
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
         self.pool_cache.get_or_schedule(pool)
+    }
+
+    fn refresh_pool_meta(&self, pool: Pubkey) {
+        self.pool_cache.refresh(pool);
     }
 
     fn lookup_mint_program(&self, mint: Pubkey) -> Option<Pubkey> {
@@ -2050,6 +2297,19 @@ impl RaydiumPoolHydrator {
         arrays
     }
 
+    fn refresh_tick_arrays(&self, pool: Pubkey) {
+        self.hydrated_tick_sets.remove(&pool);
+        let mut purge_keys = Vec::new();
+        for entry in self.tick_array_cache.iter() {
+            if entry.key().0 == pool {
+                purge_keys.push(*entry.key());
+            }
+        }
+        for key in purge_keys {
+            self.tick_array_cache.remove(&key);
+        }
+    }
+
     fn fetch_tick_arrays_for_pool(&self, pool: Pubkey) -> Option<Vec<HydratedTickArray>> {
         let pool_bytes = pool.to_bytes().to_vec();
         for client in self.clients.as_ref() {
@@ -2069,6 +2329,8 @@ impl RaydiumPoolHydrator {
                 sort_results: None,
             };
 
+            let slot_hint = client.get_slot().unwrap_or_default();
+
             match client.get_program_ui_accounts_with_config(&self.program_id, config) {
                 Ok(accounts) => {
                     let mut hydrated = Vec::new();
@@ -2076,7 +2338,7 @@ impl RaydiumPoolHydrator {
                         let Some(data) = decode_ui_account_bytes(&account) else {
                             continue;
                         };
-                        if let Some(array) = parse_tick_array_account(address, &data) {
+                        if let Some(array) = parse_tick_array_account(address, &data, slot_hint) {
                             if array.pool_id == pool {
                                 hydrated.push(array);
                             }
@@ -2106,7 +2368,7 @@ impl RaydiumPoolHydrator {
         tick_spacing: i32,
         current_tick: i32,
         zero_for_one: bool,
-    ) -> Option<Vec<Pubkey>> {
+    ) -> Option<HydratedTickArraySelection> {
         let span = tick_array_span(tick_spacing)?;
         if span == 0 {
             return None;
@@ -2131,19 +2393,20 @@ impl RaydiumPoolHydrator {
             })?;
 
         let mut selected = Vec::with_capacity(3);
-        push_unique_pubkey(&mut selected, arrays[anchor_idx].address);
+        let mut min_slot = u64::MAX;
+        push_tick_array_unique(&mut selected, &mut min_slot, &arrays[anchor_idx]);
 
         if zero_for_one {
             for step in 1..=2 {
                 if let Some(idx) = anchor_idx.checked_sub(step) {
-                    push_unique_pubkey(&mut selected, arrays[idx].address);
+                    push_tick_array_unique(&mut selected, &mut min_slot, &arrays[idx]);
                 }
             }
         } else {
             for step in 1..=2 {
                 let idx = anchor_idx + step;
                 if let Some(array) = arrays.get(idx) {
-                    push_unique_pubkey(&mut selected, array.address);
+                    push_tick_array_unique(&mut selected, &mut min_slot, array);
                 }
             }
         }
@@ -2153,7 +2416,7 @@ impl RaydiumPoolHydrator {
                 if selected.len() == 3 {
                     break;
                 }
-                push_unique_pubkey(&mut selected, array.address);
+                push_tick_array_unique(&mut selected, &mut min_slot, array);
             }
         }
 
@@ -2167,7 +2430,14 @@ impl RaydiumPoolHydrator {
             return None;
         }
 
-        Some(selected)
+        if min_slot == u64::MAX {
+            return None;
+        }
+
+        Some(HydratedTickArraySelection {
+            accounts: selected,
+            slot: min_slot,
+        })
     }
 
     fn warm_tick_arrays(&self, pool: Pubkey, tick_spacing: i32, current_tick: i32) {
@@ -2205,6 +2475,15 @@ impl RaydiumPoolHydrator {
 
 const MIN_RAYDIUM_POOL_ACCOUNT_LEN: usize = ANCHOR_DISCRIMINATOR_LEN + 390;
 
+fn fetch_account_with_slot(
+    client: &RpcClient,
+    address: &Pubkey,
+) -> Result<(Account, u64), ClientError> {
+    let account = client.get_account(address)?;
+    let slot = client.get_slot().unwrap_or_default();
+    Ok((account, slot))
+}
+
 fn parse_amm_config_account(data: &[u8]) -> Option<HydratedAmmConfig> {
     if data.len() < MIN_RAYDIUM_AMM_CONFIG_ACCOUNT_LEN {
         return None;
@@ -2235,6 +2514,7 @@ fn parse_pool_account(
     data: &[u8],
     program_id: &Pubkey,
     pool_id: &Pubkey,
+    slot: u64,
 ) -> Option<HydratedPoolMeta> {
     if data.len() < MIN_RAYDIUM_POOL_ACCOUNT_LEN {
         return None;
@@ -2289,6 +2569,7 @@ fn parse_pool_account(
         fund_fee_rate: None,
         tick_array_bitmap_extension: derive_tick_array_bitmap_extension(program_id, pool_id),
         pool_status,
+        slot,
     })
 }
 
@@ -2300,10 +2581,10 @@ fn fetch_raydium_pool_meta(
     pool: Pubkey,
 ) -> Option<HydratedPoolMeta> {
     for client in clients {
-        match client.get_account(&pool) {
-            Ok(account) => {
+        match fetch_account_with_slot(client, &pool) {
+            Ok((account, slot)) => {
                 if let Some(mut meta) =
-                    parse_pool_account(&account.data, &RAYDIUM_CLMM_PROGRAM, &pool)
+                    parse_pool_account(&account.data, &RAYDIUM_CLMM_PROGRAM, &pool, slot)
                 {
                     attach_config_fees_from_cache(
                         &mut meta,
@@ -2420,7 +2701,7 @@ fn hydrate_amm_config_from_clients(
     None
 }
 
-fn parse_tick_array_account(address: Pubkey, data: &[u8]) -> Option<HydratedTickArray> {
+fn parse_tick_array_account(address: Pubkey, data: &[u8], slot: u64) -> Option<HydratedTickArray> {
     if data.len() < MIN_RAYDIUM_TICK_ARRAY_ACCOUNT_LEN {
         return None;
     }
@@ -2467,6 +2748,7 @@ fn parse_tick_array_account(address: Pubkey, data: &[u8]) -> Option<HydratedTick
         ticks,
         initialized_tick_count,
         recent_epoch,
+        hydrated_slot: slot,
     })
 }
 
@@ -2884,7 +3166,7 @@ mod tests {
 
         let pool = Pubkey::new_unique();
         let meta =
-            parse_pool_account(&data, &RAYDIUM_CLMM_PROGRAM, &pool).expect("meta should parse");
+            parse_pool_account(&data, &RAYDIUM_CLMM_PROGRAM, &pool, 0).expect("meta should parse");
         assert_eq!(meta.pool_bump, 5);
         assert_eq!(meta.tick_spacing, tick_spacing as i32);
         assert_eq!(meta.liquidity, liquidity);
@@ -2947,7 +3229,8 @@ mod tests {
         let recent_epoch: u64 = 99;
         data[cursor..cursor + 8].copy_from_slice(&recent_epoch.to_le_bytes());
 
-        let array = parse_tick_array_account(address, &data).expect("tick array should parse");
+        let array =
+            parse_tick_array_account(address, &data, 0).expect("tick array should parse");
         assert_eq!(array.address, address);
         assert_eq!(array.pool_id, pool);
         assert_eq!(array.start_tick_index, start_tick_index);

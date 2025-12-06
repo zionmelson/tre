@@ -319,6 +319,7 @@ mod cp_amm {
         pub token_b_flag: Option<u8>,
         pub pool_fees: Option<CpAmmPoolFeesExtras>,
         pub hydrated_at: Option<Instant>,
+        pub hydrated_slot: Option<u64>,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -530,6 +531,8 @@ mod lb_clmm {
         pub bin_arrays: Vec<LbClmmBinArrayExtras>,
         pub active_bitmap: Option<LbClmmBitmapExtras>,
         pub rewards: Vec<LbClmmRewardExtras>,
+        pub hydrated_at: Option<Instant>,
+        pub hydrated_slot: Option<u64>,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -952,6 +955,8 @@ mod whirlpool {
         pub tick_array2: Option<String>,
         pub trade_enable_timestamp: Option<u64>,
         pub adaptive_fee: Option<WhirlpoolAdaptiveFeeInfo>,
+        pub hydrated_slot: Option<u64>,
+        pub hydrated_at: Option<Instant>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -9,10 +9,15 @@ use crate::builder::BuilderHandle;
 use crate::config::AppConfig;
 use crate::hydration::adapters::{
     AdapterReadiness, CpAmmAdapter, CpAmmAdapterConfig, LbClmmAdapter, LbClmmAdapterConfig,
-    ProtocolAdapter, QuoteRequest, QuoteResponse, RaydiumV3Adapter, RaydiumV3AdapterConfig,
-    SwapDirection, WhirlpoolAdapter, WhirlpoolAdapterConfig,
+    ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, RaydiumV3Adapter,
+    RaydiumV3AdapterConfig, SwapDirection, WhirlpoolAdapter, WhirlpoolAdapterConfig,
 };
-use crate::hydration::types::{HydrationComponent, PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate, TradeUpdate};
+use crate::hydration::types::{
+    HydrationComponent, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
+    TradeUpdate,
+};
+use crate::template::TemplateContext;
+use crate::telemetry;
 
 const BPS_DENOMINATOR: u64 = 10_000;
 
@@ -107,6 +112,10 @@ impl AdapterBook {
     pub fn snapshot_quotes(&self, snapshot: &mut PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         snapshot.allow_reserve_backfill = !self.requires_authoritative_quotes(&snapshot.program_id);
         let adapter = self.adapters.get(&snapshot.program_id)?;
+        if !snapshot.hydration.ready() {
+            telemetry::record_hydration_quote_blocked(adapter.name());
+            return Some(build_hydration_pending_quotes(snapshot));
+        }
         adapter.bidirectional_quotes(snapshot)
     }
 
@@ -177,6 +186,45 @@ fn register_adapter(
     adapter: Arc<dyn ProtocolAdapter>,
 ) {
     map.insert(adapter.program_id().to_string(), adapter);
+}
+
+fn build_hydration_pending_quotes(snapshot: &PoolSnapshot) -> PoolBidirectionalQuotes {
+    PoolBidirectionalQuotes {
+        base_to_quote: build_hydration_pending_side(
+            &snapshot.base_mint,
+            &snapshot.quote_mint,
+            snapshot.slot,
+        ),
+        quote_to_base: build_hydration_pending_side(
+            &snapshot.quote_mint,
+            &snapshot.base_mint,
+            snapshot.slot,
+        ),
+    }
+}
+
+fn build_hydration_pending_side(input_mint: &str, output_mint: &str, slot: u64) -> PoolQuoteSide {
+    PoolQuoteSide {
+        input_mint: input_mint.to_string(),
+        output_mint: output_mint.to_string(),
+        notional: 0,
+        expected_output: 0,
+        fee_bps: 0,
+        template_fee_bps: 0,
+        effective_price: 0.0,
+        estimated_slippage_bps: 0.0,
+        sqrt_price_limit: None,
+        min_output_amount: None,
+        limit_price: None,
+        price_impact_limit_bps: None,
+        amount_specified_is_input: true,
+        context: TemplateContext::default(),
+        status: QuoteStatus::HydrationPending,
+        sqrt_price_before_x64: None,
+        sqrt_price_after_x64: None,
+        tick_arrays_used: Vec::new(),
+        cache_slot: Some(slot),
+    }
 }
 
 #[cfg(test)]

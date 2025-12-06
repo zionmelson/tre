@@ -62,10 +62,18 @@ struct TelemetryState {
     hydration_component_pending: Family<HydrationComponentLabels, Counter>,
     hydration_component_lag_ms: Family<HydrationComponentLabels, Gauge>,
     hydration_component_lag_slots: Family<HydrationComponentLabels, Gauge>,
+    hydration_component_slot_delta: Family<HydrationComponentLabels, Gauge>,
+    hydration_stage_gauge: Family<HydrationStageLabels, Gauge>,
     hydration_stale_pools: Counter,
     hydration_queue_depth_pct: Gauge,
     hydration_queue_depth_items: Gauge,
     hydration_queue_drop_events: Counter,
+    hydration_job_scheduled: Family<HydrationWorkerLabels, Counter>,
+    hydration_job_finished: Family<HydrationJobStatusLabels, Counter>,
+    hydration_job_latency_ms: Family<HydrationJobStatusLabels, Histogram>,
+    hydration_job_queue_failures: Family<HydrationQueueFailureLabels, Counter>,
+    hydration_job_backoff_ms: Family<HydrationWorkerLabels, Gauge>,
+    hydration_quote_blocked: Family<HydrationAdapterLabels, Counter>,
     graph_pool_count: Gauge,
     graph_cycle_count: Gauge,
     graph_snapshot_latency: Histogram,
@@ -287,6 +295,13 @@ impl TelemetryState {
             hydration_component_lag_slots.clone(),
         );
 
+        let hydration_component_slot_delta = Family::default();
+        registry.register(
+            "hydration_component_slot_delta",
+            "CoreCast ingest slot minus the hydrated component slot (per adapter/component)",
+            hydration_component_slot_delta.clone(),
+        );
+
         let hydration_pool_slot = Family::default();
         registry.register(
             "hydration_pool_slot",
@@ -334,6 +349,57 @@ impl TelemetryState {
             "hydration_queue_drop_events_total",
             "Number of hydrator broadcast updates dropped due to backpressure",
             hydration_queue_drop_events.clone(),
+        );
+
+        let hydration_job_scheduled = Family::default();
+        registry.register(
+            "hydration_job_scheduled_total",
+            "Async hydrator enqueues grouped by worker name",
+            hydration_job_scheduled.clone(),
+        );
+
+        let hydration_job_finished = Family::default();
+        registry.register(
+            "hydration_job_finished_total",
+            "Async hydrator completions grouped by worker and status",
+            hydration_job_finished.clone(),
+        );
+
+        let hydration_job_latency_ms = Family::new_with_constructor(
+            hydration_job_latency_histogram as fn() -> Histogram,
+        );
+        registry.register(
+            "hydration_job_latency_ms",
+            "Observed latency per hydrator worker and status",
+            hydration_job_latency_ms.clone(),
+        );
+
+        let hydration_job_queue_failures = Family::default();
+        registry.register(
+            "hydration_job_queue_failures_total",
+            "Hydrator enqueue failures grouped by worker and reason",
+            hydration_job_queue_failures.clone(),
+        );
+
+        let hydration_job_backoff_ms = Family::default();
+        registry.register(
+            "hydration_job_backoff_ms",
+            "Last applied failure backoff duration per worker",
+            hydration_job_backoff_ms.clone(),
+        );
+
+        let hydration_quote_blocked = Family::default();
+        registry.register(
+            "hydration_quote_blocked_total",
+            "Quotes blocked while awaiting hydration grouped by adapter",
+            hydration_quote_blocked.clone(),
+        );
+
+        let hydration_stage_gauge = Family::default();
+        registry.register(
+            "hydration_stage",
+            "Stage ordinal (0=ingest,1=meta,2=tick_arrays) for each adapter/pool",
+            hydration_stage_gauge.clone(),
         );
 
         let graph_pool_count = Gauge::default();
@@ -459,6 +525,7 @@ impl TelemetryState {
             hydration_component_pending,
             hydration_component_lag_ms,
             hydration_component_lag_slots,
+            hydration_component_slot_delta,
             hydration_pool_slot,
             hydration_pool_base_liquidity,
             hydration_pool_quote_liquidity,
@@ -466,6 +533,13 @@ impl TelemetryState {
             hydration_queue_depth_pct,
             hydration_queue_depth_items,
             hydration_queue_drop_events,
+            hydration_job_scheduled,
+            hydration_job_finished,
+            hydration_job_latency_ms,
+            hydration_job_queue_failures,
+            hydration_job_backoff_ms,
+            hydration_quote_blocked,
+            hydration_stage_gauge,
             graph_pool_count,
             graph_cycle_count,
             graph_snapshot_latency,
@@ -598,6 +672,10 @@ fn should_export_metric(metric_name: &str) -> bool {
         .any(|prefix| metric_name.starts_with(prefix))
 }
 
+fn hydration_job_latency_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(0.25, 2.0, 20))
+}
+
 fn watcher_update_histogram_constructor() -> Histogram {
     Histogram::new(exponential_buckets(0.1, 2.0, 20))
 }
@@ -672,6 +750,23 @@ struct HydrationAdapterLabels {
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct HydrationWorkerLabels {
+    worker: String,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct HydrationJobStatusLabels {
+    worker: String,
+    status: &'static str,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct HydrationQueueFailureLabels {
+    worker: String,
+    reason: &'static str,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 struct HydrationPoolLabels {
     program: String,
     pool: String,
@@ -683,6 +778,12 @@ struct HydrationPoolLabels {
 struct HydrationComponentLabels {
     adapter: String,
     component: &'static str,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct HydrationStageLabels {
+    adapter: String,
+    pool: String,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
@@ -721,6 +822,12 @@ pub enum TransferHookFailureReason {
     ExtraAccountBuild,
 }
 
+#[derive(Clone, Copy)]
+pub enum HydrationJobStatus {
+    Success,
+    Failure,
+}
+
 impl Stage2PlanEvent {
     fn event(&self) -> &'static str {
         "failure"
@@ -754,6 +861,15 @@ impl TransferHookFailureReason {
             TransferHookFailureReason::ValidationAccountMissing => "validation_missing",
             TransferHookFailureReason::AccountFetch => "account_fetch",
             TransferHookFailureReason::ExtraAccountBuild => "extra_account_build",
+        }
+    }
+}
+
+impl HydrationJobStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            HydrationJobStatus::Success => "success",
+            HydrationJobStatus::Failure => "failure",
         }
     }
 }
@@ -998,6 +1114,106 @@ pub fn record_hydration_component_pending(
                 .get_or_create(&labels)
                 .set(clamp_u64_to_i64(slots));
         }
+    }
+}
+
+pub fn record_hydration_component_slot_delta(
+    adapter: &str,
+    component: &'static str,
+    delta: u64,
+) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationComponentLabels {
+            adapter: adapter.to_string(),
+            component,
+        };
+        state
+            .hydration_component_slot_delta
+            .get_or_create(&labels)
+            .set(clamp_u64_to_i64(delta));
+    }
+}
+
+pub fn record_hydration_job_scheduled(worker: &str) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationWorkerLabels {
+            worker: worker.to_string(),
+        };
+        state
+            .hydration_job_scheduled
+            .get_or_create(&labels)
+            .inc();
+    }
+}
+
+pub fn record_hydration_job_queue_failure(worker: &str, reason: &'static str) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationQueueFailureLabels {
+            worker: worker.to_string(),
+            reason,
+        };
+        state
+            .hydration_job_queue_failures
+            .get_or_create(&labels)
+            .inc();
+    }
+}
+
+pub fn record_hydration_job_finished(
+    worker: &str,
+    status: HydrationJobStatus,
+    latency: Duration,
+) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationJobStatusLabels {
+            worker: worker.to_string(),
+            status: status.label(),
+        };
+        state
+            .hydration_job_finished
+            .get_or_create(&labels)
+            .inc();
+        state
+            .hydration_job_latency_ms
+            .get_or_create(&labels)
+            .observe(latency.as_secs_f64() * 1_000.0);
+    }
+}
+
+pub fn record_hydration_job_backoff(worker: &str, delay: Duration) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationWorkerLabels {
+            worker: worker.to_string(),
+        };
+        state
+            .hydration_job_backoff_ms
+            .get_or_create(&labels)
+            .set(clamp_u64_to_i64(delay.as_millis() as u64));
+    }
+}
+
+pub fn record_hydration_quote_blocked(adapter: &str) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationAdapterLabels {
+            adapter: adapter.to_string(),
+        };
+        state
+            .hydration_quote_blocked
+            .get_or_create(&labels)
+            .inc();
+    }
+}
+
+pub fn record_hydration_stage(adapter: &str, pool: &str, stage: u64) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationStageLabels {
+            adapter: adapter.to_string(),
+            pool: pool.to_string(),
+        };
+        state
+            .hydration_stage_gauge
+            .get_or_create(&labels)
+            .set(clamp_u64_to_i64(stage));
     }
 }
 

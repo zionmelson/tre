@@ -10,6 +10,7 @@ pub enum QuoteStatus {
     StaleState,
     InsufficientLiquidity,
     MissingState,
+    HydrationPending,
     MissingReferral,
     MissingPartner,
     RateLimited,

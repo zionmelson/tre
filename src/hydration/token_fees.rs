@@ -12,7 +12,7 @@ use spl_token_2022::state::Mint as SplToken2022Mint;
 use spl_token_2022::ID as SPL_TOKEN_2022_PROGRAM_ID;
 use tracing::warn;
 
-use crate::hydration::adapters::AsyncHydrator;
+use crate::hydration::adapters::{AsyncHydrator, HydratedValue};
 
 #[derive(Clone, Copy, Debug)]
 pub struct TokenTransferFee {
@@ -94,6 +94,7 @@ impl TokenTransferFeeHydrator {
         let fetch_clients = clients.clone();
         let hydrator = AsyncHydrator::new("token_fee", endpoint_count, move |mint| {
             fetch_token_transfer_fee_meta(fetch_clients.as_ref(), mint)
+                .map(|meta| HydratedValue::new(meta, None))
         });
 
         Some(Self {
@@ -221,12 +222,16 @@ impl TokenTransferFeeHydrator {
         for (mint, fee, hook_program, token_program) in entries {
             cache.insert(
                 mint,
-                TransferFeeMeta {
-                    fee,
-                    transfer_hook_program_id: hook_program,
-                    token_program,
-                    hydrated_at: Instant::now(),
-                },
+                HydratedValue::with_timestamp(
+                    TransferFeeMeta {
+                        fee,
+                        transfer_hook_program_id: hook_program,
+                        token_program,
+                        hydrated_at: Instant::now(),
+                    },
+                    None,
+                    Instant::now(),
+                ),
             );
         }
         let hydrator = AsyncHydrator::with_cache("token_fee_static", 1, |_| None, cache);

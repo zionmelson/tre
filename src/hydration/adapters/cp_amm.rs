@@ -13,7 +13,7 @@ use spl_token_2022::state::Mint as SplToken2022Mint;
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
-use super::hydration::AsyncHydrator;
+use super::hydration::{AsyncHydrator, HydratedValue};
 use crate::builder::{BuilderHandle, CpAmmPoolAccounts, CpAmmPoolMeta};
 use crate::hydration::token_fees::{
     apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
@@ -24,6 +24,7 @@ use crate::hydration::types::{
     CP_AMM_INPUT_UTILIZATION_BPS,
 };
 use crate::template::TemplateContext;
+use crate::telemetry;
 
 use super::{
     build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, SwapDirection,
@@ -187,6 +188,7 @@ impl CpAmmAdapter {
             return;
         };
 
+        let previous_state = self.state.get(&pool_pubkey);
         let extras = self.enrich_extras(pool_pubkey, extras);
 
         let Some(base_mint) = extras
@@ -208,6 +210,36 @@ impl CpAmmAdapter {
             warn!(target = "adapter::cp_amm", pool = %update.pool_id, "invalid quote mint");
             return;
         };
+
+        let mut hydrated_meta_slot = extras.hydrated_slot;
+        if hydrated_meta_slot
+            .map(|slot| slot < update.slot)
+            .unwrap_or(true)
+        {
+            if let Some(existing) = previous_state.as_ref() {
+                if existing
+                    .hydrated_meta_slot
+                    .map(|slot| slot >= update.slot)
+                    .unwrap_or(false)
+                {
+                    hydrated_meta_slot = existing.hydrated_meta_slot;
+                }
+            }
+        }
+
+        if hydrated_meta_slot
+            .map(|slot| slot < update.slot)
+            .unwrap_or(true)
+        {
+            if let Some(hydrator) = self.hydrator.as_ref() {
+                hydrator.refresh(pool_pubkey);
+            }
+            hydrated_meta_slot = None;
+        }
+
+        let last_hydrated_at = extras
+            .hydrated_at
+            .or_else(|| previous_state.as_ref().and_then(|existing| existing.last_hydrated_at));
 
         let mut state = CpAmmState {
             pool: pool_pubkey,
@@ -267,9 +299,11 @@ impl CpAmmAdapter {
             sqrt_max_price_x64: extras.sqrt_max_price_x64,
             vault_a_balance: update.base_post_amount,
             vault_b_balance: update.quote_post_amount,
+            corecast_slot: update.slot,
             last_update_slot: update.slot,
             last_update_at: Instant::now(),
-            last_hydrated_at: extras.hydrated_at,
+            last_hydrated_at,
+            hydrated_meta_slot,
             token_a_transfer_fee: None,
             token_b_transfer_fee: None,
             last_block_time_unix: normalize_block_time(update.block_time_unix),
@@ -289,6 +323,8 @@ impl CpAmmAdapter {
         );
 
         self.register_templates_with_builder(&state);
+        self.record_hydration_metrics(&state);
+        drop(previous_state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
     }
@@ -388,6 +424,22 @@ impl CpAmmAdapter {
         });
 
         self.registered_templates.insert(state.pool, signature);
+    }
+
+    fn record_hydration_metrics(&self, state: &CpAmmState) {
+        let adapter = self.name();
+        let meta_slot = state.hydrated_meta_slot.unwrap_or(0);
+        let delta = state.corecast_slot.saturating_sub(meta_slot);
+        telemetry::record_hydration_component_slot_delta(
+            adapter,
+            HydrationComponent::Meta.as_str(),
+            delta,
+        );
+
+        let ready = state.meta_ready_for_slot(state.corecast_slot)
+            && !state.hydration_stale(self.config.hydration_meta_ttl_ms);
+        let stage = if ready { 1 } else { 0 };
+        telemetry::record_hydration_stage(adapter, &state.pool.to_string(), stage);
     }
 
     fn attach_transfer_fees(&self, state: &mut CpAmmState) {
@@ -696,6 +748,18 @@ impl CpAmmAdapter {
             );
             return None;
         }
+        if !state.meta_ready_for_slot(state.corecast_slot) {
+            self.request_meta_refresh(state.pool);
+            self.record_snapshot_issue(
+                state,
+                slot,
+                base_to_quote,
+                QuoteStatus::HydrationPending,
+                "meta_pending",
+                Some(probe_amount),
+            );
+            return None;
+        }
         let block_time_u64 = normalize_block_time(block_time);
         if !state.swap_enabled(slot, block_time_u64) {
             self.record_snapshot_issue(
@@ -808,6 +872,45 @@ impl CpAmmAdapter {
             cache_slot: Some(slot),
         })
     }
+
+    fn request_meta_refresh(&self, pool: Pubkey) {
+        if let Some(hydrator) = self.hydrator.as_ref() {
+            hydrator.refresh(pool);
+        }
+    }
+
+    fn eager_hydration(
+        &self,
+        pool: Pubkey,
+        base_hint: Option<Pubkey>,
+        quote_hint: Option<Pubkey>,
+    ) {
+        if let Some(hydrator) = self.hydrator.as_ref() {
+            hydrator.warm(pool);
+        }
+
+        if let Some(state) = self.get_state(&pool) {
+            self.warm_mint_artifacts(state.token_a_mint);
+            self.warm_mint_artifacts(state.token_b_mint);
+            return;
+        }
+
+        if let Some(mint) = base_hint {
+            self.warm_mint_artifacts(mint);
+        }
+        if let Some(mint) = quote_hint {
+            self.warm_mint_artifacts(mint);
+        }
+    }
+
+    fn warm_mint_artifacts(&self, mint: Pubkey) {
+        if let Some(cache) = self.mint_metadata_cache.as_ref() {
+            cache.hydrate(mint);
+        }
+        if let Some(cache) = self.transfer_fee_cache.as_ref() {
+            cache.hydrate(mint);
+        }
+    }
 }
 
 impl ProtocolAdapter for CpAmmAdapter {
@@ -832,8 +935,14 @@ impl ProtocolAdapter for CpAmmAdapter {
             return;
         }
 
+        let pool_pubkey = parse_pubkey(&update.pool_id);
+        let base_mint = parse_pubkey(&update.base_mint);
+        let quote_mint = parse_pubkey(&update.quote_mint);
         let extras = update.extensions.cp_amm.clone().unwrap_or_default();
         self.upsert_state(update, extras);
+        if let Some(pool) = pool_pubkey {
+            self.eager_hydration(pool, base_mint, quote_mint);
+        }
     }
 
     fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
@@ -844,10 +953,14 @@ impl ProtocolAdapter for CpAmmAdapter {
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
-        if !state.hydration_stale(self.config.hydration_meta_ttl_ms) && state.meta_ready() {
+        if !state.hydration_stale(self.config.hydration_meta_ttl_ms)
+            && state.meta_ready_for_slot(state.corecast_slot)
+        {
             snapshot
                 .hydration
                 .mark_ready(HydrationComponent::Meta, state.last_update_slot);
+        } else {
+            self.request_meta_refresh(pool_pubkey);
         }
         let extras = snapshot
             .extensions
@@ -903,6 +1016,10 @@ impl ProtocolAdapter for CpAmmAdapter {
         if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
             return Some(quote_status_response(req, QuoteStatus::StaleState));
         }
+        if !state.meta_ready_for_slot(state.corecast_slot) {
+            self.request_meta_refresh(state.pool);
+            return Some(quote_status_response(req, QuoteStatus::HydrationPending));
+        }
         if !state.swap_enabled(req.slot, req.block_time_u64()) {
             return Some(quote_status_response(req, QuoteStatus::TradingDisabled));
         }
@@ -953,6 +1070,10 @@ impl ProtocolAdapter for CpAmmAdapter {
         }
         if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
             return Some(quote_status_response(req, QuoteStatus::StaleState));
+        }
+        if !state.meta_ready_for_slot(state.corecast_slot) {
+            self.request_meta_refresh(state.pool);
+            return Some(quote_status_response(req, QuoteStatus::HydrationPending));
         }
         if !state.swap_enabled(req.slot, req.block_time_u64()) {
             return Some(quote_status_response(req, QuoteStatus::TradingDisabled));
@@ -1062,6 +1183,26 @@ impl ProtocolAdapter for CpAmmAdapter {
                 false,
                 QuoteStatus::TradingDisabled,
                 "swap_disabled",
+                None,
+            );
+            return None;
+        }
+        if !state.meta_ready_for_slot(state.corecast_slot) {
+            self.request_meta_refresh(state.pool);
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                true,
+                QuoteStatus::HydrationPending,
+                "meta_pending",
+                None,
+            );
+            self.record_snapshot_issue(
+                &state,
+                snapshot.slot,
+                false,
+                QuoteStatus::HydrationPending,
+                "meta_pending",
                 None,
             );
             return None;
@@ -1894,6 +2035,7 @@ fn apply_hydrated_meta(extras: &mut CpAmmPoolExtras, meta: &HydratedPoolMeta, fo
         extras.pool_fees = Some(meta.pool_fees.clone());
     }
     extras.hydrated_at = Some(meta.hydrated_at);
+    extras.hydrated_slot = Some(meta.hydrated_slot);
 }
 
 #[derive(Clone, Debug)]
@@ -1919,6 +2061,7 @@ struct HydratedPoolMeta {
     token_b_flag: u8,
     pool_fees: CpAmmPoolFeesExtras,
     hydrated_at: Instant,
+    hydrated_slot: u64,
 }
 
 struct CpAmmPoolHydrator {
@@ -1950,6 +2093,11 @@ impl CpAmmPoolHydrator {
         let fetch_clients = clients.clone();
         let hydrator = AsyncHydrator::new("cp_amm_pool", endpoint_count, move |pool| {
             fetch_cp_amm_meta(fetch_clients.as_ref(), pool)
+                .map(|meta| {
+                    let slot = Some(meta.hydrated_slot);
+                    let fetched_at = meta.hydrated_at;
+                    HydratedValue::with_timestamp(meta, slot, fetched_at)
+                })
         });
 
         Some(Self {
@@ -1985,6 +2133,10 @@ impl CpAmmPoolHydrator {
         }
     }
 
+    fn refresh(&self, pool: Pubkey) {
+        self.hydrator.refresh(pool);
+    }
+
     fn should_schedule(&self, pool: Pubkey) -> bool {
         let now = Instant::now();
         if let Some(last) = self.last_attempts.get(&pool) {
@@ -2001,7 +2153,9 @@ fn fetch_cp_amm_meta(clients: &[Arc<RpcClient>], pool: Pubkey) -> Option<Hydrate
     for client in clients {
         match client.get_account(&pool) {
             Ok(account) => {
-                if let Some(meta) = parse_pool_account(&account.data) {
+                if let Some(mut meta) = parse_pool_account(&account.data) {
+                    meta.hydrated_slot = client.get_slot().unwrap_or_default();
+                    meta.hydrated_at = Instant::now();
                     return Some(meta);
                 } else {
                     warn!(
@@ -2060,6 +2214,7 @@ impl MintMetadataHydrator {
         let fetch_clients = clients.clone();
         let hydrator = AsyncHydrator::new("mint_meta", endpoint_count, move |mint| {
             fetch_mint_metadata(fetch_clients.as_ref(), mint)
+                .map(|meta| HydratedValue::new(meta, None))
         });
 
         Some(Self {
@@ -2207,6 +2362,7 @@ fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
         token_b_flag,
         pool_fees,
         hydrated_at: Instant::now(),
+        hydrated_slot: 0,
     })
 }
 
@@ -2356,9 +2512,11 @@ pub struct CpAmmState {
     pub sqrt_max_price_x64: Option<u128>,
     pub vault_a_balance: u128,
     pub vault_b_balance: u128,
+    pub corecast_slot: u64,
     pub last_update_slot: u64,
     pub last_update_at: Instant,
     pub last_hydrated_at: Option<Instant>,
+    pub hydrated_meta_slot: Option<u64>,
     pub last_block_time_unix: Option<u64>,
 }
 
@@ -2440,6 +2598,15 @@ impl CpAmmState {
             && self.liquidity.is_some()
             && self.sqrt_min_price_x64.is_some()
             && self.sqrt_max_price_x64.is_some()
+    }
+
+    fn meta_ready_for_slot(&self, slot: u64) -> bool {
+        if !self.meta_ready() {
+            return false;
+        }
+        self.hydrated_meta_slot
+            .map(|hydrated_slot| hydrated_slot >= slot)
+            .unwrap_or(false)
     }
 
     fn hydration_stale(&self, ttl_ms: u64) -> bool {
@@ -3636,9 +3803,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 3_000_000,
             vault_b_balance: 3_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         }
     }
@@ -3703,6 +3872,7 @@ mod tests {
             token_b_flag: 2,
             pool_fees: refreshed_pool_fees.clone(),
             hydrated_at: Instant::now(),
+            hydrated_slot: 0,
         };
 
         apply_hydrated_meta(&mut extras, &meta, false);
@@ -3880,9 +4050,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 1_000_000,
             vault_b_balance: 1_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -3949,9 +4121,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 1_000_000,
             vault_b_balance: 1_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -4107,9 +4281,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 1_000_000,
             vault_b_balance: 1_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -4170,9 +4346,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 2_000_000,
             vault_b_balance: 3_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -4243,9 +4421,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 3_000_000,
             vault_b_balance: 5_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -4315,9 +4495,11 @@ mod tests {
             sqrt_max_price_x64: None,
             vault_a_balance: 1,
             vault_b_balance: 1,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: None,
+            hydrated_meta_slot: None,
             last_block_time_unix: None,
         };
 
@@ -4372,9 +4554,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 1_000_000,
             vault_b_balance: 2_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -4425,9 +4609,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 1_000,
             vault_b_balance: 1_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -4477,9 +4663,11 @@ mod tests {
             sqrt_max_price_x64: None,
             vault_a_balance: 500,
             vault_b_balance: 1_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: None,
+            hydrated_meta_slot: None,
             last_block_time_unix: None,
         };
 
@@ -4530,9 +4718,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 1_000_000,
             vault_b_balance: 2_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -4628,9 +4818,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 1_000_000,
             vault_b_balance: 1_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -4695,9 +4887,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 2_000_000,
             vault_b_balance: 2_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 
@@ -4740,6 +4934,8 @@ mod tests {
 
         let mut state = fixture_rate_limiter_state();
         state.last_update_slot = 5;
+        state.corecast_slot = state.last_update_slot;
+        state.hydrated_meta_slot = Some(state.corecast_slot);
         adapter.state.insert(state.pool, state.clone());
 
         let req = QuoteRequest {
@@ -4810,9 +5006,11 @@ mod tests {
             sqrt_max_price_x64: Some(1_u128 << 70),
             vault_a_balance: 2_000_000,
             vault_b_balance: 2_000_000,
+            corecast_slot: 0,
             last_update_slot: 0,
             last_update_at: Instant::now(),
             last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
             last_block_time_unix: None,
         };
 

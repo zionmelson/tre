@@ -44,6 +44,12 @@ pub struct PoolStateUpdate {
     pub event: PoolStateEvent,
 }
 
+#[derive(Clone, Debug)]
+struct RefreshTicket {
+    min_slot: u64,
+    requested_at: Instant,
+}
+
 #[derive(Default)]
 pub struct PoolStore {
     inner: Arc<DashMap<String, PoolState>>,
@@ -51,6 +57,8 @@ pub struct PoolStore {
     max_entries: usize,
     subscribers: DashMap<u64, Sender<PoolStateUpdate>>,
     subscriber_seq: AtomicU64,
+    pending_refresh: DashMap<String, RefreshTicket>,
+    latest_slot: AtomicU64,
     ready_target: usize,
     ready_state: Mutex<bool>,
     ready_notify: Condvar,
@@ -93,6 +101,8 @@ impl PoolStore {
             max_entries: capacity,
             subscribers: DashMap::new(),
             subscriber_seq: AtomicU64::new(0),
+            pending_refresh: DashMap::new(),
+            latest_slot: AtomicU64::new(0),
             ready_target,
             ready_state: Mutex::new(ready_target == 0),
             ready_notify: Condvar::new(),
@@ -122,6 +132,7 @@ impl PoolStore {
         let pool_id = snapshot.pool_id.clone();
         let program_id = snapshot.program_id.clone();
         let slot = snapshot.slot;
+        self.latest_slot.fetch_max(slot, Ordering::Relaxed);
         let block_hash = snapshot.block_hash.clone();
         let block_time_unix = snapshot.block_time_unix;
         let price = snapshot
@@ -244,53 +255,108 @@ impl PoolStore {
         removed
     }
 
-    pub fn collect_stale(&self, ttl: Duration) -> Vec<PoolState> {
-        if ttl.is_zero() {
-            return Vec::new();
+    pub fn flag_stale_candidates(
+        &self,
+        ttl: Option<Duration>,
+        slot_lag: Option<u64>,
+    ) -> usize {
+        if ttl.is_none() && slot_lag.is_none() {
+            return 0;
         }
-        self.inner
-            .iter()
-            .filter_map(|entry| {
-                let value = entry.value();
-                if value.last_updated.elapsed() >= ttl && !value.snapshot.freshness.is_stale() {
-                    Some(value.clone())
-                } else {
-                    None
+        let latest_slot = self.latest_slot.load(Ordering::Relaxed);
+        let mut flagged = 0usize;
+        for entry in self.inner.iter() {
+            let pool_id = entry.key().clone();
+            let value = entry.value();
+            if value.snapshot.freshness.is_stale() {
+                continue;
+            }
+            let stale_by_time = ttl
+                .map(|threshold| value.last_updated.elapsed() >= threshold)
+                .unwrap_or(false);
+            let stale_by_slot = slot_lag
+                .map(|lag| latest_slot.saturating_sub(value.slot) >= lag)
+                .unwrap_or(false);
+            if stale_by_time || stale_by_slot {
+                drop(entry);
+                if self.mark_snapshot_stale_and_queue(&pool_id) {
+                    flagged += 1;
                 }
-            })
-            .collect()
+            }
+        }
+        flagged
+    }
+
+    pub fn queue_refresh(&self, pool_id: &str, min_slot: u64) {
+        self.pending_refresh.insert(
+            pool_id.to_string(),
+            RefreshTicket {
+                min_slot,
+                requested_at: Instant::now(),
+            },
+        );
+    }
+
+    pub fn drain_refresh_queue(&self) -> Vec<(PoolState, u64)> {
+        let pending: Vec<(String, RefreshTicket)> = self
+            .pending_refresh
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let mut drained = Vec::with_capacity(pending.len());
+        for (pool_id, ticket) in pending {
+            self.pending_refresh.remove(&pool_id);
+            if let Some(state) = self.inner.get(&pool_id) {
+                drained.push((state.value().clone(), ticket.min_slot));
+            }
+        }
+        drained
     }
 
     pub fn mark_snapshot_stale(&self, pool_id: &str) -> bool {
-        let update = {
-            let mut entry = match self.inner.get_mut(pool_id) {
-                Some(entry) => entry,
-                None => return false,
-            };
-            if entry.snapshot.freshness.is_stale() {
-                return false;
-            }
-            entry.snapshot.freshness = SnapshotFreshness::Stale;
-            let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-            entry.generation = generation;
-            if entry.ready {
-                entry.ready = false;
-                self.ready_count.fetch_sub(1, Ordering::Relaxed);
-            }
-            PoolStateUpdate {
-                pool_id: entry.pool_id.clone(),
-                program_id: entry.program_id.clone(),
-                slot: entry.slot,
-                block_hash: entry.block_hash.clone(),
-                block_time_unix: entry.block_time_unix,
-                last_updated: entry.last_updated,
-                generation,
-                event: PoolStateEvent::Upsert(entry.snapshot.clone()),
-            }
+        self.mark_snapshot_stale_with_refresh(pool_id, false)
+    }
+
+    pub fn mark_snapshot_stale_and_queue(&self, pool_id: &str) -> bool {
+        self.mark_snapshot_stale_with_refresh(pool_id, true)
+    }
+
+    fn mark_snapshot_stale_with_refresh(&self, pool_id: &str, enqueue_refresh: bool) -> bool {
+        let Some((update, min_slot)) = self.mark_snapshot_stale_locked(pool_id) else {
+            return false;
         };
         self.broadcast_update(&update);
         self.emit_pool_counts();
+        if enqueue_refresh {
+            self.queue_refresh(pool_id, min_slot);
+        }
         true
+    }
+
+    fn mark_snapshot_stale_locked(&self, pool_id: &str) -> Option<(PoolStateUpdate, u64)> {
+        let mut entry = self.inner.get_mut(pool_id)?;
+        if entry.snapshot.freshness.is_stale() {
+            return None;
+        }
+        entry.snapshot.freshness = SnapshotFreshness::Stale;
+        entry.snapshot.quotes = None;
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        entry.generation = generation;
+        if entry.ready {
+            entry.ready = false;
+            self.ready_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        let update = PoolStateUpdate {
+            pool_id: entry.pool_id.clone(),
+            program_id: entry.program_id.clone(),
+            slot: entry.slot,
+            block_hash: entry.block_hash.clone(),
+            block_time_unix: entry.block_time_unix,
+            last_updated: entry.last_updated,
+            generation,
+            event: PoolStateEvent::Upsert(entry.snapshot.clone()),
+        };
+        Some((update, entry.slot))
     }
 
     fn prune_if_needed(&self) {
@@ -445,20 +511,24 @@ mod tests {
     }
 
     #[test]
-    fn stale_mark_prevents_repeated_collection() {
+    fn stale_flag_queues_refresh_once() {
         let store = PoolStore::new();
-        let snapshot = snapshot_with_freshness(SnapshotFreshness::LiveCorecast);
+        let mut snapshot = snapshot_with_freshness(SnapshotFreshness::LiveCorecast);
+        snapshot.pool_id = "queue_pool".to_string();
         store.update(snapshot.clone(), false);
 
         std::thread::sleep(Duration::from_millis(2));
 
-        let stale = store.collect_stale(Duration::from_millis(1));
-        assert_eq!(stale.len(), 1);
+        let flagged = store.flag_stale_candidates(Some(Duration::from_millis(1)), None);
+        assert_eq!(flagged, 1);
 
-        assert!(store.mark_snapshot_stale(&snapshot.pool_id));
+        let pending = store.drain_refresh_queue();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0.pool_id, snapshot.pool_id);
 
-        let remaining = store.collect_stale(Duration::from_millis(1));
-        assert!(remaining.is_empty());
+        // Subsequent flagging should not enqueue duplicates while already stale.
+        let flagged_again = store.flag_stale_candidates(Some(Duration::from_millis(1)), None);
+        assert_eq!(flagged_again, 0);
     }
 
     #[test]
