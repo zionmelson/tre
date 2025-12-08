@@ -3,213 +3,195 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use tracing::{debug, info, warn};
 
 use crate::builder::{BuilderHandle, BuilderStage};
-use crate::bundle::{BundleClient, BundleTracker, PendingSubmission};
+use crate::bundle::{BundleClient, BundleSubmitResult, BundleTracker, PendingSubmission};
 use crate::core::{pin_current_thread, Lease, RingConsumer};
-use crate::notifier::{BundleSubmissionEvent, BundleSubmissionStatus, Notifier};
 use crate::planner::types::BundleCandidate;
-use crate::telemetry::{self, Stage3SubmissionStatus};
-use crate::tip_pressure;
+use crate::telemetry::{self, Stage3RetryEvent, Stage3RetryReason, Stage3SubmissionStatus};
 
-/// Configuration for the fast-lane submission workers.
 #[derive(Debug, Clone)]
 pub struct SubmissionConfig {
-    /// Maximum tolerated latency from planner to outbound send.
     pub submission_budget: Duration,
+    pub max_retries: usize,
+    pub retry_backoff: Duration,
+    pub idle_backoff: Duration,
 }
 
 impl Default for SubmissionConfig {
     fn default() -> Self {
         Self {
             submission_budget: Duration::from_millis(20),
+            max_retries: 2,
+            retry_backoff: Duration::from_millis(25),
+            idle_backoff: Duration::from_millis(5),
         }
     }
 }
 
-/// Spawns the simplified fast-lane submitter which replaces Stage3 send logic when the
-/// feature flag is enabled.
 pub fn spawn_fast_lane_submitter(
     stop: Arc<AtomicBool>,
     core_id: Option<usize>,
     consumer: RingConsumer<Lease<BundleCandidate>>,
     builder: BuilderHandle,
     client: Arc<BundleClient>,
-    notifier: Arc<Notifier>,
     tracker: Arc<BundleTracker>,
     config: SubmissionConfig,
 ) -> Result<thread::JoinHandle<Result<()>>> {
-    let worker = FastLaneSubmitter::new(builder, client, notifier, tracker, config);
     thread::Builder::new()
         .name("fast_lane_submitter".into())
-        .spawn(move || worker.run(stop, core_id, consumer))
+        .spawn(move || run_submitter(stop, core_id, consumer, builder, client, tracker, config))
         .map_err(Into::into)
 }
 
-struct FastLaneSubmitter {
+fn run_submitter(
+    stop: Arc<AtomicBool>,
+    core_id: Option<usize>,
+    consumer: RingConsumer<Lease<BundleCandidate>>,
     builder: BuilderHandle,
     client: Arc<BundleClient>,
-    notifier: Arc<Notifier>,
     tracker: Arc<BundleTracker>,
     config: SubmissionConfig,
+) -> Result<()> {
+    if let Some(core) = core_id {
+        let _ = pin_current_thread(core);
+    }
+    info!(
+        target = "submitter",
+        budget_ms = config.submission_budget.as_millis(),
+        retries = config.max_retries,
+        retry_backoff_ms = config.retry_backoff.as_millis(),
+        "fast-lane submitter online"
+    );
+    while !stop.load(Ordering::Relaxed) {
+        builder.heartbeat(BuilderStage::SubmitHotPath);
+        if let Some(lease) = consumer.pop() {
+            if let Err(err) =
+                process_bundle(lease, &builder, client.as_ref(), tracker.as_ref(), &config)
+            {
+                warn!(target = "submitter", error = %err.detail, seq = err.seq, "stage3 submission failed");
+                telemetry::record_stage3_retry_event(Stage3RetryEvent::FailureRecorded(err.reason));
+                telemetry::record_stage3_latency(err.latency);
+                telemetry::record_stage3_outcome(
+                    Stage3SubmissionStatus::Failure,
+                    None,
+                    err.tip_lamports,
+                );
+                tracker.record_stage3_failure(
+                    err.seq,
+                    err.tip_lamports,
+                    format!("{:#}", err.detail),
+                );
+            }
+        } else {
+            thread::sleep(config.idle_backoff);
+        }
+    }
+    info!(target = "submitter", "fast-lane submitter shutting down");
+    Ok(())
 }
 
-impl FastLaneSubmitter {
-    fn new(
-        builder: BuilderHandle,
-        client: Arc<BundleClient>,
-        notifier: Arc<Notifier>,
-        tracker: Arc<BundleTracker>,
-        config: SubmissionConfig,
-    ) -> Self {
-        Self {
-            builder,
-            client,
-            notifier,
-            tracker,
-            config,
+fn process_bundle(
+    mut lease: Lease<BundleCandidate>,
+    builder: &BuilderHandle,
+    client: &BundleClient,
+    tracker: &BundleTracker,
+    config: &SubmissionConfig,
+) -> Result<(), Stage3Failure> {
+    let seq = lease.seq;
+    let tip = lease.tip_lamports;
+    let started = Instant::now();
+    match submit_with_retries(&mut lease, builder, client, config) {
+        Ok(result) => {
+            telemetry::record_stage3_latency(started.elapsed());
+            telemetry::record_stage3_outcome(
+                Stage3SubmissionStatus::Success,
+                Some(&result.bundle_id),
+                tip,
+            );
+            tracker.track_submission(PendingSubmission {
+                bundle_id: result.bundle_id.clone(),
+                seq,
+                endpoint: result.endpoint.clone(),
+                tip_lamports: tip,
+            });
+            info!(
+                target = "submitter",
+                seq,
+                endpoint = %result.endpoint,
+                bundle = %result.bundle_id,
+                "bundle submitted"
+            );
+            Ok(())
         }
+        Err(err) => Err(Stage3Failure {
+            seq,
+            tip_lamports: tip,
+            reason: err.reason,
+            detail: err.error,
+            latency: started.elapsed(),
+        }),
     }
+}
 
-    fn run(
-        &self,
-        stop: Arc<AtomicBool>,
-        core_id: Option<usize>,
-        consumer: RingConsumer<Lease<BundleCandidate>>,
-    ) -> Result<()> {
-        if let Some(core) = core_id {
-            let _ = pin_current_thread(core);
-        }
-        info!(
-            submission_budget_ms = self.config.submission_budget.as_millis(),
-            "fast-lane submitter online"
-        );
-        while !stop.load(Ordering::Relaxed) {
-            self.builder.heartbeat(BuilderStage::SubmitHotPath);
-            if let Some(lease) = consumer.pop() {
-                if let Err(err) = self.process_bundle(lease) {
-                    warn!(error = %err, "fast-lane bundle submission failed");
-                }
-            } else {
-                thread::yield_now();
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-        info!("fast-lane submitter shutting down");
-        Ok(())
-    }
-
-    fn process_bundle(&self, mut lease: Lease<BundleCandidate>) -> Result<()> {
-        let seq = lease.seq;
-        let detection_latency = lease.created_at.elapsed();
-        let tip_lamports = lease.tip_lamports;
-        let ctx = match lease.bundle_context.as_ref() {
-            Some(ctx) => ctx,
-            None => {
-                release_flash_loan_reservation(&self.builder, &mut lease);
-                self.record_failure(
-                    &lease,
-                    detection_latency,
-                    tip_lamports,
-                    "missing bundle context".to_string(),
-                );
-                return Err(anyhow!("bundle {} missing build context", seq));
-            }
-        };
-        let signed = match self.builder.sign_bundle(ctx) {
-            Ok(tx) => tx,
-            Err(err) => {
-                release_flash_loan_reservation(&self.builder, &mut lease);
-                self.record_failure(
-                    &lease,
-                    detection_latency,
-                    tip_lamports,
-                    format!("signing failed for bundle {}: {err}", seq),
-                );
-                return Err(anyhow!("signing failed for bundle {}: {err}", seq));
-            }
-        };
-        debug!(seq, "fast-lane submitting bundle");
-        match self.client.submit(&signed) {
+fn submit_with_retries(
+    bundle: &mut Lease<BundleCandidate>,
+    builder: &BuilderHandle,
+    client: &BundleClient,
+    config: &SubmissionConfig,
+) -> Result<BundleSubmitResult, Stage3Error> {
+    let context = bundle.bundle_context.clone().ok_or_else(|| {
+        Stage3Error::new(
+            Stage3RetryReason::Context,
+            anyhow!("bundle missing context"),
+        )
+    })?;
+    for attempt in 0..=config.max_retries {
+        bundle.stage3_attempts = bundle.stage3_attempts.saturating_add(1);
+        let tx = builder
+            .sign_bundle(&context)
+            .map_err(|err| Stage3Error::new(Stage3RetryReason::Sign, err))?;
+        match client.submit(&tx) {
             Ok(result) => {
-                release_flash_loan_reservation(&self.builder, &mut lease);
-                record_submission_metrics(
-                    Stage3SubmissionStatus::Success,
-                    detection_latency,
-                    Some(result.bundle_id.as_str()),
-                    tip_lamports,
-                );
-                self.tracker.track_submission(PendingSubmission {
-                    bundle_id: result.bundle_id.clone(),
-                    seq,
-                    endpoint: result.endpoint.clone(),
-                    detected_at: lease.created_at,
-                    tip_lamports,
-                });
-                let event = BundleSubmissionEvent {
-                    seq,
-                    status: BundleSubmissionStatus::Submitted,
-                    bundle_id: Some(result.bundle_id),
-                    endpoint: Some(result.endpoint),
-                    tip_lamports,
-                    detection_latency,
-                    slot: None,
-                    detail: None,
-                    error: None,
-                };
-                if let Err(err) = self.notifier.notify_bundle_submission(event) {
-                    warn!(seq, error = %err, "failed to emit submission event");
-                }
-                Ok(())
+                return Ok(result);
             }
             Err(err) => {
-                release_flash_loan_reservation(&self.builder, &mut lease);
-                self.record_failure(
-                    &lease,
-                    detection_latency,
-                    tip_lamports,
-                    format!("fast-lane submission error: {err}"),
-                );
-                Err(err)
+                debug!(target = "submitter", seq = bundle.seq, attempt, error = %err, "bundle submission attempt failed");
+                if attempt == config.max_retries {
+                    telemetry::record_stage3_retry_event(Stage3RetryEvent::RetriesExhausted(
+                        Stage3RetryReason::Submit,
+                    ));
+                    return Err(Stage3Error::new(Stage3RetryReason::Submit, err));
+                }
+                telemetry::record_stage3_retry_event(Stage3RetryEvent::RetryQueued(
+                    Stage3RetryReason::Submit,
+                ));
+                thread::sleep(config.retry_backoff);
             }
         }
     }
+    unreachable!("retry loop must return")
+}
 
-    fn record_failure(
-        &self,
-        lease: &Lease<BundleCandidate>,
-        detection_latency: Duration,
-        tip_lamports: Option<u64>,
-        detail: String,
-    ) {
-        record_submission_metrics(
-            Stage3SubmissionStatus::Failure,
-            detection_latency,
-            None,
-            tip_lamports,
-        );
-        self.tracker
-            .record_stage3_failure(lease.seq, lease.created_at, tip_lamports, detail);
+struct Stage3Error {
+    reason: Stage3RetryReason,
+    error: anyhow::Error,
+}
+
+impl Stage3Error {
+    fn new(reason: Stage3RetryReason, error: anyhow::Error) -> Self {
+        Self { reason, error }
     }
 }
 
-fn release_flash_loan_reservation(builder: &BuilderHandle, lease: &mut Lease<BundleCandidate>) {
-    if let Some(plan) = lease.flash_loan_reservation.take() {
-        builder.flash_loan_planner().release_route(&plan);
-    }
-}
-
-fn record_submission_metrics(
-    status: Stage3SubmissionStatus,
-    latency: Duration,
-    bundle_id: Option<&str>,
+struct Stage3Failure {
+    seq: u64,
     tip_lamports: Option<u64>,
-) {
-    telemetry::record_stage3_latency(latency);
-    tip_pressure::record_stage3_latency(latency);
-    telemetry::record_stage3_outcome(status, bundle_id, tip_lamports);
+    reason: Stage3RetryReason,
+    detail: anyhow::Error,
+    latency: Duration,
 }

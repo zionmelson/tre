@@ -62,6 +62,20 @@ docker run --rm \
   tre-arb-bot
 ```
 
+### Pool Inventory Validation
+
+`./scripts/check-pools.sh` runs four sequential validations so you can confirm the local pool inventory is coherent before starting the hydrator:
+
+1. Config + watcher thresholds (`config_inventory_valid`)
+2. ALT registry readiness (`alt_registry_ready_and_consistent`)
+3. On-chain ALT account existence (`alt_registry_accounts_exist_on_chain`)
+4. IDL program IDs (`idl_program_ids_match_expectations`)
+5. Instruction template coverage (`swap_template_sets_cover_both_directions`)
+
+The script stops on the first failure, so the console output always highlights the exact validation that needs attention.
+
+Use `TRE_RPC_URL=<https endpoint>` to override which Solana RPC the on-chain validation hits; it falls back to `quicknode_rpcs[0]` in `config.json` if unset.
+
 Environment variables:
 
 - `ARBITRAGE_CONFIG`: optional path override for `config.json` (defaults to repo root).
@@ -116,7 +130,7 @@ Set `alerts.webhook_url` in `config.json` to mirror every arbitrage, bundle cand
 - Expose metrics by setting `PROMETHEUS_METRICS_ADDR="0.0.0.0:9898"` (or any open port). Prometheus scrapes `/` for counters, histograms, and gauges.
 - Hydrator health: watch `hydration_adapter_ingest_total` (per adapter), `hydrator_queue_depth`, `hydrator_update_latency_ms`, and `hydration_stale_pool_total`. Sustained queue depth or stale pools mean CoreCast isn’t keeping up.
 - Watcher health: track `watcher_update_age_ms` (age of pool data when consumed), `watcher_strategy_latency_ms`, and `bundle_execution_retry_events_total{reason="sign|submit|context"}` for send issues.
-- Template/flash readiness: keep `hydration_template_age_ms`, `hydration_alt_age_ms`, `hydration_flash_routes_prepared`, and `hydration_backlog_items` on a single dashboard to highlight upstream starvation.
+- Template/flash readiness: keep `hydration_template_age_ms`, `hydration_flash_routes_prepared`, and `hydration_template_cache_entries` on a single dashboard to highlight upstream starvation.
 - Recommended alert:
 
   ```yaml

@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client as HttpClient, ClientBuilder as HttpClientBuilder};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::timeout,
+};
 use tonic::{
     metadata::{Ascii, MetadataValue},
     service::{interceptor::InterceptedService, Interceptor},
@@ -17,7 +20,7 @@ use tracing::{debug, info};
 use url::Url;
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, CoreCastTimeouts},
     proto::solana_corecast::{
         core_cast_client::CoreCastClient as ProtoCoreCast, AddressFilter, DexTradeStreamMessage,
         PoolLiquidityChangeStreamMessage, SubscribePoolsRequest, SubscribeTradesRequest,
@@ -56,7 +59,11 @@ impl CoreCastClient {
     pub fn new(config: Arc<AppConfig>) -> Result<Self> {
         let endpoint = normalize_endpoint(&config.corecast.address)?;
         let domain = endpoint_host(&endpoint)?;
-        let http_builder = HttpClientBuilder::new().use_rustls_tls();
+        let timeouts = config.corecast.timeouts.clone();
+        let http_builder = HttpClientBuilder::new()
+            .use_rustls_tls()
+            .timeout(Duration::from_millis(timeouts.http_request_timeout_ms))
+            .connect_timeout(Duration::from_millis(timeouts.http_connect_timeout_ms));
         let http_client = http_builder
             .build()
             .with_context(|| "failed to build CoreCast HTTP client")?;
@@ -68,6 +75,8 @@ impl CoreCastClient {
             tls_config,
             config.corecast.cache.warm_capacity,
             config.corecast.cache.channel_capacity,
+            Duration::from_millis(timeouts.grpc_connect_timeout_ms),
+            Duration::from_millis(timeouts.channel_acquire_timeout_ms),
         );
 
         let client = Self {
@@ -87,6 +96,18 @@ impl CoreCastClient {
         );
 
         Ok(client)
+    }
+
+    fn timeouts(&self) -> &CoreCastTimeouts {
+        &self.config.corecast.timeouts
+    }
+
+    fn subscribe_timeout(&self) -> Duration {
+        Duration::from_millis(self.timeouts().subscribe_timeout_ms)
+    }
+
+    fn stream_idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.timeouts().stream_idle_timeout_ms)
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -119,11 +140,18 @@ impl CoreCastClient {
             program: Some(self.program_filter()?),
             ..Default::default()
         };
-        let response = client
-            .dex_trades(Request::new(request))
-            .await
-            .with_context(|| "failed to subscribe to CoreCast dex trades")?;
-        Ok(CoreCastStream::new(response.into_inner(), lease))
+        let response = timeout(
+            self.subscribe_timeout(),
+            client.dex_trades(Request::new(request)),
+        )
+        .await
+        .map_err(|_| anyhow!("timed out waiting for CoreCast dex trades subscription"))?
+        .with_context(|| "failed to subscribe to CoreCast dex trades")?;
+        Ok(CoreCastStream::new(
+            response.into_inner(),
+            lease,
+            self.stream_idle_timeout(),
+        ))
     }
 
     async fn subscribe_pools(
@@ -135,11 +163,18 @@ impl CoreCastClient {
             program: Some(self.program_filter()?),
             ..Default::default()
         };
-        let response = client
-            .dex_pools(Request::new(request))
-            .await
-            .with_context(|| "failed to subscribe to CoreCast dex pools")?;
-        Ok(CoreCastStream::new(response.into_inner(), lease))
+        let response = timeout(
+            self.subscribe_timeout(),
+            client.dex_pools(Request::new(request)),
+        )
+        .await
+        .map_err(|_| anyhow!("timed out waiting for CoreCast dex pools subscription"))?
+        .with_context(|| "failed to subscribe to CoreCast dex pools")?;
+        Ok(CoreCastStream::new(
+            response.into_inner(),
+            lease,
+            self.stream_idle_timeout(),
+        ))
     }
 
     fn proto_client_from_lease(&self, lease: &ChannelLease) -> ProtoClient {
@@ -165,14 +200,25 @@ type ProtoClient = ProtoCoreCast<InterceptedService<Channel, AuthInterceptor>>;
 
 pub struct CoreCastStream<T> {
     inner: Streaming<T>,
+    idle_timeout: Duration,
     _lease: ChannelLease,
 }
 
 impl<T> CoreCastStream<T> {
-    fn new(inner: Streaming<T>, lease: ChannelLease) -> Self {
+    fn new(inner: Streaming<T>, lease: ChannelLease, idle_timeout: Duration) -> Self {
         Self {
             inner,
+            idle_timeout,
             _lease: lease,
+        }
+    }
+
+    pub async fn next_message(&mut self) -> std::result::Result<Option<T>, Status> {
+        match timeout(self.idle_timeout, self.inner.message()).await {
+            Ok(result) => result,
+            Err(_) => Err(Status::deadline_exceeded(
+                "CoreCast stream idle timeout exceeded",
+            )),
         }
     }
 }
@@ -196,6 +242,7 @@ struct ChannelPool {
     tls_config: ClientTlsConfig,
     warm_capacity: usize,
     connect_timeout: Duration,
+    acquire_timeout: Duration,
     idle: Mutex<Vec<Channel>>,
     semaphore: Arc<Semaphore>,
 }
@@ -206,6 +253,8 @@ impl ChannelPool {
         tls_config: ClientTlsConfig,
         warm_capacity: usize,
         channel_capacity: usize,
+        connect_timeout: Duration,
+        acquire_timeout: Duration,
     ) -> Self {
         let capacity = channel_capacity.max(1);
         let warm_capacity = warm_capacity.min(capacity);
@@ -216,18 +265,17 @@ impl ChannelPool {
             endpoint,
             tls_config,
             warm_capacity,
-            connect_timeout: Duration::from_secs(5),
+            connect_timeout,
+            acquire_timeout,
             idle: Mutex::new(Vec::new()),
             semaphore: Arc::new(Semaphore::new(capacity)),
         }
     }
 
     async fn acquire(self: &Arc<Self>) -> Result<ChannelLease> {
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
+        let permit = timeout(self.acquire_timeout, self.semaphore.clone().acquire_owned())
             .await
+            .map_err(|_| anyhow!("CoreCast channel acquisition timed out"))?
             .map_err(|_| anyhow!("CoreCast channel pool closed"))?;
 
         if let Some(channel) = self.try_take_idle() {

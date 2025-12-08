@@ -7,13 +7,15 @@ mod tx_graph;
 
 use std::{
     collections::HashMap,
+    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 use crate::config::AppConfig;
+use crate::hydration::readiness::ReadinessRegistry;
 use blockhash::BlockhashCache;
 use solana_sdk::hash::Hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -21,9 +23,9 @@ use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Keypair, Signer};
 use solana_sdk::transaction::VersionedTransaction;
-use tracing::warn;
+use tracing::{debug, warn};
 
-pub use crate::hydration::alt_manager::{AltManager, AltManagerStats};
+pub use crate::hydration::alt_manager::AltManager;
 pub use crate::hydration::flash_loan::{
     compute_flash_loan_fee, FlashLoanPlanner, FlashLoanRoutePlan, FLASH_LOAN_BPS_DENOMINATOR,
     SOLEND_FLASH_LOAN_FEE_BPS,
@@ -44,11 +46,25 @@ pub use tx_graph::TxGraph;
 pub struct BuilderHandle(Arc<BuilderContext>);
 
 const TEMPLATE_FRESHNESS_TTL: Duration = Duration::from_millis(40);
-const ALT_FRESHNESS_TTL: Duration = Duration::from_millis(40);
+const LEGACY_COMPUTE_UNIT_LIMIT: u32 = 200_000;
 
 impl BuilderHandle {
     pub fn new(config: Arc<AppConfig>) -> Result<Self> {
-        Ok(Self(Arc::new(BuilderContext::new(config)?)))
+        Self::new_with_option(config, None)
+    }
+
+    pub fn new_with_readiness(
+        config: Arc<AppConfig>,
+        readiness: ReadinessRegistry,
+    ) -> Result<Self> {
+        Self::new_with_option(config, Some(readiness))
+    }
+
+    fn new_with_option(
+        config: Arc<AppConfig>,
+        readiness: Option<ReadinessRegistry>,
+    ) -> Result<Self> {
+        Ok(Self(Arc::new(BuilderContext::new(config, readiness)?)))
     }
 
     pub fn template_cache(&self) -> &TemplateCache {
@@ -103,6 +119,14 @@ impl BuilderHandle {
         suffix_instructions: &[Instruction],
     ) -> Result<bundle_builder::BundleBuildContext> {
         let blockhash = self.recent_blockhash()?;
+        let mut plans = legs.to_vec();
+        for plan in plans.iter_mut() {
+            if plan.lookup_table.is_none() {
+                if let Some(lookup) = self.ensure_lookup_table(plan)? {
+                    plan.lookup_table = Some(lookup);
+                }
+            }
+        }
         bundle_builder::build_bundle(
             seq,
             self.0.payer_pubkey,
@@ -110,9 +134,52 @@ impl BuilderHandle {
             &self.0.token_atas,
             blockhash,
             prefix_instructions,
-            legs,
+            &plans,
             suffix_instructions,
         )
+    }
+
+    fn ensure_lookup_table(
+        &self,
+        plan: &bundle_builder::BundleInstructionPlan,
+    ) -> Result<Option<BundleLookupTablePlan>> {
+        let pool = Pubkey::from_str(&plan.pool_id)
+            .with_context(|| format!("invalid pool id {}", plan.pool_id))?;
+        let key = TemplateCacheKey::new(pool, plan.direction);
+        let template = self.0.template_cache.get(&key).with_context(|| {
+            format!(
+                "missing template for pool {} direction {:?}",
+                plan.pool_id, plan.direction
+            )
+        })?;
+        if !lookup_table_required(plan, template.as_ref()) {
+            return Ok(None);
+        }
+
+        let handle = match self
+            .0
+            .alt_manager
+            .ensure_handle(pool, template.alt_accounts.as_ref())
+        {
+            Some(handle) => handle,
+            None => return Ok(None),
+        };
+        let info = self.0.alt_manager.table_info(handle).ok_or_else(|| {
+            anyhow!(
+                "ALT handle {} for pool {} not ready",
+                handle.0,
+                plan.pool_id
+            )
+        })?;
+
+        Ok(Some(BundleLookupTablePlan {
+            handle_id: handle.0,
+            table_address: info.address.to_string(),
+            authority: info.authority.to_string(),
+            creation_slot: info.creation_slot,
+            last_extended_slot: info.last_extended_slot,
+            accounts: info.addresses.iter().map(|pk| pk.to_string()).collect(),
+        }))
     }
 
     pub fn instruction_accounts_for_plan(
@@ -156,73 +223,61 @@ impl BuilderHandle {
             let now = Instant::now();
             let template_deadline = template.fresh_until(TEMPLATE_FRESHNESS_TTL);
             let template_ready = template.is_hydrated() && now <= template_deadline;
-            let (alt_ready, alt_fresh_until) = match template.alt_handle {
-                Some(handle) => match self.0.alt_manager.table_info(handle) {
-                    Some(info) => {
-                        let deadline = info.fresh_until(ALT_FRESHNESS_TTL);
-                        (now <= deadline, Some(deadline))
-                    }
-                    None => (false, None),
-                },
-                None => (true, Some(now + ALT_FRESHNESS_TTL)),
-            };
             TemplateReadiness {
                 template_ready,
-                alt_ready,
                 template_fresh_until: Some(template_deadline),
-                alt_fresh_until,
             }
         } else {
             TemplateReadiness::missing()
         }
     }
 
-    pub fn register_amm_v3_pool(&self, mut meta: AmmV3PoolMeta) {
-        if meta.alt_handle.is_none() {
-            meta.alt_handle = self
-                .0
-                .alt_manager
-                .ensure_handle(meta.pool_id, &meta.alt_accounts);
-        }
+    pub fn register_amm_v3_pool(&self, meta: AmmV3PoolMeta) {
         if let Err(err) = template_loader::register_amm_v3_pool(&self.0.template_cache, &meta) {
             warn!(error = ?err, pool = %meta.pool_id, fee_bps = meta.fee_tier_bps, "failed to register amm_v3 templates");
         }
     }
 
-    pub fn register_cp_amm_pool(&self, mut meta: CpAmmPoolMeta) {
-        if meta.alt_handle.is_none() {
-            meta.alt_handle = self
-                .0
-                .alt_manager
-                .ensure_handle(meta.pool_id, &meta.alt_accounts);
-        }
+    pub fn register_cp_amm_pool(&self, meta: CpAmmPoolMeta) {
         if let Err(err) = template_loader::register_cp_amm_pool(&self.0.template_cache, &meta) {
             warn!(error = ?err, pool = %meta.pool_id, fee_bps = meta.fee_tier_bps, "failed to register cp_amm templates");
         }
     }
 
-    pub fn register_lb_clmm_pool(&self, mut meta: LbClmmPoolMeta) {
-        if meta.alt_handle.is_none() {
-            meta.alt_handle = self
-                .0
-                .alt_manager
-                .ensure_handle(meta.pool_id, &meta.alt_accounts);
-        }
+    pub fn register_lb_clmm_pool(&self, meta: LbClmmPoolMeta) {
         if let Err(err) = template_loader::register_lb_clmm_pool(&self.0.template_cache, &meta) {
             warn!(error = ?err, pool = %meta.pool_id, fee_bps = meta.fee_tier_bps, "failed to register lb_clmm templates");
         }
     }
 
-    pub fn register_whirlpool_pool(&self, mut meta: WhirlpoolPoolMeta) {
-        if meta.alt_handle.is_none() {
-            meta.alt_handle = self
-                .0
-                .alt_manager
-                .ensure_handle(meta.pool_id, &meta.alt_accounts);
-        }
+    pub fn register_whirlpool_pool(&self, meta: WhirlpoolPoolMeta) {
         if let Err(err) = template_loader::register_whirlpool_pool(&self.0.template_cache, &meta) {
             warn!(error = ?err, pool = %meta.pool_id, fee_bps = meta.fee_tier_bps, "failed to register whirlpool templates");
         }
+    }
+
+    pub fn reset_template_cache(&self) -> u64 {
+        let epoch = self.0.template_cache.clear();
+        template_loader::populate_static_templates(&self.0.template_cache, self.0.config.as_ref());
+        debug!(
+            target = "builder",
+            epoch, "template cache reset; static templates reloaded"
+        );
+        epoch
+    }
+}
+
+fn lookup_table_required(
+    plan: &bundle_builder::BundleInstructionPlan,
+    template: &InstructionTemplate,
+) -> bool {
+    if template.alt_accounts.is_empty() {
+        return false;
+    }
+
+    match plan.context.compute_unit_limit {
+        Some(limit) => limit > LEGACY_COMPUTE_UNIT_LIMIT,
+        None => false,
     }
 }
 
@@ -246,11 +301,16 @@ struct BuilderContext {
     auth_pubkey: Pubkey,
     token_atas: HashMap<Pubkey, Pubkey>,
     host_fee_accounts: HashMap<Pubkey, Pubkey>,
+    config: Arc<AppConfig>,
 }
 
 impl BuilderContext {
-    fn new(config: Arc<AppConfig>) -> Result<Self> {
-        let template_cache = TemplateCache::new(config.clone());
+    fn new(config: Arc<AppConfig>, readiness: Option<ReadinessRegistry>) -> Result<Self> {
+        let template_cache = if let Some(registry) = readiness.clone() {
+            TemplateCache::with_readiness(config.clone(), registry)
+        } else {
+            TemplateCache::new(config.clone())
+        };
         template_loader::populate_static_templates(&template_cache, config.as_ref());
 
         let payer_path = config.wallets.payer.path.clone();
@@ -283,11 +343,15 @@ impl BuilderContext {
         let host_fee_accounts = config.host_fee_account_map().clone();
         let mev_guard = MevGuard::new(config.clone());
 
+        let alt_manager = AltManager::new(config.clone())?;
+        let flash_loan = FlashLoanPlanner::new(config.clone())?;
+        flash_loan.prepare_default_routes();
+
         Ok(Self {
             template_cache,
-            alt_manager: AltManager::new(config.clone())?,
+            alt_manager,
             tx_graph: TxGraph::new(),
-            flash_loan: FlashLoanPlanner::new(config.clone())?,
+            flash_loan,
             mev_guard,
             blockhash_cache,
             payer_pubkey: payer.pubkey(),
@@ -296,6 +360,7 @@ impl BuilderContext {
             auth,
             token_atas,
             host_fee_accounts,
+            config,
         })
     }
 }

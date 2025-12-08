@@ -10,27 +10,42 @@ use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use crate::builder::templates::{AccountSpec, SwapMintRole, SwapTemplateDirection};
 use crate::builder::{CpAmmPoolAccounts, LbClmmPoolAccounts, WhirlpoolPoolAccounts};
 use crate::config::AppConfig;
+use crate::hydration::readiness::{ReadinessRegistry, TemplateSignal};
+
+const TEMPLATE_SIGNAL_TTL: Duration = Duration::from_millis(400);
 
 #[derive(Clone)]
 pub struct TemplateCache {
     state: Arc<TemplateCacheState>,
+    readiness: Option<ReadinessRegistry>,
 }
 
 struct TemplateCacheState {
     warm_calls: AtomicU64,
     last_refresh_unix_ms: AtomicU64,
+    epoch: AtomicU64,
     templates: DashMap<TemplateCacheKey, Arc<InstructionTemplate>>,
 }
 
 impl TemplateCache {
     pub fn new(config: Arc<AppConfig>) -> Self {
+        Self::new_with_signals(config, None)
+    }
+
+    pub fn with_readiness(config: Arc<AppConfig>, readiness: ReadinessRegistry) -> Self {
+        Self::new_with_signals(config, Some(readiness))
+    }
+
+    fn new_with_signals(config: Arc<AppConfig>, readiness: Option<ReadinessRegistry>) -> Self {
         let _ = config; // config plumbing will drive template selection later
         Self {
             state: Arc::new(TemplateCacheState {
                 warm_calls: AtomicU64::new(0),
                 last_refresh_unix_ms: AtomicU64::new(now_millis()),
+                epoch: AtomicU64::new(0),
                 templates: DashMap::new(),
             }),
+            readiness,
         }
     }
 
@@ -42,11 +57,24 @@ impl TemplateCache {
             .store(now_millis(), Ordering::Relaxed);
     }
 
+    /// Clears all cached templates and bumps the cache epoch. Returns the new epoch value.
+    pub fn clear(&self) -> u64 {
+        self.state.templates.clear();
+        self.state
+            .last_refresh_unix_ms
+            .store(now_millis(), Ordering::Relaxed);
+        self.state
+            .epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
     /// Inserts or replaces a template and returns the stored Arc handle.
     pub fn insert(&self, template: InstructionTemplate) -> Arc<InstructionTemplate> {
         let key = template.key.clone();
         let handle = Arc::new(template);
         self.state.templates.insert(key, handle.clone());
+        self.emit_template_signal(handle.as_ref());
         handle
     }
 
@@ -77,7 +105,28 @@ impl TemplateCache {
             warm_calls: self.state.warm_calls.load(Ordering::Relaxed),
             last_refresh_unix_ms: self.state.last_refresh_unix_ms.load(Ordering::Relaxed),
             template_count: self.state.templates.len() as u64,
+            epoch: self.state.epoch.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.state.epoch.load(Ordering::Relaxed)
+    }
+
+    fn emit_template_signal(&self, template: &InstructionTemplate) {
+        let Some(readiness) = &self.readiness else {
+            return;
+        };
+        let epoch = self.state.epoch.load(Ordering::Relaxed);
+        let signal = TemplateSignal {
+            pool_id: template.key.pool_id.to_string(),
+            direction: template.key.direction,
+            hydrated_at: template.hydrated_at,
+            ttl: TEMPLATE_SIGNAL_TTL,
+            template_hash: Some(template.template_hash),
+            epoch,
+        };
+        readiness.record_template_signal(signal);
     }
 }
 
@@ -86,6 +135,7 @@ pub struct TemplateCacheStats {
     pub warm_calls: u64,
     pub last_refresh_unix_ms: u64,
     pub template_count: u64,
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -112,6 +162,7 @@ pub struct InstructionTemplate {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub alt_accounts: Arc<[Pubkey]>,
     pub metadata: TemplateMetadata,
     pub hydrated_at: Instant,
 }
@@ -131,6 +182,7 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            alt_accounts,
             account_specs,
             pool_accounts,
         } = params;
@@ -148,6 +200,7 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            alt_accounts: alt_accounts.into(),
             metadata: TemplateMetadata::AmmV3 {
                 account_specs,
                 pool_accounts,
@@ -170,6 +223,7 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            alt_accounts,
             account_specs,
             pool_accounts,
         } = params;
@@ -187,6 +241,7 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            alt_accounts: alt_accounts.into(),
             metadata: TemplateMetadata::CpAmm {
                 account_specs,
                 pool_accounts,
@@ -209,6 +264,7 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            alt_accounts,
             account_specs,
             pool_accounts,
         } = params;
@@ -226,6 +282,7 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            alt_accounts: alt_accounts.into(),
             metadata: TemplateMetadata::LbClmm {
                 account_specs,
                 pool_accounts,
@@ -248,6 +305,7 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            alt_accounts,
             account_specs,
             pool_accounts,
         } = params;
@@ -265,6 +323,7 @@ impl InstructionTemplate {
             tlv_bytes,
             template_hash,
             alt_handle,
+            alt_accounts: alt_accounts.into(),
             metadata: TemplateMetadata::Whirlpool {
                 account_specs,
                 pool_accounts,
@@ -405,6 +464,7 @@ mod tests {
             tlv_bytes: 0,
             template_hash: [0; 32],
             alt_handle: None,
+            alt_accounts: Arc::from(Vec::new()),
             metadata: TemplateMetadata::AmmV3 {
                 account_specs: &[],
                 pool_accounts,
@@ -657,6 +717,7 @@ pub struct AmmV3TemplateParams {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub alt_accounts: Vec<Pubkey>,
     pub account_specs: &'static [AccountSpec],
     pub pool_accounts: Option<AmmV3PoolAccounts>,
 }
@@ -675,6 +736,7 @@ pub struct CpAmmTemplateParams {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub alt_accounts: Vec<Pubkey>,
     pub account_specs: &'static [AccountSpec],
     pub pool_accounts: Option<CpAmmPoolAccounts>,
 }
@@ -693,6 +755,7 @@ pub struct LbClmmTemplateParams {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub alt_accounts: Vec<Pubkey>,
     pub account_specs: &'static [AccountSpec],
     pub pool_accounts: Option<LbClmmPoolAccounts>,
 }
@@ -711,6 +774,7 @@ pub struct WhirlpoolTemplateParams {
     pub tlv_bytes: u16,
     pub template_hash: [u8; 32],
     pub alt_handle: Option<AltHandleId>,
+    pub alt_accounts: Vec<Pubkey>,
     pub account_specs: &'static [AccountSpec],
     pub pool_accounts: Option<WhirlpoolPoolAccounts>,
 }

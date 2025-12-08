@@ -26,6 +26,7 @@ use crate::builder::{BuilderHandle, LbClmmPoolAccounts, LbClmmPoolMeta};
 #[cfg(test)]
 use crate::hydration::types::HydrationStatus;
 use crate::hydration::{
+    mint_metadata::{MintMetadata, MintMetadataHydrator},
     token_fees::{
         apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
     },
@@ -36,20 +37,16 @@ use crate::hydration::{
         PoolQuoteSide, PoolSnapshot, PoolUpdate, LB_CLMM_INPUT_UTILIZATION_BPS,
     },
 };
+use crate::telemetry;
 use crate::template::{
     LbClmmAccountsType, LbClmmRemainingAccountsSlice, LbClmmRewardAccountContext, TemplateContext,
     TransferFeeConfigHint,
 };
-use crate::telemetry;
 
 use super::{
     build_quote_response,
     hydration::{AsyncHydrator, HydratedValue},
-    ProtocolAdapter,
-    QuoteRequest,
-    QuoteResponse,
-    QuoteStatus,
-    SwapDirection,
+    ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, SwapDirection,
 };
 
 const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
@@ -74,6 +71,8 @@ const PRICE_IMPACT_PADDING_BPS: u16 = 10;
 const LB_CLMM_DEFAULT_CU_LIMIT: u32 = 420_000;
 const LB_CLMM_DEFAULT_CU_PRICE: u64 = 5_000;
 const DEFAULT_LB_CLMM_HYDRATION_RETRY_MS: u64 = 60_000;
+const DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE: u64 = 3_000;
+const DEFAULT_HYDRATION_LAG_MS_TOLERANCE: u64 = 30_000;
 const TARGETED_BIN_ARRAY_RADIUS: i64 = 4;
 const BIN_WINDOW_EDGE_BUFFER_BINS: i32 = MAX_BIN_PER_ARRAY * 2;
 const DEFAULT_MAX_BIN_WALK: usize = 800;
@@ -88,6 +87,7 @@ const Q64_ONE: u128 = 1u128 << Q64_SCALE_OFFSET;
 const MAX_Q64_EXPONENT: u32 = 0x80000;
 const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
 const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
+const HYDRATION_LAG_LOG_INTERVAL_MS: u64 = 15_000;
 
 construct_uint! {
     pub struct U256(4);
@@ -97,6 +97,11 @@ construct_uint! {
 struct SnapshotStatusLogEntry {
     status: QuoteStatus,
     logged_at: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LbTemplateRegistration {
+    epoch: u64,
 }
 
 static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
@@ -118,6 +123,8 @@ pub struct LbClmmAdapterConfig {
     pub rpc_endpoints: Vec<String>,
     pub rpc_timeout_ms: u64,
     pub hydration_retry_ms: u64,
+    pub hydration_slot_lag_tolerance: u64,
+    pub hydration_lag_ms_tolerance: u64,
     pub max_swap_utilization_bps: u64,
     pub max_bin_walk: usize,
     pub max_price_impact_bps: u16,
@@ -132,6 +139,8 @@ impl Default for LbClmmAdapterConfig {
             // lb_clmm bin array/bitmap fetches can be slow; give RPC plenty of time.
             rpc_timeout_ms: 15_000,
             hydration_retry_ms: DEFAULT_LB_CLMM_HYDRATION_RETRY_MS,
+            hydration_slot_lag_tolerance: DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE,
+            hydration_lag_ms_tolerance: DEFAULT_HYDRATION_LAG_MS_TOLERANCE,
             max_swap_utilization_bps: LB_CLMM_INPUT_UTILIZATION_BPS,
             max_bin_walk: DEFAULT_MAX_BIN_WALK,
             max_price_impact_bps: DEFAULT_MAX_PRICE_IMPACT_BPS,
@@ -144,12 +153,14 @@ pub struct LbClmmAdapter {
     state: DashMap<Pubkey, LbClmmState>,
     config: LbClmmAdapterConfig,
     hydrator: Option<LbClmmPoolHydrator>,
+    mint_metadata_cache: Option<MintMetadataHydrator>,
     transfer_fee_cache: Option<TokenTransferFeeHydrator>,
     transfer_hook_resolver: Option<TransferHookAccountsResolver>,
     template_builder: Option<BuilderHandle>,
-    registered_templates: DashSet<Pubkey>,
+    registered_templates: DashMap<Pubkey, LbTemplateRegistration>,
     snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
     missing_state_log: DashMap<Pubkey, Instant>,
+    lag_log: DashMap<(Pubkey, u8), Instant>,
 }
 
 impl LbClmmAdapter {
@@ -157,6 +168,11 @@ impl LbClmmAdapter {
         let program_id = Pubkey::from_str(LB_CLMM_PROGRAM_ID)
             .expect("static lb_clmm program id should be valid");
         let hydrator = LbClmmPoolHydrator::new(program_id, &config);
+        let mint_metadata_cache = MintMetadataHydrator::new(
+            &config.rpc_endpoints,
+            config.rpc_timeout_ms,
+            config.hydration_retry_ms,
+        );
         let transfer_fee_cache = TokenTransferFeeHydrator::new(
             &config.rpc_endpoints,
             config.rpc_timeout_ms,
@@ -181,12 +197,14 @@ impl LbClmmAdapter {
             state: DashMap::new(),
             config,
             hydrator,
+            mint_metadata_cache,
             transfer_fee_cache,
             transfer_hook_resolver,
             template_builder,
-            registered_templates: DashSet::new(),
+            registered_templates: DashMap::new(),
             snapshot_failure_log: DashMap::new(),
             missing_state_log: DashMap::new(),
+            lag_log: DashMap::new(),
         }
     }
 
@@ -248,6 +266,7 @@ impl LbClmmAdapter {
         }
 
         let bin_liquidity = build_bin_liquidity_map(&extras);
+        let meta_slot_from_update = extras.hydrated_slot.is_some();
         let mut hydrated_meta_slot = extras.hydrated_slot;
         if hydrated_meta_slot
             .map(|slot| slot < update.slot)
@@ -264,10 +283,11 @@ impl LbClmmAdapter {
             }
         }
 
-        let mut hydrated_window_slot = if bin_liquidity.is_empty() {
-            None
-        } else {
+        let window_data_present = !bin_liquidity.is_empty();
+        let mut hydrated_window_slot = if window_data_present {
             extras.hydrated_slot
+        } else {
+            None
         };
         if hydrated_window_slot
             .map(|slot| slot < update.slot)
@@ -284,14 +304,35 @@ impl LbClmmAdapter {
             }
         }
 
-        let last_hydrated_at = extras
-            .hydrated_at
-            .or_else(|| previous_state.as_ref().and_then(|state| state.last_hydrated_at));
+        let mut meta_hydrated_at = extras.hydrated_at.or_else(|| {
+            previous_state
+                .as_ref()
+                .and_then(|state| state.meta_hydrated_at)
+        });
+        if meta_slot_from_update && extras.hydrated_at.is_none() {
+            meta_hydrated_at = Some(Instant::now());
+        }
+
+        let mut window_hydrated_at = if window_data_present {
+            extras.hydrated_at
+        } else {
+            None
+        }
+        .or_else(|| {
+            previous_state
+                .as_ref()
+                .and_then(|state| state.window_hydrated_at)
+        });
+        if window_data_present && extras.hydrated_at.is_none() {
+            window_hydrated_at = Some(Instant::now());
+        }
 
         let mut state = LbClmmState {
             lb_pair: pool_pubkey,
             token_x_mint,
             token_y_mint,
+            token_x_decimals: None,
+            token_y_decimals: None,
             token_x_program: extras
                 .token_x_program
                 .as_ref()
@@ -351,14 +392,21 @@ impl LbClmmAdapter {
             corecast_slot: update.slot,
             hydrated_meta_slot,
             hydrated_window_slot,
-            last_hydrated_at,
+            meta_hydrated_at,
+            window_hydrated_at,
             last_update_slot: update.slot,
             last_update_at: Instant::now(),
             token_x_transfer_fee: None,
             token_y_transfer_fee: None,
         };
+        self.attach_mint_metadata(&mut state);
         self.ensure_token_programs(&mut state);
         self.attach_transfer_fees(&mut state);
+        if !self.meta_ready_within_lag(&state) {
+            if let Some(hydrator) = self.hydrator.as_ref() {
+                hydrator.hydrate(pool_pubkey);
+            }
+        }
         trace!(
             target = "adapter::lb_clmm",
             pool = %update.pool_id,
@@ -445,24 +493,35 @@ impl LbClmmAdapter {
     }
 
     fn register_templates_with_builder(&self, state: &LbClmmState) {
+        self.ensure_templates_for_epoch(state, None, "adapter state update", false);
+    }
+
+    fn ensure_templates_for_epoch(
+        &self,
+        state: &LbClmmState,
+        epoch_override: Option<u64>,
+        reason: &'static str,
+        force_refresh: bool,
+    ) {
         let Some(builder) = self.template_builder.as_ref() else {
             return;
         };
 
-        let already_registered = self.registered_templates.contains(&state.lb_pair);
-        if already_registered {
-            let alt_missing = builder
-                .alt_manager()
-                .handle_for_pool(state.lb_pair)
-                .is_none();
-            if !alt_missing {
-                return;
-            }
-            debug!(
+        if !self.meta_ready_within_lag(state) {
+            trace!(
                 target = "adapter::lb_clmm",
                 pool = %state.lb_pair,
-                "ALT handle missing; re-registering pool templates"
+                slot = state.corecast_slot,
+                reason = reason,
+                "deferring template registration until meta hydration completes"
             );
+            self.record_component_lag_event(state, HydrationComponent::Meta, reason);
+            return;
+        }
+
+        let epoch = epoch_override.unwrap_or_else(|| builder.template_cache().epoch());
+        if !force_refresh && self.template_epoch_ready(state.lb_pair, epoch) {
+            return;
         }
 
         let (Some(token_x_program), Some(token_y_program)) =
@@ -489,6 +548,15 @@ impl LbClmmAdapter {
             token_y_program,
             host_fee_in: state.host_fee_account,
         };
+
+        debug!(
+            target = "adapter::lb_clmm",
+            pool = %state.lb_pair,
+            epoch,
+            reason = reason,
+            "registering lb_clmm instruction templates"
+        );
+
         builder.register_lb_clmm_pool(LbClmmPoolMeta {
             pool_id: state.lb_pair,
             fee_tier_bps,
@@ -497,7 +565,108 @@ impl LbClmmAdapter {
             accounts: pool_accounts,
         });
 
-        self.registered_templates.insert(state.lb_pair);
+        self.registered_templates
+            .insert(state.lb_pair, LbTemplateRegistration { epoch });
+    }
+
+    fn template_epoch_ready(&self, pool: Pubkey, epoch: u64) -> bool {
+        self.registered_templates
+            .get(&pool)
+            .map(|entry| entry.epoch == epoch)
+            .unwrap_or(false)
+    }
+
+    fn meta_ready_within_lag(&self, state: &LbClmmState) -> bool {
+        state.meta_ready_within_lag(
+            state.corecast_slot,
+            self.config.hydration_slot_lag_tolerance,
+            self.config.hydration_lag_ms_tolerance,
+        )
+    }
+
+    fn window_ready_within_lag(&self, state: &LbClmmState) -> bool {
+        state.bin_window_ready_within_lag(
+            state.corecast_slot,
+            self.config.hydration_slot_lag_tolerance,
+            self.config.hydration_lag_ms_tolerance,
+        )
+    }
+
+    fn component_lag(
+        &self,
+        state: &LbClmmState,
+        component: HydrationComponent,
+    ) -> (Option<u64>, Option<u64>) {
+        let lag_slots = match component {
+            HydrationComponent::Meta => state.meta_lag_slots(state.corecast_slot),
+            HydrationComponent::BinWindow => state.window_lag_slots(state.corecast_slot),
+            _ => None,
+        };
+        let lag_ms = match component {
+            HydrationComponent::Meta => state.meta_hydration_age_ms(),
+            HydrationComponent::BinWindow => state.window_hydration_age_ms(),
+            _ => None,
+        };
+        (lag_slots, lag_ms)
+    }
+
+    fn should_log_component_lag(
+        &self,
+        pool: Pubkey,
+        component: HydrationComponent,
+        lag_slots: Option<u64>,
+        lag_ms: Option<u64>,
+    ) -> bool {
+        let slot_over = lag_slots
+            .map(|slots| slots > self.config.hydration_slot_lag_tolerance)
+            .unwrap_or(false);
+        let time_over = lag_ms
+            .map(|ms| ms > self.config.hydration_lag_ms_tolerance)
+            .unwrap_or(false);
+        if !(slot_over || time_over) {
+            return false;
+        }
+        let key = (pool, component.index() as u8);
+        if let Some(entry) = self.lag_log.get(&key) {
+            if entry.value().elapsed().as_millis() as u64 <= HYDRATION_LAG_LOG_INTERVAL_MS {
+                return false;
+            }
+        }
+        self.lag_log.insert(key, Instant::now());
+        true
+    }
+
+    fn record_component_lag_event(
+        &self,
+        state: &LbClmmState,
+        component: HydrationComponent,
+        context: &'static str,
+    ) {
+        let (lag_slots, lag_ms) = self.component_lag(state, component);
+        telemetry::record_hydration_component_pending(
+            self.name(),
+            component.as_str(),
+            lag_ms,
+            lag_slots,
+        );
+        if self.should_log_component_lag(state.lb_pair, component, lag_slots, lag_ms) {
+            let hydrated_slot = match component {
+                HydrationComponent::Meta => state.hydrated_meta_slot,
+                HydrationComponent::BinWindow => state.hydrated_window_slot,
+                _ => None,
+            };
+            warn!(
+                target = "adapter::lb_clmm",
+                pool = %state.lb_pair,
+                component = component.as_str(),
+                context,
+                corecast_slot = state.corecast_slot,
+                hydrated_slot,
+                lag_slots,
+                lag_ms,
+                "lb_clmm hydration lag exceeds tolerance"
+            );
+        }
     }
 
     fn record_hydration_metrics(&self, state: &LbClmmState) {
@@ -518,14 +687,48 @@ impl LbClmmAdapter {
             window_delta,
         );
 
-        let stage = if !state.meta_ready_for_slot(state.corecast_slot) {
+        let meta_ready = self.meta_ready_within_lag(state);
+        let window_ready = self.window_ready_within_lag(state);
+        let stage = if !meta_ready {
             0
-        } else if !state.bin_window_ready_for_slot(state.corecast_slot) {
+        } else if !window_ready {
             1
         } else {
             2
         };
         telemetry::record_hydration_stage(adapter, &state.lb_pair.to_string(), stage);
+        if !meta_ready {
+            self.record_component_lag_event(state, HydrationComponent::Meta, "metrics_meta_pending");
+        }
+        if !window_ready {
+            self.record_component_lag_event(state, HydrationComponent::BinWindow, "metrics_window_pending");
+        }
+    }
+
+    fn mint_metadata(&self, mint: Pubkey) -> Option<MintMetadata> {
+        self.mint_metadata_cache
+            .as_ref()
+            .and_then(|cache| cache.hydrate(mint))
+    }
+
+    fn attach_mint_metadata(&self, state: &mut LbClmmState) {
+        if let Some(meta) = self.mint_metadata(state.token_x_mint) {
+            if state.token_x_decimals.is_none() {
+                state.token_x_decimals = meta.decimals;
+            }
+            if state.token_x_program.is_none() {
+                state.token_x_program = Some(meta.program_id);
+            }
+        }
+
+        if let Some(meta) = self.mint_metadata(state.token_y_mint) {
+            if state.token_y_decimals.is_none() {
+                state.token_y_decimals = meta.decimals;
+            }
+            if state.token_y_program.is_none() {
+                state.token_y_program = Some(meta.program_id);
+            }
+        }
     }
 
     fn ensure_token_programs(&self, state: &mut LbClmmState) {
@@ -545,6 +748,11 @@ impl LbClmmAdapter {
     }
 
     fn resolve_token_program(&self, mint: Pubkey) -> Option<Pubkey> {
+        if let Some(cache) = self.mint_metadata_cache.as_ref() {
+            if let Some(meta) = cache.hydrate(mint) {
+                return Some(meta.program_id);
+            }
+        }
         self.transfer_fee_cache
             .as_ref()
             .and_then(|cache| cache.mint_program(mint))
@@ -957,6 +1165,9 @@ impl LbClmmAdapter {
     }
 
     fn warm_mint_artifacts(&self, mint: Pubkey) {
+        if let Some(cache) = self.mint_metadata_cache.as_ref() {
+            cache.hydrate(mint);
+        }
         if let Some(cache) = self.transfer_fee_cache.as_ref() {
             cache.hydrate(mint);
         }
@@ -965,21 +1176,57 @@ impl LbClmmAdapter {
         }
     }
 
-    fn clamp_request_amount(&self, state: &LbClmmState, req: &QuoteRequest) -> u64 {
+    fn clamp_request_amount(
+        &self,
+        state: &LbClmmState,
+        req: &QuoteRequest,
+    ) -> Result<u64, QuoteStatus> {
+        if req.amount == 0 {
+            return Ok(0);
+        }
         match state.resolve_reserves(&req.input_mint, &req.output_mint) {
             Some((reserve, _)) => {
-                clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps)
+                if reserve == 0 {
+                    return Err(QuoteStatus::InsufficientLiquidity);
+                }
+                let capped = clamp_amount_to_reserve(
+                    req.amount,
+                    reserve,
+                    self.config.max_swap_utilization_bps,
+                );
+                if capped == 0 {
+                    return Err(QuoteStatus::PriceImpactExceeded);
+                }
+                Ok(capped)
             }
-            None => req.amount,
+            None => Ok(req.amount),
         }
     }
 
-    fn clamp_request_output_amount(&self, state: &LbClmmState, req: &QuoteRequest) -> u64 {
+    fn clamp_request_output_amount(
+        &self,
+        state: &LbClmmState,
+        req: &QuoteRequest,
+    ) -> Result<u64, QuoteStatus> {
+        if req.amount == 0 {
+            return Ok(0);
+        }
         match state.resolve_reserves(&req.input_mint, &req.output_mint) {
             Some((_, reserve)) => {
-                clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps)
+                if reserve == 0 {
+                    return Err(QuoteStatus::InsufficientLiquidity);
+                }
+                let capped = clamp_amount_to_reserve(
+                    req.amount,
+                    reserve,
+                    self.config.max_swap_utilization_bps,
+                );
+                if capped == 0 {
+                    return Err(QuoteStatus::PriceImpactExceeded);
+                }
+                Ok(capped)
             }
-            None => req.amount,
+            None => Ok(req.amount),
         }
     }
 
@@ -1085,7 +1332,7 @@ impl LbClmmAdapter {
                 "quote_to_base"
             },
             status = ?status,
-            reason,
+            reason = reason,
             probe_amount,
             missing_bin_id,
             observed_slippage_bps,
@@ -1401,16 +1648,19 @@ impl ProtocolAdapter for LbClmmAdapter {
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
-        if state.meta_ready_for_slot(state.corecast_slot) {
+        if self.meta_ready_within_lag(&state) {
             snapshot
                 .hydration
                 .mark_ready(HydrationComponent::Meta, state.last_update_slot);
+        } else {
+            self.record_component_lag_event(&state, HydrationComponent::Meta, "snapshot_meta_pending");
         }
-        if state.bin_window_ready_for_slot(state.corecast_slot) {
+        if self.window_ready_within_lag(&state) {
             snapshot
                 .hydration
                 .mark_ready(HydrationComponent::BinWindow, state.last_update_slot);
         } else {
+            self.record_component_lag_event(&state, HydrationComponent::BinWindow, "snapshot_window_pending");
             self.refresh_window(&state, state.active_bin_id);
         }
         let extras = snapshot
@@ -1464,6 +1714,30 @@ impl ProtocolAdapter for LbClmmAdapter {
         }
     }
 
+    fn refresh_templates(&self, epoch: u64) {
+        if self.template_builder.is_none() {
+            return;
+        }
+        let states: Vec<LbClmmState> = self.state.iter().map(|entry| entry.clone()).collect();
+        for state in states {
+            self.ensure_templates_for_epoch(&state, Some(epoch), "cache epoch refresh", false);
+        }
+    }
+
+    fn refresh_pool_templates(&self, pool: Pubkey, epoch: u64) {
+        if self.template_builder.is_none() {
+            return;
+        }
+        if let Some(state) = self.get_state(&pool) {
+            self.ensure_templates_for_epoch(
+                &state,
+                Some(epoch),
+                "template readiness refresh",
+                true,
+            );
+        }
+    }
+
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
@@ -1475,20 +1749,29 @@ impl ProtocolAdapter for LbClmmAdapter {
             response.status = QuoteStatus::StaleState;
             return Some(response);
         }
-        if !state.meta_ready_for_slot(state.corecast_slot) {
+        if !self.meta_ready_within_lag(&state) {
+            self.record_component_lag_event(&state, HydrationComponent::Meta, "quote_exact_in");
             return Some(quote_status_response(
                 request.clone(),
                 QuoteStatus::HydrationPending,
             ));
         }
-        if !state.bin_window_ready_for_slot(state.corecast_slot) {
+        if !self.window_ready_within_lag(&state) {
+            self.record_component_lag_event(&state, HydrationComponent::BinWindow, "quote_exact_in");
             self.refresh_window(&state, state.active_bin_id);
             return Some(quote_status_response(
                 request.clone(),
                 QuoteStatus::HydrationPending,
             ));
         }
-        let capped = self.clamp_request_amount(&state, &request);
+        let capped = match self.clamp_request_amount(&state, &request) {
+            Ok(value) => value,
+            Err(status) => {
+                let mut response = build_quote_response(request, 0);
+                response.status = status;
+                return Some(response);
+            }
+        };
         if capped == 0 {
             return None;
         }
@@ -1553,20 +1836,29 @@ impl ProtocolAdapter for LbClmmAdapter {
             response.status = QuoteStatus::StaleState;
             return Some(response);
         }
-        if !state.meta_ready_for_slot(state.corecast_slot) {
+        if !self.meta_ready_within_lag(&state) {
+            self.record_component_lag_event(&state, HydrationComponent::Meta, "quote_exact_out");
             return Some(quote_status_response(
                 request.clone(),
                 QuoteStatus::HydrationPending,
             ));
         }
-        if !state.bin_window_ready_for_slot(state.corecast_slot) {
+        if !self.window_ready_within_lag(&state) {
+            self.record_component_lag_event(&state, HydrationComponent::BinWindow, "quote_exact_out");
             self.refresh_window(&state, state.active_bin_id);
             return Some(quote_status_response(
                 request.clone(),
                 QuoteStatus::HydrationPending,
             ));
         }
-        let capped = self.clamp_request_output_amount(&state, &request);
+        let capped = match self.clamp_request_output_amount(&state, &request) {
+            Ok(value) => value,
+            Err(status) => {
+                let mut response = build_quote_response(request, 0);
+                response.status = status;
+                return Some(response);
+            }
+        };
         if capped == 0 {
             return None;
         }
@@ -1653,7 +1945,8 @@ impl ProtocolAdapter for LbClmmAdapter {
             return None;
         }
 
-        if !state.meta_ready_for_slot(state.corecast_slot) {
+        if !self.meta_ready_within_lag(&state) {
+            self.record_component_lag_event(&state, HydrationComponent::Meta, "snapshot_quotes");
             self.record_snapshot_issue(
                 &state,
                 snapshot.slot,
@@ -1677,7 +1970,8 @@ impl ProtocolAdapter for LbClmmAdapter {
             return None;
         }
 
-        if !state.bin_window_ready_for_slot(state.corecast_slot) {
+        if !self.window_ready_within_lag(&state) {
+            self.record_component_lag_event(&state, HydrationComponent::BinWindow, "snapshot_quotes");
             self.refresh_window(&state, state.active_bin_id);
             self.record_snapshot_issue(
                 &state,
@@ -1848,6 +2142,8 @@ pub struct LbClmmState {
     pub lb_pair: Pubkey,
     pub token_x_mint: Pubkey,
     pub token_y_mint: Pubkey,
+    pub token_x_decimals: Option<u8>,
+    pub token_y_decimals: Option<u8>,
     pub token_x_program: Option<Pubkey>,
     pub token_y_program: Option<Pubkey>,
     pub token_x_transfer_fee: Option<TokenTransferFee>,
@@ -1870,7 +2166,8 @@ pub struct LbClmmState {
     pub corecast_slot: u64,
     pub hydrated_meta_slot: Option<u64>,
     pub hydrated_window_slot: Option<u64>,
-    pub last_hydrated_at: Option<Instant>,
+    pub meta_hydrated_at: Option<Instant>,
+    pub window_hydrated_at: Option<Instant>,
     pub last_update_slot: u64,
     pub last_update_at: Instant,
 }
@@ -1936,6 +2233,27 @@ impl LbClmmState {
         self.meta_ready() && Self::hydration_slot_ready(self.hydrated_meta_slot, slot)
     }
 
+    fn meta_ready_within_lag(
+        &self,
+        slot: u64,
+        slot_lag_tolerance: u64,
+        lag_ms_tolerance: u64,
+    ) -> bool {
+        if !self.meta_ready() {
+            return false;
+        }
+        if Self::hydration_slot_within_tolerance(self.hydrated_meta_slot, slot, slot_lag_tolerance)
+        {
+            return true;
+        }
+        if lag_ms_tolerance == 0 {
+            return false;
+        }
+        self.meta_hydration_age_ms()
+            .map(|age| age <= lag_ms_tolerance)
+            .unwrap_or(false)
+    }
+
     fn bin_window_ready(&self) -> bool {
         let active_bin = match self.active_bin_id {
             Some(bin) => bin,
@@ -1961,6 +2279,60 @@ impl LbClmmState {
 
     fn hydration_slot_ready(slot: Option<u64>, target: u64) -> bool {
         slot.map(|value| value >= target).unwrap_or(false)
+    }
+
+    fn bin_window_ready_within_lag(
+        &self,
+        slot: u64,
+        slot_lag_tolerance: u64,
+        lag_ms_tolerance: u64,
+    ) -> bool {
+        if !self.bin_window_ready() {
+            return false;
+        }
+        if Self::hydration_slot_within_tolerance(
+            self.hydrated_window_slot,
+            slot,
+            slot_lag_tolerance,
+        ) {
+            return true;
+        }
+        if lag_ms_tolerance == 0 {
+            return false;
+        }
+        self.window_hydration_age_ms()
+            .map(|age| age <= lag_ms_tolerance)
+            .unwrap_or(false)
+    }
+
+    fn hydration_slot_within_tolerance(
+        slot: Option<u64>,
+        target: u64,
+        tolerance: u64,
+    ) -> bool {
+        slot
+            .map(|hydrated| hydrated >= target || target.saturating_sub(hydrated) <= tolerance)
+            .unwrap_or(false)
+    }
+
+    fn meta_hydration_age_ms(&self) -> Option<u64> {
+        self.meta_hydrated_at
+            .map(|instant| instant.elapsed().as_millis() as u64)
+    }
+
+    fn window_hydration_age_ms(&self) -> Option<u64> {
+        self.window_hydrated_at
+            .map(|instant| instant.elapsed().as_millis() as u64)
+    }
+
+    fn meta_lag_slots(&self, slot: u64) -> Option<u64> {
+        self.hydrated_meta_slot
+            .map(|hydrated| slot.saturating_sub(hydrated))
+    }
+
+    fn window_lag_slots(&self, slot: u64) -> Option<u64> {
+        self.hydrated_window_slot
+            .map(|hydrated| slot.saturating_sub(hydrated))
     }
 
     fn taker_fee_bps(&self) -> u64 {
@@ -2169,7 +2541,7 @@ impl From<LbClmmSimulationError> for QuoteStatus {
         match value {
             LbClmmSimulationError::MissingState => QuoteStatus::MissingState,
             LbClmmSimulationError::InsufficientLiquidity => QuoteStatus::InsufficientLiquidity,
-            LbClmmSimulationError::InsufficientBins { .. } => QuoteStatus::InsufficientBins,
+            LbClmmSimulationError::InsufficientBins { .. } => QuoteStatus::HydrationPending,
             LbClmmSimulationError::PriceImpactExceeded { .. } => QuoteStatus::PriceImpactExceeded,
         }
     }
@@ -2813,11 +3185,8 @@ fn fetch_lb_clmm_meta(
                     let fetched_at = Instant::now();
                     meta.hydrated_slot = hydrated_slot;
                     meta.hydrated_at = fetched_at;
-                    let hydrated = HydratedValue::with_timestamp(
-                        meta,
-                        Some(hydrated_slot),
-                        fetched_at,
-                    );
+                    let hydrated =
+                        HydratedValue::with_timestamp(meta, Some(hydrated_slot), fetched_at);
                     cache.insert(pool, hydrated.clone());
                     stream_lb_clmm_extensions(
                         program_id,
@@ -2938,11 +3307,8 @@ fn stream_lb_clmm_extensions(
                         updated.bin_arrays = merge_bin_array_sets(updated.bin_arrays, targeted);
                         window_cache.insert(pool, window);
                         let slot = cached_slot.or(Some(updated.hydrated_slot));
-                        let entry = HydratedValue::with_timestamp(
-                            updated.clone(),
-                            slot,
-                            Instant::now(),
-                        );
+                        let entry =
+                            HydratedValue::with_timestamp(updated.clone(), slot, Instant::now());
                         cache.insert(pool, entry);
                         staged = true;
                     }
@@ -3536,6 +3902,8 @@ mod tests {
             lb_pair: Pubkey::new_unique(),
             token_x_mint: Pubkey::new_unique(),
             token_y_mint: Pubkey::new_unique(),
+            token_x_decimals: None,
+            token_y_decimals: None,
             token_x_program: Some(*SPL_TOKEN_PROGRAM_PUBKEY),
             token_y_program: Some(*SPL_TOKEN_PROGRAM_PUBKEY),
             token_x_transfer_fee: None,
@@ -3558,7 +3926,8 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            last_hydrated_at: Some(now),
+            meta_hydrated_at: Some(now),
+            window_hydrated_at: Some(now),
             last_update_slot: 0,
             last_update_at: now,
         }
@@ -3670,6 +4039,8 @@ mod tests {
             lb_pair: pool,
             token_x_mint: token_x,
             token_y_mint: token_y,
+            token_x_decimals: None,
+            token_y_decimals: None,
             token_x_program: None,
             token_y_program: None,
             token_x_transfer_fee: None,
@@ -3692,7 +4063,8 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            last_hydrated_at: Some(Instant::now()),
+            meta_hydrated_at: Some(Instant::now()),
+            window_hydrated_at: Some(Instant::now()),
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -3741,6 +4113,8 @@ mod tests {
             lb_pair: pool,
             token_x_mint: token_x,
             token_y_mint: token_y,
+            token_x_decimals: None,
+            token_y_decimals: None,
             token_x_program: None,
             token_y_program: None,
             token_x_transfer_fee: None,
@@ -3763,7 +4137,8 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            last_hydrated_at: Some(Instant::now()),
+            meta_hydrated_at: Some(Instant::now()),
+            window_hydrated_at: Some(Instant::now()),
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -3781,6 +4156,8 @@ mod tests {
             lb_pair: Pubkey::new_unique(),
             token_x_mint: Pubkey::new_unique(),
             token_y_mint: Pubkey::new_unique(),
+            token_x_decimals: None,
+            token_y_decimals: None,
             token_x_program: None,
             token_y_program: None,
             token_x_transfer_fee: None,
@@ -3803,7 +4180,8 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            last_hydrated_at: Some(Instant::now()),
+            meta_hydrated_at: Some(Instant::now()),
+            window_hydrated_at: Some(Instant::now()),
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -4060,14 +4438,20 @@ mod tests {
         state.reserve_x_balance = Some(1_000_000);
         state.reserve_y_balance = Some(1_000_000);
         let mut liquidity = BTreeMap::new();
-        liquidity.insert(
+        for bin_id in [
+            -BIN_WINDOW_EDGE_BUFFER_BINS,
             0,
-            LbClmmBinSnapshot {
-                bin_id: 0,
-                liquidity_x: 5_000_000,
-                liquidity_y: 5_000_000,
-            },
-        );
+            BIN_WINDOW_EDGE_BUFFER_BINS,
+        ] {
+            liquidity.insert(
+                bin_id,
+                LbClmmBinSnapshot {
+                    bin_id,
+                    liquidity_x: 5_000_000,
+                    liquidity_y: 5_000_000,
+                },
+            );
+        }
         state.bin_liquidity = liquidity;
         state
     }
@@ -4078,6 +4462,8 @@ mod tests {
             lb_pair: Pubkey::new_unique(),
             token_x_mint: Pubkey::new_unique(),
             token_y_mint: Pubkey::new_unique(),
+            token_x_decimals: None,
+            token_y_decimals: None,
             token_x_program: Some(*SPL_TOKEN_PROGRAM_PUBKEY),
             token_y_program: Some(*SPL_TOKEN_2022_PROGRAM_PUBKEY),
             token_x_transfer_fee: None,
@@ -4100,7 +4486,8 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            last_hydrated_at: Some(now),
+            meta_hydrated_at: Some(now),
+            window_hydrated_at: Some(now),
             last_update_slot: 0,
             last_update_at: now,
         }

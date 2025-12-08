@@ -22,7 +22,8 @@ use tokio::{runtime::Handle, task::JoinHandle};
 use tracing::{info, warn};
 
 const PROMETHEUS_ENV: &str = "PROMETHEUS_METRICS_ADDR";
-const PROMETHEUS_METRIC_PREFIX_ALLOWLIST: &[&str] = &["hydration_", "watcher_", "fastlane_"];
+const PROMETHEUS_METRIC_PREFIX_ALLOWLIST: &[&str] =
+    &["hydration_", "watcher_", "fastlane_", "bundle_", "stage2_"];
 const HYDRATION_POOL_PRICE_SCALE: f64 = 1_000_000.0;
 
 static TELEMETRY: OnceCell<TelemetryState> = OnceCell::new();
@@ -42,10 +43,7 @@ struct TelemetryState {
     stage2_pool_blocks: Family<Stage2PoolLabels, Counter>,
     execution_retry_events: Family<Stage3RetryLabels, Counter>,
     hydration_template_age_ms: Gauge,
-    hydration_alt_age_ms: Gauge,
-    hydration_backlog_gauge: Gauge,
     hydration_template_cache_entries: Gauge,
-    hydration_alt_ready_tables: Gauge,
     hydration_flash_routes_prepared: Gauge,
     hydration_snapshot_overwrites: Counter,
     hydration_ready_pools: Gauge,
@@ -56,13 +54,16 @@ struct TelemetryState {
     hydration_rpc_refresh_failure: Family<HydrationAdapterLabels, Counter>,
     hydration_transfer_hook_events: Family<TransferHookEventLabels, Counter>,
     hydration_pool_price_scaled: Family<HydrationPoolLabels, Gauge>,
+    hydration_pool_ready: Family<HydrationPoolLabels, Gauge>,
     hydration_pool_slot: Family<HydrationPoolLabels, Gauge>,
     hydration_pool_base_liquidity: Family<HydrationPoolLabels, Gauge>,
     hydration_pool_quote_liquidity: Family<HydrationPoolLabels, Gauge>,
+    hydration_pool_initial_latency_ms: Family<HydrationPoolLabels, Gauge>,
     hydration_component_pending: Family<HydrationComponentLabels, Counter>,
     hydration_component_lag_ms: Family<HydrationComponentLabels, Gauge>,
     hydration_component_lag_slots: Family<HydrationComponentLabels, Gauge>,
     hydration_component_slot_delta: Family<HydrationComponentLabels, Gauge>,
+    hydration_readiness_failures: Family<HydrationReadinessLabels, Counter>,
     hydration_stage_gauge: Family<HydrationStageLabels, Gauge>,
     hydration_stale_pools: Counter,
     hydration_queue_depth_pct: Gauge,
@@ -176,32 +177,11 @@ impl TelemetryState {
             hydration_template_age_ms.clone(),
         );
 
-        let hydration_alt_age_ms = Gauge::default();
-        registry.register(
-            "hydration_alt_age_ms",
-            "Milliseconds since the ALT manager last refreshed",
-            hydration_alt_age_ms.clone(),
-        );
-
-        let hydration_backlog_gauge = Gauge::default();
-        registry.register(
-            "hydration_backlog_items",
-            "Pending hydration jobs/backlog queued by the ALT manager",
-            hydration_backlog_gauge.clone(),
-        );
-
         let hydration_template_cache_entries = Gauge::default();
         registry.register(
             "hydration_template_cache_entries",
             "Number of hydrated instruction templates currently cached",
             hydration_template_cache_entries.clone(),
-        );
-
-        let hydration_alt_ready_tables = Gauge::default();
-        registry.register(
-            "hydration_alt_ready_tables",
-            "Count of ALT tables ready for immediate use",
-            hydration_alt_ready_tables.clone(),
         );
 
         let hydration_flash_routes_prepared = Gauge::default();
@@ -221,7 +201,7 @@ impl TelemetryState {
         let hydration_ready_pools = Gauge::default();
         registry.register(
             "hydration_ready_pools",
-            "Count of pools that are fully hydrated with templates/ALTs tick arrays",
+            "Count of pools that are fully hydrated with templates and tick arrays",
             hydration_ready_pools.clone(),
         );
 
@@ -274,6 +254,13 @@ impl TelemetryState {
             hydration_pool_price_scaled.clone(),
         );
 
+        let hydration_pool_ready = Family::default();
+        registry.register(
+            "hydration_pool_ready",
+            "Boolean readiness flag (1 = hydrated, 0 = warming) for the most recent pool snapshot",
+            hydration_pool_ready.clone(),
+        );
+
         let hydration_component_pending = Family::default();
         registry.register(
             "hydration_component_pending_total",
@@ -302,6 +289,13 @@ impl TelemetryState {
             hydration_component_slot_delta.clone(),
         );
 
+        let hydration_readiness_failures = Family::default();
+        registry.register(
+            "hydration_readiness_failures_total",
+            "Pool readiness failures grouped by adapter and reason",
+            hydration_readiness_failures.clone(),
+        );
+
         let hydration_pool_slot = Family::default();
         registry.register(
             "hydration_pool_slot",
@@ -321,6 +315,13 @@ impl TelemetryState {
             "hydration_pool_quote_liquidity",
             "Quote-side post balance associated with the most recent pool snapshot",
             hydration_pool_quote_liquidity.clone(),
+        );
+
+        let hydration_pool_initial_latency_ms = Family::default();
+        registry.register(
+            "hydration_pool_initial_latency_ms",
+            "Elapsed milliseconds between pool discovery and its first ready state",
+            hydration_pool_initial_latency_ms.clone(),
         );
 
         let hydration_stale_pools = Counter::default();
@@ -365,9 +366,8 @@ impl TelemetryState {
             hydration_job_finished.clone(),
         );
 
-        let hydration_job_latency_ms = Family::new_with_constructor(
-            hydration_job_latency_histogram as fn() -> Histogram,
-        );
+        let hydration_job_latency_ms =
+            Family::new_with_constructor(hydration_job_latency_histogram as fn() -> Histogram);
         registry.register(
             "hydration_job_latency_ms",
             "Observed latency per hydrator worker and status",
@@ -508,10 +508,7 @@ impl TelemetryState {
             stage2_pool_blocks,
             execution_retry_events,
             hydration_template_age_ms,
-            hydration_alt_age_ms,
-            hydration_backlog_gauge,
             hydration_template_cache_entries,
-            hydration_alt_ready_tables,
             hydration_flash_routes_prepared,
             hydration_snapshot_overwrites,
             hydration_ready_pools,
@@ -522,13 +519,16 @@ impl TelemetryState {
             hydration_rpc_refresh_failure,
             hydration_transfer_hook_events,
             hydration_pool_price_scaled,
+            hydration_pool_ready,
             hydration_component_pending,
             hydration_component_lag_ms,
             hydration_component_lag_slots,
             hydration_component_slot_delta,
+            hydration_readiness_failures,
             hydration_pool_slot,
             hydration_pool_base_liquidity,
             hydration_pool_quote_liquidity,
+            hydration_pool_initial_latency_ms,
             hydration_stale_pools,
             hydration_queue_depth_pct,
             hydration_queue_depth_items,
@@ -781,6 +781,12 @@ struct HydrationComponentLabels {
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
+struct HydrationReadinessLabels {
+    adapter: String,
+    reason: &'static str,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
 struct HydrationStageLabels {
     adapter: String,
     pool: String,
@@ -969,35 +975,11 @@ pub fn record_hydration_template_refresh(last_refresh_unix_ms: u64) {
     }
 }
 
-pub fn record_hydration_alt_refresh(last_refresh_unix_ms: u64) {
-    if let Some(state) = TELEMETRY.get() {
-        if let Some(age_ms) = age_since_unix_ms(last_refresh_unix_ms) {
-            state.hydration_alt_age_ms.set(clamp_u64_to_i64(age_ms));
-        }
-    }
-}
-
-pub fn record_hydration_backlog(pending_jobs: u64) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .hydration_backlog_gauge
-            .set(clamp_u64_to_i64(pending_jobs));
-    }
-}
-
 pub fn record_hydration_template_count(template_count: u64) {
     if let Some(state) = TELEMETRY.get() {
         state
             .hydration_template_cache_entries
             .set(clamp_u64_to_i64(template_count));
-    }
-}
-
-pub fn record_hydration_alt_ready_tables(ready_tables: u64) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .hydration_alt_ready_tables
-            .set(clamp_u64_to_i64(ready_tables));
     }
 }
 
@@ -1117,11 +1099,7 @@ pub fn record_hydration_component_pending(
     }
 }
 
-pub fn record_hydration_component_slot_delta(
-    adapter: &str,
-    component: &'static str,
-    delta: u64,
-) {
+pub fn record_hydration_component_slot_delta(adapter: &str, component: &'static str, delta: u64) {
     if let Some(state) = TELEMETRY.get() {
         let labels = HydrationComponentLabels {
             adapter: adapter.to_string(),
@@ -1134,15 +1112,25 @@ pub fn record_hydration_component_slot_delta(
     }
 }
 
+pub fn record_hydration_readiness_failure(adapter: &str, reason: &'static str) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationReadinessLabels {
+            adapter: adapter.to_string(),
+            reason,
+        };
+        state
+            .hydration_readiness_failures
+            .get_or_create(&labels)
+            .inc();
+    }
+}
+
 pub fn record_hydration_job_scheduled(worker: &str) {
     if let Some(state) = TELEMETRY.get() {
         let labels = HydrationWorkerLabels {
             worker: worker.to_string(),
         };
-        state
-            .hydration_job_scheduled
-            .get_or_create(&labels)
-            .inc();
+        state.hydration_job_scheduled.get_or_create(&labels).inc();
     }
 }
 
@@ -1159,20 +1147,13 @@ pub fn record_hydration_job_queue_failure(worker: &str, reason: &'static str) {
     }
 }
 
-pub fn record_hydration_job_finished(
-    worker: &str,
-    status: HydrationJobStatus,
-    latency: Duration,
-) {
+pub fn record_hydration_job_finished(worker: &str, status: HydrationJobStatus, latency: Duration) {
     if let Some(state) = TELEMETRY.get() {
         let labels = HydrationJobStatusLabels {
             worker: worker.to_string(),
             status: status.label(),
         };
-        state
-            .hydration_job_finished
-            .get_or_create(&labels)
-            .inc();
+        state.hydration_job_finished.get_or_create(&labels).inc();
         state
             .hydration_job_latency_ms
             .get_or_create(&labels)
@@ -1197,10 +1178,7 @@ pub fn record_hydration_quote_blocked(adapter: &str) {
         let labels = HydrationAdapterLabels {
             adapter: adapter.to_string(),
         };
-        state
-            .hydration_quote_blocked
-            .get_or_create(&labels)
-            .inc();
+        state.hydration_quote_blocked.get_or_create(&labels).inc();
     }
 }
 
@@ -1239,6 +1217,7 @@ pub fn record_hydration_pool_snapshot(
     price: f64,
     base_liquidity: u128,
     quote_liquidity: u128,
+    ready: bool,
 ) {
     if program_id.is_empty() || pool_id.is_empty() {
         return;
@@ -1254,6 +1233,10 @@ pub fn record_hydration_pool_snapshot(
             .hydration_pool_slot
             .get_or_create(&labels)
             .set(clamp_u64_to_i64(slot));
+        state
+            .hydration_pool_ready
+            .get_or_create(&labels)
+            .set(if ready { 1 } else { 0 });
         if price.is_finite() && price > 0.0 {
             let scaled = (price * HYDRATION_POOL_PRICE_SCALE).round();
             let clamped = scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
@@ -1270,6 +1253,30 @@ pub fn record_hydration_pool_snapshot(
             .hydration_pool_quote_liquidity
             .get_or_create(&labels)
             .set(clamp_u128_to_i64(quote_liquidity));
+    }
+}
+
+pub fn record_hydration_initial_latency(
+    program_id: &str,
+    pool_id: &str,
+    base_mint: &str,
+    quote_mint: &str,
+    latency_ms: u64,
+) {
+    if program_id.is_empty() || pool_id.is_empty() {
+        return;
+    }
+    if let Some(state) = TELEMETRY.get() {
+        let labels = HydrationPoolLabels {
+            program: program_id.to_string(),
+            pool: pool_id.to_string(),
+            base_mint: base_mint.to_string(),
+            quote_mint: quote_mint.to_string(),
+        };
+        state
+            .hydration_pool_initial_latency_ms
+            .get_or_create(&labels)
+            .set(clamp_u64_to_i64(latency_ms));
     }
 }
 

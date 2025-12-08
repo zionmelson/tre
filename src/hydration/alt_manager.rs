@@ -175,23 +175,6 @@ impl AltManager {
         self.state.persist_snapshot()
     }
 
-    pub fn stats(&self) -> AltManagerStats {
-        let ready_tables = self
-            .state
-            .registry
-            .iter()
-            .filter(|entry| matches!(entry.status, AltStatus::Ready))
-            .count() as u64;
-
-        AltManagerStats {
-            refresh_count: self.state.refresh_count.load(Ordering::Relaxed),
-            last_refresh_unix_ms: self.state.last_refresh_unix_ms.load(Ordering::Relaxed),
-            registered_handles: self.state.registry.len() as u64,
-            ready_tables,
-            pending_jobs: self.state.pending_jobs.load(Ordering::Relaxed),
-        }
-    }
-
     pub fn ensure_handle(&self, pool: Pubkey, accounts: &[Pubkey]) -> Option<AltHandleId> {
         let normalized = normalize_accounts(accounts);
         if normalized.is_empty() {
@@ -712,15 +695,6 @@ impl AltManagerState {
             );
         }
     }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct AltManagerStats {
-    pub refresh_count: u64,
-    pub last_refresh_unix_ms: u64,
-    pub registered_handles: u64,
-    pub ready_tables: u64,
-    pub pending_jobs: u64,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -957,6 +957,11 @@ mod whirlpool {
         pub adaptive_fee: Option<WhirlpoolAdaptiveFeeInfo>,
         pub hydrated_slot: Option<u64>,
         pub hydrated_at: Option<Instant>,
+        pub twap_price: Option<f64>,
+        pub twap_tick: Option<i32>,
+        pub twap_seconds_per_liquidity_x64: Option<u128>,
+        pub twap_sample_seconds: Option<u64>,
+        pub twap_timestamp: Option<u64>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1041,7 +1046,12 @@ mod whirlpool {
             || extras.oracle.is_some()
             || extras.tick_array0.is_some()
             || extras.tick_array1.is_some()
-            || extras.tick_array2.is_some();
+            || extras.tick_array2.is_some()
+            || extras.twap_price.is_some()
+            || extras.twap_tick.is_some()
+            || extras.twap_seconds_per_liquidity_x64.is_some()
+            || extras.twap_sample_seconds.is_some()
+            || extras.twap_timestamp.is_some();
 
         if has_data {
             Some(extras)

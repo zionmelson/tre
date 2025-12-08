@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::thread;
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
+use dashmap::{DashMap, DashSet};
 use solana_sdk::pubkey::Pubkey;
 use tokio::runtime::Builder as TokioRuntime;
 use tokio::time::sleep;
@@ -17,12 +18,16 @@ use tracing::{debug, info, warn};
 
 use super::{
     adapters::{AdapterReadiness, ReadinessBlocker, ReadinessBlockerKind},
-    AdapterBook, AltManagerStats, FlashLoanPlanner, PoolStateEvent, PoolStateUpdate, PoolStore,
-    PoolStoreView, RpcRefresher, SnapshotPublisher, TemplateCache, TemplateCacheStats,
+    AdapterBook, FlashLoanPlanner, PoolStateEvent, PoolStateUpdate, PoolStore, PoolStoreView,
+    RpcRefresher, SnapshotPublisher, TemplateCache, TemplateCacheStats,
 };
 use crate::builder::{templates::SwapTemplateDirection, BuilderHandle};
 use crate::config::AppConfig;
 use crate::corecast::CoreCastClient;
+use crate::hydration::logging::{
+    describe_pending_components, program_log_target, PendingComponentSummary,
+};
+use crate::hydration::readiness::ReadinessRegistry;
 use crate::hydration::types::{HydrationComponent, PoolSnapshot, PoolUpdate, WHIRLPOOL_PROGRAM_ID};
 use crate::telemetry;
 use crate::token_pair::TokenPair;
@@ -34,7 +39,6 @@ use crate::token_pair::TokenPair;
 pub struct HydrationSnapshot {
     pub issued_at: Instant,
     pub template_stats: TemplateCacheStats,
-    pub alt_stats: AltManagerStats,
     pub flash_routes_prepared: u64,
 }
 
@@ -47,18 +51,14 @@ impl HydrationSnapshot {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TemplateReadiness {
     pub template_ready: bool,
-    pub alt_ready: bool,
     pub template_fresh_until: Option<Instant>,
-    pub alt_fresh_until: Option<Instant>,
 }
 
 impl TemplateReadiness {
     pub const fn missing() -> Self {
         Self {
             template_ready: false,
-            alt_ready: false,
             template_fresh_until: None,
-            alt_fresh_until: None,
         }
     }
 }
@@ -76,11 +76,16 @@ pub struct HydrationService {
     adapter_book: Arc<AdapterBook>,
     pool_store: Arc<PoolStore>,
     rpc_refresher: Arc<RpcRefresher>,
-    alt_required_for_readiness: bool,
+    readiness: ReadinessRegistry,
+    template_epoch: Arc<AtomicU64>,
 }
 
 impl HydrationService {
-    pub fn new(builder: BuilderHandle, config: Arc<AppConfig>) -> Self {
+    pub fn new(
+        builder: BuilderHandle,
+        config: Arc<AppConfig>,
+        readiness: ReadinessRegistry,
+    ) -> Self {
         let adapter_book = Arc::new(AdapterBook::new(config.clone(), builder.clone()));
         let pool_store = Arc::new(PoolStore::with_limits_and_policy(
             config.watcher.max_tracked_pools,
@@ -88,7 +93,7 @@ impl HydrationService {
             config.watcher.queue_drop_policy,
         ));
         let rpc_refresher = Arc::new(RpcRefresher::new(config.clone()));
-        let alt_required_for_readiness = !config.pipeline.dry_run_mode;
+        let template_epoch = Arc::new(AtomicU64::new(builder.template_cache().epoch()));
         Self {
             builder,
             config,
@@ -96,7 +101,8 @@ impl HydrationService {
             adapter_book,
             pool_store,
             rpc_refresher,
-            alt_required_for_readiness,
+            readiness,
+            template_epoch,
         }
     }
 
@@ -109,9 +115,22 @@ impl HydrationService {
     ) -> Result<thread::JoinHandle<Result<()>>> {
         let builder = self.builder.clone();
         let interval = self.publish_interval;
+        let readiness = self.readiness.clone();
+        let adapter_book = self.adapter_book.clone();
+        let template_epoch = self.template_epoch.clone();
         thread::Builder::new()
             .name("hydration_service".into())
-            .spawn(move || run_snapshot_loop(stop, publisher, builder, interval))
+            .spawn(move || {
+                run_snapshot_loop(
+                    stop,
+                    publisher,
+                    builder,
+                    interval,
+                    readiness,
+                    adapter_book,
+                    template_epoch,
+                )
+            })
             .map_err(Into::into)
     }
 
@@ -126,18 +145,11 @@ impl HydrationService {
         let adapter_book = self.adapter_book.clone();
         let pool_store = self.pool_store.clone();
         let builder = self.builder.clone();
-        let require_alt_ready = self.alt_required_for_readiness;
+        let readiness = self.readiness.clone();
         thread::Builder::new()
             .name("hydration_ingest".into())
             .spawn(move || {
-                run_adapter_ingest_loop(
-                    stop,
-                    config,
-                    adapter_book,
-                    pool_store,
-                    builder,
-                    require_alt_ready,
-                )
+                run_adapter_ingest_loop(stop, config, adapter_book, pool_store, builder, readiness)
             })
             .map_err(Into::into)
     }
@@ -168,6 +180,13 @@ impl HydrationService {
 
     pub fn readiness_diagnostics(&self) -> AdapterReadiness {
         self.adapter_book.readiness_diagnostics()
+    }
+
+    pub fn reset_template_cache(&self) -> u64 {
+        let epoch = self.builder.reset_template_cache();
+        self.template_epoch.store(epoch, Ordering::Relaxed);
+        self.adapter_book.refresh_templates(epoch);
+        epoch
     }
 
     pub fn wait_for_pool_readiness(&self, timeout: Duration) -> bool {
@@ -210,7 +229,7 @@ impl HydrationService {
         let slot_lag = self.config.watcher.pool_stale_slot_lag;
         let sweep = Duration::from_millis(self.config.watcher.pool_stale_sweep_ms.max(50));
         let builder = self.builder.clone();
-        let require_alt_ready = self.alt_required_for_readiness;
+        let readiness = self.readiness.clone();
         if ttl.is_none() {
             info!(
                 target = "hydration",
@@ -229,7 +248,7 @@ impl HydrationService {
                     slot_lag,
                     sweep,
                     builder,
-                    require_alt_ready,
+                    readiness,
                 )
             })
             .map_err(Into::into)
@@ -260,15 +279,51 @@ impl HydrationService {
 
         let stalled = self.sample_unready_pool_reasons(3);
         if !stalled.is_empty() {
+            let summary = stalled
+                .iter()
+                .map(PoolReadinessSample::short_summary)
+                .collect::<Vec<_>>()
+                .join(" | ");
             warn!(
                 target = "hydration",
-                samples = %stalled.join(" | "),
+                samples = %summary,
                 "pool readiness stalled; sample pools failing fast-lane checks"
             );
         }
+
+        for sample in &stalled {
+            telemetry::record_hydration_readiness_failure(
+                &sample.program_id,
+                sample.reason.label(),
+            );
+            let target = program_log_target(&sample.program_id);
+            match (&sample.reason, &sample.pending) {
+                (PoolReadinessFailure::HydrationPending(_), Some(summary)) => {
+                    warn!(
+                        target = target,
+                        pool = %sample.pool_id,
+                        slot = sample.slot,
+                        lag_ms = summary.lag_ms,
+                        lag_slots = summary.lag_slots,
+                        components = %summary.component_names(),
+                        details = %summary.detail_string(),
+                        "hydration pending; fast-lane readiness stalled"
+                    );
+                }
+                _ => {
+                    warn!(
+                        target = target,
+                        pool = %sample.pool_id,
+                        slot = sample.slot,
+                        reason = sample.reason.label(),
+                        "pool readiness blocked"
+                    );
+                }
+            }
+        }
     }
 
-    fn sample_unready_pool_reasons(&self, limit: usize) -> Vec<String> {
+    fn sample_unready_pool_reasons(&self, limit: usize) -> Vec<PoolReadinessSample> {
         if limit == 0 {
             return Vec::new();
         }
@@ -279,12 +334,16 @@ impl HydrationService {
             if state.ready {
                 continue;
             }
-            if let Err(reason) = evaluate_snapshot_readiness(
-                &self.builder,
-                &state.snapshot,
-                self.alt_required_for_readiness,
-            ) {
-                samples.push(format!("{}:{} {}", state.program_id, state.pool_id, reason));
+            if let Err(reason) = evaluate_snapshot_readiness(&self.builder, &state.snapshot) {
+                let pending = matches!(reason, PoolReadinessFailure::HydrationPending(_))
+                    .then(|| describe_pending_components(&state.snapshot));
+                samples.push(PoolReadinessSample {
+                    program_id: state.program_id.clone(),
+                    pool_id: state.pool_id.clone(),
+                    slot: state.slot,
+                    reason,
+                    pending,
+                });
             }
             if samples.len() >= limit {
                 break;
@@ -317,28 +376,57 @@ fn run_snapshot_loop(
     publisher: SnapshotPublisher,
     builder: BuilderHandle,
     interval: Duration,
+    readiness: ReadinessRegistry,
+    adapter_book: Arc<AdapterBook>,
+    template_epoch: Arc<AtomicU64>,
 ) -> Result<()> {
+    let mut waiting_logged = false;
     while !stop.load(Ordering::Relaxed) {
+        readiness.expire_stale();
+        let stats = builder.template_cache().stats();
+        let previous_epoch = template_epoch.swap(stats.epoch, Ordering::Relaxed);
+        if stats.epoch > previous_epoch {
+            adapter_book.refresh_templates(stats.epoch);
+        }
         let snapshot = HydrationSnapshot {
             issued_at: Instant::now(),
-            template_stats: builder.template_cache().stats(),
-            alt_stats: builder.alt_manager().stats(),
+            template_stats: stats,
             flash_routes_prepared: builder.flash_loan_planner().prepared_route_count(),
         };
         let template_count = snapshot.template_stats.template_count;
-        let ready_tables = snapshot.alt_stats.ready_tables;
         let flash_routes = snapshot.flash_routes_prepared;
+
+        if !hydration_snapshot_ready(&snapshot) {
+            if !waiting_logged {
+                debug!(
+                    templates = template_count,
+                    flash_routes, "hydration snapshot withheld; waiting for full readiness"
+                );
+                waiting_logged = true;
+            }
+            thread::sleep(interval);
+            continue;
+        }
+
+        waiting_logged = false;
         let overwritten = publisher.publish(snapshot);
         if overwritten {
             telemetry::record_hydration_snapshot_overwrite();
         }
         debug!(
             templates = template_count,
-            ready_tables, flash_routes, overwritten, "published hydration snapshot"
+            flash_routes, overwritten, "published hydration snapshot"
         );
         thread::sleep(interval);
     }
     Ok(())
+}
+
+fn hydration_snapshot_ready(snapshot: &HydrationSnapshot) -> bool {
+    let template_count = snapshot.template_stats.template_count;
+    let flash_routes = snapshot.flash_routes_prepared;
+
+    template_count > 0 && flash_routes > 0
 }
 
 fn run_adapter_ingest_loop(
@@ -347,7 +435,7 @@ fn run_adapter_ingest_loop(
     adapter_book: Arc<AdapterBook>,
     pool_store: Arc<PoolStore>,
     builder: BuilderHandle,
-    require_alt_ready: bool,
+    readiness: ReadinessRegistry,
 ) -> Result<()> {
     let client = CoreCastClient::new(config.clone())
         .context("failed to initialize CoreCast client for hydration ingest")?;
@@ -366,7 +454,7 @@ fn run_adapter_ingest_loop(
             pool_store,
             pair_allowlist,
             builder,
-            require_alt_ready,
+            readiness,
         )
         .await
     })
@@ -379,11 +467,19 @@ async fn pump_pool_stream(
     pool_store: Arc<PoolStore>,
     allowlist: Arc<HashSet<TokenPair>>,
     builder: BuilderHandle,
-    require_alt_ready: bool,
+    readiness: ReadinessRegistry,
 ) -> Result<()> {
     let mut seq = 0u64;
     let mut retry = Duration::from_millis(250);
     let max_retry = Duration::from_secs(5);
+    let update_cache = Arc::new(UpdateCache::default());
+    let processor = Arc::new(ProcessContext::new(
+        adapter_book.clone(),
+        pool_store.clone(),
+        builder,
+        readiness.clone(),
+    ));
+    let hydrator_retry = HydrationRetry::new(stop.clone(), processor.clone(), update_cache.clone());
 
     while !stop.load(Ordering::Relaxed) {
         match client.pool_stream().await {
@@ -391,7 +487,7 @@ async fn pump_pool_stream(
                 info!(target = "hydration", "CoreCast pool stream subscribed");
                 retry = Duration::from_millis(250);
                 while !stop.load(Ordering::Relaxed) {
-                    match stream.message().await {
+                    match stream.next_message().await {
                         Ok(Some(message)) => {
                             if let Some(update) = PoolUpdate::from_corecast(seq, &message) {
                                 seq = seq.wrapping_add(1);
@@ -399,26 +495,15 @@ async fn pump_pool_stream(
                                     &update.base_mint,
                                     &update.quote_mint,
                                 )) {
-                                    if let Some(adapter) = adapter_book.ingest(&update) {
-                                        telemetry::record_hydration_adapter_ingest(adapter);
+                                    readiness.record_pool_update(&update);
+                                    update_cache.store(&update);
+                                    let needs_retry = processor.process(&update, true).needs_retry;
+                                    if needs_retry {
+                                        hydrator_retry.schedule(
+                                            update.program_id.clone(),
+                                            update.pool_id.clone(),
+                                        );
                                     }
-                                    let mut snapshot = update.into_snapshot();
-                                    adapter_book.enrich_snapshot(&mut snapshot);
-                                    if let Some(quotes) =
-                                        adapter_book.snapshot_quotes(&mut snapshot)
-                                    {
-                                        snapshot.quotes = Some(quotes);
-                                    }
-                                    let pending = snapshot.hydration.pending_components();
-                                    if !pending.is_empty() {
-                                        adapter_book.warm_components(&snapshot, &pending);
-                                    }
-                                    let ready = snapshot_ready_for_fastlane(
-                                        &builder,
-                                        &snapshot,
-                                        require_alt_ready,
-                                    );
-                                    pool_store.update(snapshot, ready);
                                     telemetry::record_hydration_heartbeat(unix_timestamp_ms());
                                 }
                             } else {
@@ -468,6 +553,216 @@ fn unix_timestamp_ms() -> u64 {
         .unwrap_or_default()
 }
 
+struct ProcessContext {
+    adapter_book: Arc<AdapterBook>,
+    pool_store: Arc<PoolStore>,
+    builder: BuilderHandle,
+    readiness: ReadinessRegistry,
+}
+
+impl ProcessContext {
+    fn new(
+        adapter_book: Arc<AdapterBook>,
+        pool_store: Arc<PoolStore>,
+        builder: BuilderHandle,
+        readiness: ReadinessRegistry,
+    ) -> Self {
+        Self {
+            adapter_book,
+            pool_store,
+            builder,
+            readiness,
+        }
+    }
+
+    fn process(&self, update: &PoolUpdate, emit_ingest_metrics: bool) -> ProcessResult {
+        if let Some(adapter) = self.adapter_book.ingest(update) {
+            if emit_ingest_metrics {
+                telemetry::record_hydration_adapter_ingest(adapter);
+            }
+        }
+        let mut snapshot = update.clone().into_snapshot();
+        self.adapter_book.enrich_snapshot(&mut snapshot);
+        if let Some(quotes) = self.adapter_book.snapshot_quotes(&mut snapshot) {
+            snapshot.quotes = Some(quotes);
+        }
+        let pending = snapshot.hydration.pending_components();
+        if !pending.is_empty() {
+            self.adapter_book.warm_components(&snapshot, &pending);
+        }
+        let readiness = evaluate_snapshot_readiness(&self.builder, &snapshot);
+        if let Err(reason) = &readiness {
+            self.handle_readiness_failure(&snapshot, reason);
+        }
+        let ready = readiness.is_ok();
+        self.pool_store.update(snapshot.clone(), ready);
+        self.readiness.record_hydration_status(
+            &snapshot.pool_id,
+            snapshot.slot,
+            &snapshot.hydration,
+        );
+        ProcessResult {
+            needs_retry: !pending.is_empty(),
+        }
+    }
+}
+
+impl ProcessContext {
+    fn handle_readiness_failure(&self, snapshot: &PoolSnapshot, failure: &PoolReadinessFailure) {
+        let target = program_log_target(&snapshot.program_id);
+        match failure {
+            PoolReadinessFailure::InvalidPoolId => {
+                debug!(
+                    target = target,
+                    pool = %snapshot.pool_id,
+                    slot = snapshot.slot,
+                    "pool readiness failed: invalid pool id"
+                );
+            }
+            PoolReadinessFailure::MissingTemplate(direction) => {
+                debug!(
+                    target = target,
+                    pool = %snapshot.pool_id,
+                    slot = snapshot.slot,
+                    direction = format_swap_direction(*direction),
+                    "pool readiness failed: template missing"
+                );
+                if let Ok(pool_pubkey) = Pubkey::from_str(&snapshot.pool_id) {
+                    let epoch = self.builder.template_cache().epoch();
+                    self.adapter_book.refresh_pool_templates(
+                        &snapshot.program_id,
+                        pool_pubkey,
+                        epoch,
+                    );
+                }
+            }
+            PoolReadinessFailure::MissingQuotes => {
+                debug!(
+                    target = target,
+                    pool = %snapshot.pool_id,
+                    slot = snapshot.slot,
+                    "pool readiness failed: missing quotes"
+                );
+            }
+            PoolReadinessFailure::MissingWhirlpoolTickArrays => {
+                debug!(
+                    target = target,
+                    pool = %snapshot.pool_id,
+                    slot = snapshot.slot,
+                    "pool readiness failed: whirlpool tick arrays unavailable"
+                );
+            }
+            PoolReadinessFailure::HydrationPending(_) => {
+                let summary = describe_pending_components(snapshot);
+                debug!(
+                    target = target,
+                    pool = %snapshot.pool_id,
+                    slot = snapshot.slot,
+                    lag_ms = summary.lag_ms,
+                    lag_slots = summary.lag_slots,
+                    components = %summary.component_names(),
+                    details = %summary.detail_string(),
+                    "pool readiness failed: hydration pending"
+                );
+            }
+        }
+    }
+}
+
+struct ProcessResult {
+    needs_retry: bool,
+}
+
+#[derive(Default)]
+struct UpdateCache {
+    entries: DashMap<String, PoolUpdate>,
+}
+
+impl UpdateCache {
+    fn store(&self, update: &PoolUpdate) {
+        self.entries.insert(
+            Self::key(&update.program_id, &update.pool_id),
+            update.clone(),
+        );
+    }
+
+    fn get(&self, program_id: &str, pool_id: &str) -> Option<PoolUpdate> {
+        self.entries
+            .get(&Self::key(program_id, pool_id))
+            .map(|entry| entry.value().clone())
+    }
+
+    fn key(program_id: &str, pool_id: &str) -> String {
+        format!("{program_id}:{pool_id}")
+    }
+}
+
+#[derive(Clone)]
+struct HydrationRetry {
+    pending: Arc<DashSet<String>>,
+    stop: Arc<AtomicBool>,
+    processor: Arc<ProcessContext>,
+    update_cache: Arc<UpdateCache>,
+    base_delay: Duration,
+    max_attempts: u32,
+}
+
+impl HydrationRetry {
+    fn new(
+        stop: Arc<AtomicBool>,
+        processor: Arc<ProcessContext>,
+        update_cache: Arc<UpdateCache>,
+    ) -> Self {
+        Self {
+            pending: Arc::new(DashSet::new()),
+            stop,
+            processor,
+            update_cache,
+            base_delay: Duration::from_millis(100),
+            max_attempts: 6,
+        }
+    }
+
+    fn schedule(&self, program_id: String, pool_id: String) {
+        let key = UpdateCache::key(&program_id, &pool_id);
+        if !self.pending.insert(key.clone()) {
+            return;
+        }
+        let runner = self.clone();
+        tokio::spawn(async move {
+            runner.run_worker(program_id, pool_id, key).await;
+        });
+    }
+
+    async fn run_worker(&self, program_id: String, pool_id: String, key: String) {
+        let mut attempt = 1;
+        while attempt <= self.max_attempts && !self.stop.load(Ordering::Relaxed) {
+            sleep(self.delay_for_attempt(attempt)).await;
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(update) = self.update_cache.get(&program_id, &pool_id) else {
+                break;
+            };
+            let outcome = self.processor.process(&update, false);
+            if !outcome.needs_retry {
+                break;
+            }
+            attempt = attempt.saturating_add(1);
+        }
+        self.pending.remove(&key);
+    }
+
+    fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        if attempt <= 1 {
+            return self.base_delay;
+        }
+        let shift = attempt.saturating_sub(1).min(4);
+        let millis = self.base_delay.as_millis() as u64 * (1u64 << shift);
+        Duration::from_millis(millis.min(2_000))
+    }
+}
+
 fn run_watcher_metrics_loop(
     stop: Arc<AtomicBool>,
     pool_store: Arc<PoolStore>,
@@ -504,36 +799,84 @@ fn run_pool_maintenance_loop(
     slot_lag: Option<u64>,
     sweep: Duration,
     builder: BuilderHandle,
-    require_alt_ready: bool,
+    readiness: ReadinessRegistry,
 ) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        pool_store.flag_stale_candidates(ttl, slot_lag);
+        let flagged = pool_store.flag_stale_candidates(ttl, slot_lag);
+        if flagged > 0 {
+            debug!(
+                target = "hydration",
+                flagged, "maintenance sweep marked pools stale"
+            );
+        }
         let pending = pool_store.drain_refresh_queue();
         if pending.is_empty() {
             thread::sleep(sweep);
             continue;
         }
+        debug!(
+            target = "hydration",
+            queued = pending.len(),
+            "maintenance dispatching rpc refreshes"
+        );
         for (state, min_slot) in pending {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             let protocol = state.program_id.clone();
+            debug!(
+                target = "hydration",
+                program = %protocol,
+                pool = %state.pool_id,
+                snapshot_slot = state.slot,
+                min_slot,
+                "issuing rpc refresh"
+            );
             if let Some(mut refreshed) = refresher.refresh(&state.snapshot) {
                 if refreshed.slot < min_slot {
                     pool_store.queue_refresh(&state.pool_id, min_slot);
                     telemetry::record_hydration_rpc_refresh_failure(&protocol);
+                    debug!(
+                        target = "hydration",
+                        program = %protocol,
+                        pool = %state.pool_id,
+                        refreshed_slot = refreshed.slot,
+                        min_slot,
+                        "rpc refresh slot below requirement; requeued"
+                    );
                     continue;
                 }
                 if let Some(quotes) = adapter_book.snapshot_quotes(&mut refreshed) {
                     refreshed.quotes = Some(quotes);
                 }
-                let ready = snapshot_ready_for_fastlane(&builder, &refreshed, require_alt_ready);
-                pool_store.update(refreshed, ready);
+                let ready = snapshot_ready_for_fastlane(&builder, &refreshed);
+                let refreshed_slot = refreshed.slot;
+                pool_store.update(refreshed.clone(), ready);
+                readiness.record_hydration_status(
+                    &refreshed.pool_id,
+                    refreshed.slot,
+                    &refreshed.hydration,
+                );
                 telemetry::record_hydration_rpc_refresh(&protocol);
+                debug!(
+                    target = "hydration",
+                    program = %protocol,
+                    pool = %state.pool_id,
+                    refreshed_slot,
+                    ready,
+                    "rpc refresh applied"
+                );
             } else {
                 telemetry::record_hydration_rpc_refresh_failure(&protocol);
                 pool_store.queue_refresh(&state.pool_id, min_slot);
                 telemetry::record_hydration_stale_pools(1);
+                debug!(
+                    target = "hydration",
+                    program = %protocol,
+                    pool = %state.pool_id,
+                    min_slot,
+                    "rpc refresh failed; requeued"
+                );
             }
         }
         thread::sleep(sweep);
@@ -541,18 +884,13 @@ fn run_pool_maintenance_loop(
     Ok(())
 }
 
-fn snapshot_ready_for_fastlane(
-    builder: &BuilderHandle,
-    snapshot: &PoolSnapshot,
-    require_alt_ready: bool,
-) -> bool {
-    evaluate_snapshot_readiness(builder, snapshot, require_alt_ready).is_ok()
+fn snapshot_ready_for_fastlane(builder: &BuilderHandle, snapshot: &PoolSnapshot) -> bool {
+    evaluate_snapshot_readiness(builder, snapshot).is_ok()
 }
 
 fn evaluate_snapshot_readiness(
     builder: &BuilderHandle,
     snapshot: &PoolSnapshot,
-    require_alt_ready: bool,
 ) -> Result<(), PoolReadinessFailure> {
     let pool_pubkey =
         Pubkey::from_str(&snapshot.pool_id).map_err(|_| PoolReadinessFailure::InvalidPoolId)?;
@@ -564,9 +902,6 @@ fn evaluate_snapshot_readiness(
         let readiness = builder.template_readiness(&pool_pubkey, direction);
         if !readiness.template_ready {
             return Err(PoolReadinessFailure::MissingTemplate(direction));
-        }
-        if require_alt_ready && !readiness.alt_ready {
-            return Err(PoolReadinessFailure::MissingAlt(direction));
         }
     }
 
@@ -606,7 +941,6 @@ fn evaluate_snapshot_readiness(
 enum PoolReadinessFailure {
     InvalidPoolId,
     MissingTemplate(SwapTemplateDirection),
-    MissingAlt(SwapTemplateDirection),
     MissingQuotes,
     MissingWhirlpoolTickArrays,
     HydrationPending(Vec<HydrationComponent>),
@@ -621,11 +955,6 @@ impl fmt::Display for PoolReadinessFailure {
                 "missing-template direction={}",
                 format_swap_direction(*direction)
             ),
-            PoolReadinessFailure::MissingAlt(direction) => write!(
-                f,
-                "missing-alt-table direction={}",
-                format_swap_direction(*direction)
-            ),
             PoolReadinessFailure::MissingQuotes => write!(f, "missing-quotes"),
             PoolReadinessFailure::MissingWhirlpoolTickArrays => {
                 write!(f, "missing-whirlpool-tick-arrays")
@@ -637,6 +966,21 @@ impl fmt::Display for PoolReadinessFailure {
                     format_hydration_components(components)
                 )
             }
+        }
+    }
+}
+
+impl PoolReadinessFailure {
+    fn label(&self) -> &'static str {
+        match self {
+            PoolReadinessFailure::InvalidPoolId => "invalid_pool_id",
+            PoolReadinessFailure::MissingTemplate(direction) => match direction {
+                SwapTemplateDirection::BaseIn => "missing_template_base_in",
+                SwapTemplateDirection::BaseOut => "missing_template_base_out",
+            },
+            PoolReadinessFailure::MissingQuotes => "missing_quotes",
+            PoolReadinessFailure::MissingWhirlpoolTickArrays => "missing_whirlpool_tick_arrays",
+            PoolReadinessFailure::HydrationPending(_) => "hydration_pending",
         }
     }
 }
@@ -657,4 +1001,29 @@ fn format_hydration_components(components: &[HydrationComponent]) -> String {
         .map(|component| component.as_str())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[derive(Debug, Clone)]
+struct PoolReadinessSample {
+    program_id: String,
+    pool_id: String,
+    slot: u64,
+    reason: PoolReadinessFailure,
+    pending: Option<PendingComponentSummary>,
+}
+
+impl PoolReadinessSample {
+    fn short_summary(&self) -> String {
+        match &self.pending {
+            Some(summary) if !summary.is_empty() => format!(
+                "{}:{} {} lag_ms={} components={}",
+                self.program_id,
+                self.pool_id,
+                self.reason,
+                summary.lag_ms,
+                summary.component_names()
+            ),
+            _ => format!("{}:{} {}", self.program_id, self.pool_id, self.reason),
+        }
+    }
 }

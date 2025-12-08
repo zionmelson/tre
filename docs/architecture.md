@@ -71,8 +71,8 @@
 ## Data Contracts
 
 - **`PoolState` / `PoolStateUpdate`** – Represent hydrated protocol state: slot, `Instant` timestamps, base/quote liquidity summaries, protocol identifiers, freshness flags, and a monotonically increasing generation counter.
-- **`HydrationSnapshot`** – Cheap `Copy` struct delivered via the lossy `SnapshotChannel` that includes template counts, ALT manager stats, and flash-route readiness plus the `issued_at` timestamp. The channel always exposes the newest snapshot, dropping older ones and incrementing an overwrite metric so operators can see when freshness pressure is high. Callers compare `Instant::now()` against `snapshot.stale_at(freshness_budget)` to guard planners.
-- **`TemplateReadiness`** – Returned by `BuilderHandle::template_readiness(pool, direction)` and combines template TTL + ALT TTL so route planning can skip pools missing a hydrated template/ALT table.
+- **`HydrationSnapshot`** – Cheap `Copy` struct delivered via the lossy `SnapshotChannel` that includes template counts, flash-route readiness, and the `issued_at` timestamp. The channel always exposes the newest snapshot, dropping older ones and incrementing an overwrite metric so operators can see when freshness pressure is high. Callers compare `Instant::now()` against `snapshot.stale_at(freshness_budget)` to guard planners.
+- **`TemplateReadiness`** – Returned by `BuilderHandle::template_readiness(pool, direction)` and reflects whether a hydrated template is still inside its freshness TTL so route planning can skip pools missing current templates.
 - **`BundleCandidate`** – Planner output containing `BundleBuildContext`, route metadata, estimated edge/profit/tip, flash-loan reservations, and detection timestamps. Candidates always live inside a `Lease` from `SlabPool` so memory stays deterministic.
 - **`PendingSubmission`** – Tracker input with `bundle_id`, `seq`, endpoint, detection time, and optional tips. Tracker augments it with result streams and emits `BundleSubmissionEvent`s (submitted, accepted, rejected, expired, etc.).
 
@@ -81,11 +81,11 @@
 - `pipeline.hydration_only_mode` – Spins up hydration/graph threads but drains both snapshots and planner outputs immediately. Useful for soak-testing CoreCast or RPC refreshers.
 - `pipeline.dry_run_mode` – Keeps planner/graph online but routes bundle candidates to a drain thread while recording planner metrics. Submission, tracker, and bundle client threads are skipped.
 - Backpressure is surfaced via metrics and logs: `hydration_queue_depth_pct`, `watcher_pool_update_backlog_pct`, `fastlane_ring_depth_pct`, and `fastlane_ring_drop_events_total` all spike before candidates are dropped.
-- Template/ALT freshness is enforced via TTLs (`TemplateCache` ~40 ms, ALT tables ~40 ms). Pools that fall behind are either refreshed via RPC or flagged stale, preventing planners from emitting bundles they cannot safely build.
+- Template freshness is enforced via a ~40 ms TTL on hydrated templates. Pools that fall behind are either refreshed via RPC or flagged stale, preventing planners from emitting bundles they cannot safely build even if lookup tables exist.
 
 ## Telemetry & Alerting
 
-- **Hydration** – `hydration_adapter_ingest_total{protocol}`, `hydration_rpc_refresh_total`, `hydration_stale_pool_events_total`, `hydration_template_cache_entries`, `hydration_alt_ready_tables`, and queue gauges measure ingest health plus template readiness.
+- **Hydration** – `hydration_adapter_ingest_total{protocol}`, `hydration_rpc_refresh_total`, `hydration_stale_pool_events_total`, `hydration_template_cache_entries`, `hydration_flash_routes_prepared`, and queue gauges measure ingest health plus template readiness.
 - **Planner/graph** – `graph_pool_count`, `graph_cycle_count`, `watcher_update_age_ms{adapter}`, `watcher_cache_entries`, and `watcher_cycle_scan_pending` indicate whether CoreCast deltas are being consumed quickly enough.
 - **Fast lane buffers** – `fastlane_ring_depth_pct`, `fastlane_ring_drop_events_total`, `fastlane_slab_free_pct`, and `fastlane_slab_exhaustion_events_total` highlight saturation inside the bundle ring/slab.
 - **Submission + tracking** – `bundle_execution_latency_ms`, `bundle_execution_attempts_total{status}`, `bundle_result_events_total{status}`, `bundle_execution_retry_events_total{reason}`, and `bundle_result_latency_ms` capture send performance and downstream outcomes.

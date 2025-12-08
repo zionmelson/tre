@@ -215,9 +215,23 @@ fn build_amm_v3_params(
 
     let template_hash = compute_template_hash(&program_id, &accounts, &data);
 
-    let (pool_id, fee_tier_bps, alt_handle) = pool_meta
-        .map(|meta| (meta.pool_id, meta.fee_tier_bps, meta.alt_handle))
-        .unwrap_or_else(|| (synth_pool_id(&program_id, template.direction), 0, None));
+    let (pool_id, fee_tier_bps, alt_handle, alt_accounts) = pool_meta
+        .map(|meta| {
+            (
+                meta.pool_id,
+                meta.fee_tier_bps,
+                meta.alt_handle,
+                meta.alt_accounts.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                synth_pool_id(&program_id, template.direction),
+                0,
+                None,
+                Vec::new(),
+            )
+        });
 
     let pool_accounts = pool_meta
         .map(|meta| derive_amm_v3_pool_accounts(meta, &program_id))
@@ -236,6 +250,7 @@ fn build_amm_v3_params(
         tlv_bytes: 0,
         template_hash,
         alt_handle,
+        alt_accounts,
         account_specs: template.accounts,
         pool_accounts,
     })
@@ -298,9 +313,23 @@ fn build_cp_amm_params(
     data.extend_from_slice(&template.discriminator);
     let field_layout = encode_cp_amm_args(template, &mut data)?;
 
-    let (pool_id, fee_tier_bps, alt_handle) = pool_meta
-        .map(|meta| (meta.pool_id, meta.fee_tier_bps, meta.alt_handle))
-        .unwrap_or_else(|| (synth_pool_id(&program_id, template.direction), 0, None));
+    let (pool_id, fee_tier_bps, alt_handle, alt_accounts) = pool_meta
+        .map(|meta| {
+            (
+                meta.pool_id,
+                meta.fee_tier_bps,
+                meta.alt_handle,
+                meta.alt_accounts.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                synth_pool_id(&program_id, template.direction),
+                0,
+                None,
+                Vec::new(),
+            )
+        });
 
     let pool_accounts = if let Some(meta) = pool_meta {
         apply_cp_amm_pool_accounts(template.accounts, &mut accounts, meta, template.direction)?;
@@ -324,6 +353,7 @@ fn build_cp_amm_params(
         tlv_bytes: 0,
         template_hash,
         alt_handle,
+        alt_accounts,
         account_specs: template.accounts,
         pool_accounts,
     })
@@ -494,9 +524,23 @@ fn build_lb_clmm_params(
     let field_layout = encode_lb_clmm_args(template, &mut data)?;
     let template_hash = compute_template_hash(&program_id, &accounts, &data);
 
-    let (pool_id, fee_tier_bps, alt_handle) = pool_meta
-        .map(|meta| (meta.pool_id, meta.fee_tier_bps, meta.alt_handle))
-        .unwrap_or_else(|| (synth_pool_id(&program_id, template.direction), 0, None));
+    let (pool_id, fee_tier_bps, alt_handle, alt_accounts) = pool_meta
+        .map(|meta| {
+            (
+                meta.pool_id,
+                meta.fee_tier_bps,
+                meta.alt_handle,
+                meta.alt_accounts.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                synth_pool_id(&program_id, template.direction),
+                0,
+                None,
+                Vec::new(),
+            )
+        });
 
     Ok(LbClmmTemplateParams {
         pool_id,
@@ -511,6 +555,7 @@ fn build_lb_clmm_params(
         tlv_bytes: 0,
         template_hash,
         alt_handle,
+        alt_accounts,
         account_specs: template.accounts,
         pool_accounts,
     })
@@ -597,9 +642,23 @@ fn build_whirlpool_params(
     let field_layout = encode_whirlpool_args(template, &mut data)?;
     let template_hash = compute_template_hash(&program_id, &accounts, &data);
 
-    let (pool_id, fee_tier_bps, alt_handle) = pool_meta
-        .map(|meta| (meta.pool_id, meta.fee_tier_bps, meta.alt_handle))
-        .unwrap_or_else(|| (synth_pool_id(&program_id, template.direction), 0, None));
+    let (pool_id, fee_tier_bps, alt_handle, alt_accounts) = pool_meta
+        .map(|meta| {
+            (
+                meta.pool_id,
+                meta.fee_tier_bps,
+                meta.alt_handle,
+                meta.alt_accounts.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                synth_pool_id(&program_id, template.direction),
+                0,
+                None,
+                Vec::new(),
+            )
+        });
 
     let pool_accounts = if let Some(meta) = pool_meta {
         apply_whirlpool_pool_accounts(template.accounts, &mut accounts, meta)?;
@@ -621,6 +680,7 @@ fn build_whirlpool_params(
         tlv_bytes: 0,
         template_hash,
         alt_handle,
+        alt_accounts,
         account_specs: template.accounts,
         pool_accounts,
     })

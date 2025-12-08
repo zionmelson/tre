@@ -34,7 +34,7 @@ Together these changes replicate the upstream SDK behavior end-to-end: we pull t
 
 1. **State ingestion** – Parse CoreCast `PoolLiquidityChangeStreamMessage` and `DexBlockMessage` extras for Whirlpool pools (sqrt price, liquidity, fee growth globals, reward info snapshots, tick-array cursors) and hydrate a `WhirlpoolState` cache keyed by pool address.
 2. **Immutable metadata hydration** – Fetch once per pool via RPC: token mints, vaults, token_program IDs (Token-2022 requires distinct programs), tick spacing, reward infos, oracle PDA, and `whirlpool_bump`. Store under `StaticPoolMeta` to avoid re-decoding.
-3. **Tick-array coverage management** – Track cached `TickArray` accounts with `{start_tick, last_slot, bytes}` so the quote path can confirm coverage for three consecutive arrays in the trade direction. Missing arrays trigger either async RPC hydration or a `MissingTickArrays` quote status.
+3. **Tick-array coverage management** – Track cached `TickArray` accounts with `{start_tick, last_slot, bytes}` so the quote path can confirm coverage for three consecutive arrays in the trade direction. Missing arrays trigger either async RPC hydration or a `HydrationPending` quote status.
 4. **Adaptive-fee tracking** – Mirror `AdaptiveFeeInfo` from `swap_manager.rs` (constants + variables) so quotes can project `fee_rate` adjustments. Defer to on-chain logic when variables are stale or missing.
 5. **Pricing & quoting** – Provide `quote_exact_in` / `quote_exact_out` methods that replay `swap_math::compute_swap_step` tick-by-tick, respecting `sqrt_price_limit`, fee tiers, protocol fee, rewards, and liquidity exhaustion semantics defined in `swap_manager.rs`.
 6. **Instruction templating** – Emit `SwapTemplate` (and later `TwoHopSwapTemplate`) objects that serialize args exactly as Anchor would (`amount`, `other_amount_threshold`, `sqrt_price_limit`, `amount_specified_is_input`, `a_to_b`), and attach account metas/remaining accounts in the order expected by `swap_v2`.
@@ -46,7 +46,7 @@ Together these changes replicate the upstream SDK behavior end-to-end: we pull t
 - **Whirlpool IDL** – `idls/pools/whirlpool.json` is treated as the single source for account layouts and instruction schemas; codegen (via `anchor-client` or `idl-codegen`) should be refreshed whenever the upstream npm tag changes.
 - **Orca program sources** – `swap_math.rs`, `swap_manager.rs`, and the v2 instruction modules govern math correctness and account ordering; the adapter must cite these for parity tests.
 - **Internal swap guide** – `docs/swaps/whirlpool-swaps.md` documents runner expectations (ATA ownership, CPI stack, compute budgeting) and remains the consumer-facing contract for template outputs.
-- **Config overrides** – `config.json` supplies mint decimal overrides, tick-array prefetch counts, rate-limit knobs (e.g., `pool_failure_backoff_ms`, `tick_array_backoff_ms`, `max_pool_failures`, `max_tick_array_failures` under `protocols.whirlpool`), or pool-specific toggles (such as ignoring Token-2022 pools on early rollouts).
+- **Config overrides** – `config.json` supplies mint decimal overrides, tick-array prefetch counts, rate-limit knobs (e.g., `pool_failure_backoff_ms`, `tick_array_backoff_ms`, `max_pool_failures`, `max_tick_array_failures`, `oracle_hydration_enabled`, `hydration_slot_lag_tolerance`, `hydration_lag_ms_tolerance` under `protocols.whirlpool`), or pool-specific toggles (such as ignoring Token-2022 pools on early rollouts). Setting `oracle_hydration_enabled` to `false` skips fetching Whirlpool oracle PDAs via RPC, silencing the corresponding log spam when those accounts are known to be absent and deferring to the TWAP fallback, while the hydration lag knobs relax or tighten the slot/ms windows before templates are considered ready.
 
 ## API Shape
 
@@ -149,7 +149,7 @@ The adapter must match `swap_manager::swap` semantics exactly:
 - Quote status taxonomy:
   - `Ok`
   - `StaleState` – `slot_now - last_update_slot > config.state_stale_slots`.
-  - `MissingTickArrays` – Cache lacks any of the three arrays in the trade path or arrays are older than `tick_array_stale_slots`.
+  - `HydrationPending` – Cache lacks any of the three arrays in the trade path or arrays are older than `tick_array_stale_slots`.
   - `InsufficientLiquidity` – Simulation hit zero liquidity or min/max sqrt price before satisfying the request.
   - `RateLimited` – Prior submissions returned Orca errors (`6011`, `6035`, `6034`, `6064`); adapter backs off for `config.rate_limit_cooldown_slots`.
   - `MissingAccounts` – Token owner ATA, transfer-hook extra accounts, or oracle is absent.
@@ -176,7 +176,7 @@ The adapter must match `swap_manager::swap` semantics exactly:
 
 ## Risks & Open Questions
 
-- **Tick-array availability** – CoreCast streams may omit arrays far from current price. Decide between on-demand RPC fetch (with latency hit), background prefetch, or rejecting quotes with `MissingTickArrays`.
+- **Tick-array availability** – CoreCast streams may omit arrays far from current price. Decide between on-demand RPC fetch (with latency hit), background prefetch, or rejecting quotes with `HydrationPending`.
 - **Adaptive-fee drift** – If CoreCast omits adaptive variables, we must either re-fetch whirlpool accounts or treat pools as fixed-fee. Need policy per pool tier.
 - **Token-2022 hooks** – Pools using transfer hooks require extra accounts; we need config-driven manifests so templates include them without human intervention.
 - **Slot lag** – Significant lag between CoreCast slot and latest blockhash can cause stale quotes. Consider sampling on-chain `recent_blockhash` slot before publishing quotes.

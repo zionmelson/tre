@@ -3,6 +3,7 @@ use std::time::Instant;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::builder::{BundleBuildContext, FlashLoanRoutePlan};
+use crate::hydration::readiness::PoolReadinessState;
 use crate::hydration::types::{compute_edge_bps, PoolQuoteDirection, PoolSnapshot, TradeUpdate};
 use crate::template::TemplateContext;
 
@@ -15,6 +16,7 @@ pub struct Opportunity {
     pub estimated_edge_bps: f64,
     pub created_at: Instant,
     pub route_plan: Option<RoutePlan>,
+    pub readiness: Option<PoolReadinessState>,
 }
 
 impl Opportunity {
@@ -24,6 +26,7 @@ impl Opportunity {
         snapshot: Option<PoolSnapshot>,
         snapshot_generation: Option<u64>,
         override_edge_bps: Option<f64>,
+        readiness: Option<PoolReadinessState>,
     ) -> Self {
         let estimated_edge_bps = override_edge_bps
             .or_else(|| {
@@ -42,6 +45,7 @@ impl Opportunity {
             estimated_edge_bps,
             created_at: Instant::now(),
             route_plan: None,
+            readiness,
         }
     }
 }
@@ -64,6 +68,9 @@ pub struct BundleCandidate {
     pub stage2_attempts: u8,
     pub stage3_attempts: u8,
     pub stage3_ready_at: Option<Instant>,
+    pub pool_snapshot: Option<PoolSnapshot>,
+    pub snapshot_generation: Option<u64>,
+    pub readiness: Option<PoolReadinessState>,
 }
 
 impl BundleCandidate {
@@ -85,6 +92,9 @@ impl BundleCandidate {
             stage2_attempts: 0,
             stage3_attempts: 0,
             stage3_ready_at: None,
+            pool_snapshot: opportunity.pool_snapshot.clone(),
+            snapshot_generation: opportunity.snapshot_generation,
+            readiness: opportunity.readiness.clone(),
         }
     }
 }
@@ -119,7 +129,6 @@ pub struct RouteLegPlan {
     pub price_impact_limit_bps: Option<u16>,
     pub context: TemplateContext,
     pub template_ready: bool,
-    pub alt_ready: bool,
 }
 
 #[derive(Debug, Clone)]

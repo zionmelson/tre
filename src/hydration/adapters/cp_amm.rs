@@ -8,13 +8,12 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use spl_token_2022::extension::StateWithExtensionsOwned;
-use spl_token_2022::state::Mint as SplToken2022Mint;
 use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
 use super::hydration::{AsyncHydrator, HydratedValue};
 use crate::builder::{BuilderHandle, CpAmmPoolAccounts, CpAmmPoolMeta};
+use crate::hydration::mint_metadata::{MintMetadata, MintMetadataHydrator};
 use crate::hydration::token_fees::{
     apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
 };
@@ -23,8 +22,8 @@ use crate::hydration::types::{
     HydrationComponent, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
     CP_AMM_INPUT_UTILIZATION_BPS,
 };
-use crate::template::TemplateContext;
 use crate::telemetry;
+use crate::template::TemplateContext;
 
 use super::{
     build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, SwapDirection,
@@ -52,6 +51,9 @@ const Q64_FACTOR: f64 = 18_446_744_073_709_551_616.0;
 const DEFAULT_CP_AMM_HYDRATION_RETRY_MS: u64 = 60_000;
 const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
 const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
+const META_LAG_LOG_INTERVAL_MS: u64 = 15_000;
+const DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE: u64 = 3_000;
+const DEFAULT_HYDRATION_LAG_MS_TOLERANCE: u64 = 30_000;
 
 #[derive(Clone)]
 struct SnapshotStatusLogEntry {
@@ -79,6 +81,8 @@ pub struct CpAmmAdapterConfig {
     pub rpc_timeout_ms: u64,
     pub hydration_retry_ms: u64,
     pub hydration_meta_ttl_ms: u64,
+    pub hydration_slot_lag_tolerance: u64,
+    pub hydration_lag_ms_tolerance: u64,
     pub max_swap_utilization_bps: u64,
     pub required_partner: Option<Pubkey>,
 }
@@ -93,6 +97,8 @@ impl Default for CpAmmAdapterConfig {
             rpc_timeout_ms: 15_000,
             hydration_retry_ms: DEFAULT_CP_AMM_HYDRATION_RETRY_MS,
             hydration_meta_ttl_ms: 600_000,
+            hydration_slot_lag_tolerance: DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE,
+            hydration_lag_ms_tolerance: DEFAULT_HYDRATION_LAG_MS_TOLERANCE,
             max_swap_utilization_bps: CP_AMM_INPUT_UTILIZATION_BPS,
             required_partner: None,
         }
@@ -110,6 +116,7 @@ pub struct CpAmmAdapter {
     registered_templates: DashMap<Pubkey, RegisteredTemplateSignature>,
     snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
     missing_state_log: DashMap<Pubkey, Instant>,
+    meta_lag_log: DashMap<Pubkey, Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,6 +124,7 @@ struct RegisteredTemplateSignature {
     alt_accounts: Vec<Pubkey>,
     pool_accounts: CpAmmPoolAccounts,
     fee_tier_bps: u16,
+    epoch: u64,
 }
 
 impl CpAmmAdapter {
@@ -129,7 +137,11 @@ impl CpAmmAdapter {
             config.rpc_timeout_ms,
             config.hydration_retry_ms,
         );
-        let mint_metadata_cache = MintMetadataHydrator::new(&config);
+        let mint_metadata_cache = MintMetadataHydrator::new(
+            &config.rpc_endpoints,
+            config.rpc_timeout_ms,
+            config.hydration_retry_ms,
+        );
         if let Some(hydrator) = hydrator.as_ref() {
             info!(
                 target = "adapter::cp_amm",
@@ -153,6 +165,7 @@ impl CpAmmAdapter {
             registered_templates: DashMap::new(),
             snapshot_failure_log: DashMap::new(),
             missing_state_log: DashMap::new(),
+            meta_lag_log: DashMap::new(),
         }
     }
 
@@ -189,7 +202,7 @@ impl CpAmmAdapter {
         };
 
         let previous_state = self.state.get(&pool_pubkey);
-        let extras = self.enrich_extras(pool_pubkey, extras);
+        let extras = self.enrich_extras(pool_pubkey, extras, previous_state.as_deref());
 
         let Some(base_mint) = extras
             .token_a_mint
@@ -211,35 +224,33 @@ impl CpAmmAdapter {
             return;
         };
 
-        let mut hydrated_meta_slot = extras.hydrated_slot;
-        if hydrated_meta_slot
-            .map(|slot| slot < update.slot)
-            .unwrap_or(true)
-        {
-            if let Some(existing) = previous_state.as_ref() {
-                if existing
-                    .hydrated_meta_slot
-                    .map(|slot| slot >= update.slot)
-                    .unwrap_or(false)
-                {
-                    hydrated_meta_slot = existing.hydrated_meta_slot;
-                }
-            }
+        let slot_lag_tolerance = self.config.hydration_slot_lag_tolerance;
+        let lag_ms_tolerance = self.config.hydration_lag_ms_tolerance;
+
+        let hydrated_meta_slot = extras
+            .hydrated_slot
+            .or_else(|| previous_state.as_ref().and_then(|existing| existing.hydrated_meta_slot));
+        let mut last_hydrated_at = extras
+            .hydrated_at
+            .or_else(|| previous_state.as_ref().and_then(|existing| existing.last_hydrated_at));
+        if last_hydrated_at.is_none() && hydrated_meta_slot.is_some() {
+            last_hydrated_at = Some(Instant::now());
         }
 
-        if hydrated_meta_slot
-            .map(|slot| slot < update.slot)
-            .unwrap_or(true)
-        {
+        let slot_within_window = hydrated_meta_slot
+            .map(|slot| CpAmmState::slot_within_tolerance(slot, update.slot, slot_lag_tolerance))
+            .unwrap_or(false);
+        let hydration_age_ms = last_hydrated_at.map(|instant| instant.elapsed().as_millis() as u64);
+        let time_within_window = lag_ms_tolerance > 0
+            && hydration_age_ms
+                .map(|age| age <= lag_ms_tolerance)
+                .unwrap_or(false);
+
+        if hydrated_meta_slot.is_none() || (!slot_within_window && !time_within_window) {
             if let Some(hydrator) = self.hydrator.as_ref() {
                 hydrator.refresh(pool_pubkey);
             }
-            hydrated_meta_slot = None;
         }
-
-        let last_hydrated_at = extras
-            .hydrated_at
-            .or_else(|| previous_state.as_ref().and_then(|existing| existing.last_hydrated_at));
 
         let mut state = CpAmmState {
             pool: pool_pubkey,
@@ -329,8 +340,18 @@ impl CpAmmAdapter {
         self.evict_stale(update.slot);
     }
 
-    fn enrich_extras(&self, pool: Pubkey, mut extras: CpAmmPoolExtras) -> CpAmmPoolExtras {
-        let force_refresh = hydration_meta_expired(&extras, self.config.hydration_meta_ttl_ms);
+    fn enrich_extras(
+        &self,
+        pool: Pubkey,
+        mut extras: CpAmmPoolExtras,
+        previous_state: Option<&CpAmmState>,
+    ) -> CpAmmPoolExtras {
+        let hydration_missing = extras.hydrated_slot.is_none()
+            && previous_state
+                .map(|existing| existing.hydrated_meta_slot.is_none())
+                .unwrap_or(true);
+        let force_refresh = hydration_missing
+            || hydration_meta_expired(&extras, self.config.hydration_meta_ttl_ms);
         if !needs_hydration(&extras) && !force_refresh {
             return extras;
         }
@@ -347,9 +368,31 @@ impl CpAmmAdapter {
     }
 
     fn register_templates_with_builder(&self, state: &CpAmmState) {
+        self.ensure_templates_for_epoch(state, None, "adapter state update", false);
+    }
+
+    fn ensure_templates_for_epoch(
+        &self,
+        state: &CpAmmState,
+        epoch_override: Option<u64>,
+        reason: &'static str,
+        force_refresh: bool,
+    ) {
         let Some(builder) = self.template_builder.as_ref() else {
             return;
         };
+
+        if !self.meta_ready_within_lag(state) {
+            trace!(
+                target = "adapter::cp_amm",
+                pool = %state.pool,
+                slot = state.corecast_slot,
+                reason = reason,
+                "deferring template registration until meta hydration completes"
+            );
+            self.record_meta_lag_event(state, reason);
+            return;
+        }
 
         let mut alt_accounts = Vec::with_capacity(10);
         alt_accounts.push(state.pool);
@@ -390,30 +433,35 @@ impl CpAmmAdapter {
             debug!(
                 target = "adapter::cp_amm",
                 pool = %state.pool,
+                reason = reason,
                 "cp_amm pool metadata incomplete; deferring template registration"
             );
             return;
         }
 
+        let epoch = epoch_override.unwrap_or_else(|| builder.template_cache().epoch());
         let signature = RegisteredTemplateSignature {
             alt_accounts: alt_accounts.clone(),
             pool_accounts: pool_accounts.clone(),
             fee_tier_bps,
+            epoch,
         };
 
-        if let Some(existing) = self.registered_templates.get(&state.pool) {
-            let alt_missing = builder.alt_manager().handle_for_pool(state.pool).is_none();
-            if *existing == signature && !alt_missing {
-                return;
-            }
-            if *existing == signature && alt_missing {
-                debug!(
-                    target = "adapter::cp_amm",
-                    pool = %state.pool,
-                    "ALT handle missing; re-registering pool templates"
-                );
+        if !force_refresh {
+            if let Some(existing) = self.registered_templates.get(&state.pool) {
+                if *existing == signature {
+                    return;
+                }
             }
         }
+
+        debug!(
+            target = "adapter::cp_amm",
+            pool = %state.pool,
+            epoch,
+            reason = reason,
+            "registering cp_amm instruction templates"
+        );
 
         builder.register_cp_amm_pool(CpAmmPoolMeta {
             pool_id: state.pool,
@@ -430,14 +478,24 @@ impl CpAmmAdapter {
         let adapter = self.name();
         let meta_slot = state.hydrated_meta_slot.unwrap_or(0);
         let delta = state.corecast_slot.saturating_sub(meta_slot);
+        let (lag_slots, lag_ms) = self.meta_lag(state);
         telemetry::record_hydration_component_slot_delta(
             adapter,
             HydrationComponent::Meta.as_str(),
             delta,
         );
 
-        let ready = state.meta_ready_for_slot(state.corecast_slot)
-            && !state.hydration_stale(self.config.hydration_meta_ttl_ms);
+        let meta_ready = self.meta_ready_within_lag(state);
+        if !meta_ready {
+            self.log_meta_lag_if_needed(state, "metrics_meta_pending", lag_slots, lag_ms);
+            telemetry::record_hydration_component_pending(
+                adapter,
+                HydrationComponent::Meta.as_str(),
+                lag_ms,
+                lag_slots,
+            );
+        }
+        let ready = meta_ready && !state.hydration_stale(self.config.hydration_meta_ttl_ms);
         let stage = if ready { 1 } else { 0 };
         telemetry::record_hydration_stage(adapter, &state.pool.to_string(), stage);
     }
@@ -575,26 +633,54 @@ impl CpAmmAdapter {
         }
     }
 
-    fn clamp_request_amount(&self, state: &CpAmmState, req: &QuoteRequest) -> u64 {
+    fn clamp_request_amount(
+        &self,
+        state: &CpAmmState,
+        req: &QuoteRequest,
+    ) -> Result<u64, QuoteStatus> {
+        if req.amount == 0 {
+            return Ok(0);
+        }
         let reserve = if req.input_mint == state.token_a_mint {
             state.vault_a_balance
         } else if req.input_mint == state.token_b_mint {
             state.vault_b_balance
         } else {
-            return req.amount;
+            return Ok(req.amount);
         };
-        clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps)
+        if reserve == 0 {
+            return Err(QuoteStatus::InsufficientLiquidity);
+        }
+        let capped = clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps);
+        if capped == 0 {
+            return Err(QuoteStatus::PriceImpactExceeded);
+        }
+        Ok(capped)
     }
 
-    fn clamp_request_output_amount(&self, state: &CpAmmState, req: &QuoteRequest) -> u64 {
+    fn clamp_request_output_amount(
+        &self,
+        state: &CpAmmState,
+        req: &QuoteRequest,
+    ) -> Result<u64, QuoteStatus> {
+        if req.amount == 0 {
+            return Ok(0);
+        }
         let reserve = if req.output_mint == state.token_a_mint {
             state.vault_a_balance
         } else if req.output_mint == state.token_b_mint {
             state.vault_b_balance
         } else {
-            return req.amount;
+            return Ok(req.amount);
         };
-        clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps)
+        if reserve == 0 {
+            return Err(QuoteStatus::InsufficientLiquidity);
+        }
+        let capped = clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps);
+        if capped == 0 {
+            return Err(QuoteStatus::PriceImpactExceeded);
+        }
+        Ok(capped)
     }
 
     fn partner_mismatch(&self, state: &CpAmmState) -> bool {
@@ -606,11 +692,6 @@ impl CpAmmAdapter {
         };
         if let Some(required) = self.config.required_partner {
             return partner != required;
-        }
-        if let Some(builder) = self.template_builder.as_ref() {
-            let auth = builder.auth_pubkey();
-            let payer = builder.payer_pubkey();
-            return partner != auth && partner != payer;
         }
         false
     }
@@ -692,7 +773,7 @@ impl CpAmmAdapter {
                 "quote_to_base"
             },
             status = ?status,
-            reason,
+            reason = reason,
             probe_amount,
             last_update_slot = state.last_update_slot,
             cache_age_ms,
@@ -715,6 +796,77 @@ impl CpAmmAdapter {
         let time_stale = self.config.stale_after_ms > 0
             && state.last_update_at.elapsed().as_millis() as u64 > self.config.stale_after_ms;
         slot_stale || time_stale
+    }
+
+    fn meta_ready_within_lag(&self, state: &CpAmmState) -> bool {
+        state.meta_ready_for_slot(
+            state.corecast_slot,
+            self.config.hydration_slot_lag_tolerance,
+            self.config.hydration_lag_ms_tolerance,
+        )
+    }
+
+    fn meta_lag(&self, state: &CpAmmState) -> (Option<u64>, Option<u64>) {
+        (
+            state.hydration_lag_slots(state.corecast_slot),
+            state.hydration_lag_ms(),
+        )
+    }
+
+    fn should_log_meta_lag(
+        &self,
+        pool: Pubkey,
+        lag_slots: Option<u64>,
+        lag_ms: Option<u64>,
+    ) -> bool {
+        let slot_over = lag_slots
+            .map(|slots| slots > self.config.hydration_slot_lag_tolerance)
+            .unwrap_or(false);
+        let time_over = lag_ms
+            .map(|ms| ms > self.config.hydration_lag_ms_tolerance)
+            .unwrap_or(false);
+        if !(slot_over || time_over) {
+            return false;
+        }
+        if let Some(entry) = self.meta_lag_log.get(&pool) {
+            if entry.value().elapsed().as_millis() as u64 <= META_LAG_LOG_INTERVAL_MS {
+                return false;
+            }
+        }
+        self.meta_lag_log.insert(pool, Instant::now());
+        true
+    }
+
+    fn log_meta_lag_if_needed(
+        &self,
+        state: &CpAmmState,
+        context: &'static str,
+        lag_slots: Option<u64>,
+        lag_ms: Option<u64>,
+    ) {
+        if self.should_log_meta_lag(state.pool, lag_slots, lag_ms) {
+            warn!(
+                target = "adapter::cp_amm",
+                pool = %state.pool,
+                context,
+                corecast_slot = state.corecast_slot,
+                hydrated_slot = ?state.hydrated_meta_slot,
+                lag_slots,
+                lag_ms,
+                "cp_amm hydration lag exceeds tolerance"
+            );
+        }
+    }
+
+    fn record_meta_lag_event(&self, state: &CpAmmState, context: &'static str) {
+        let (lag_slots, lag_ms) = self.meta_lag(state);
+        telemetry::record_hydration_component_pending(
+            self.name(),
+            HydrationComponent::Meta.as_str(),
+            lag_ms,
+            lag_slots,
+        );
+        self.log_meta_lag_if_needed(state, context, lag_slots, lag_ms);
     }
 
     fn build_snapshot_side(
@@ -748,8 +900,9 @@ impl CpAmmAdapter {
             );
             return None;
         }
-        if !state.meta_ready_for_slot(state.corecast_slot) {
+        if !self.meta_ready_within_lag(state) {
             self.request_meta_refresh(state.pool);
+            self.record_meta_lag_event(state, "snapshot_meta_pending");
             self.record_snapshot_issue(
                 state,
                 slot,
@@ -777,7 +930,7 @@ impl CpAmmAdapter {
                 state,
                 slot,
                 base_to_quote,
-                QuoteStatus::MissingPartner,
+                QuoteStatus::HydrationPending,
                 "partner_mismatch",
                 Some(probe_amount),
             );
@@ -879,12 +1032,7 @@ impl CpAmmAdapter {
         }
     }
 
-    fn eager_hydration(
-        &self,
-        pool: Pubkey,
-        base_hint: Option<Pubkey>,
-        quote_hint: Option<Pubkey>,
-    ) {
+    fn eager_hydration(&self, pool: Pubkey, base_hint: Option<Pubkey>, quote_hint: Option<Pubkey>) {
         if let Some(hydrator) = self.hydrator.as_ref() {
             hydrator.warm(pool);
         }
@@ -954,12 +1102,13 @@ impl ProtocolAdapter for CpAmmAdapter {
             return;
         };
         if !state.hydration_stale(self.config.hydration_meta_ttl_ms)
-            && state.meta_ready_for_slot(state.corecast_slot)
+            && self.meta_ready_within_lag(&state)
         {
             snapshot
                 .hydration
                 .mark_ready(HydrationComponent::Meta, state.last_update_slot);
         } else {
+            self.record_meta_lag_event(&state, "snapshot_enrich_meta_pending");
             self.request_meta_refresh(pool_pubkey);
         }
         let extras = snapshot
@@ -1005,6 +1154,30 @@ impl ProtocolAdapter for CpAmmAdapter {
         }
     }
 
+    fn refresh_templates(&self, epoch: u64) {
+        if self.template_builder.is_none() {
+            return;
+        }
+        let states: Vec<CpAmmState> = self.state.iter().map(|entry| entry.clone()).collect();
+        for state in states {
+            self.ensure_templates_for_epoch(&state, Some(epoch), "cache epoch refresh", false);
+        }
+    }
+
+    fn refresh_pool_templates(&self, pool: Pubkey, epoch: u64) {
+        if self.template_builder.is_none() {
+            return;
+        }
+        if let Some(state) = self.get_state(&pool) {
+            self.ensure_templates_for_epoch(
+                &state,
+                Some(epoch),
+                "template readiness refresh",
+                true,
+            );
+        }
+    }
+
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
@@ -1016,29 +1189,28 @@ impl ProtocolAdapter for CpAmmAdapter {
         if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
             return Some(quote_status_response(req, QuoteStatus::StaleState));
         }
-        if !state.meta_ready_for_slot(state.corecast_slot) {
+        if !self.meta_ready_within_lag(&state) {
             self.request_meta_refresh(state.pool);
+            self.record_meta_lag_event(&state, "quote_exact_in_meta_pending");
             return Some(quote_status_response(req, QuoteStatus::HydrationPending));
         }
         if !state.swap_enabled(req.slot, req.block_time_u64()) {
             return Some(quote_status_response(req, QuoteStatus::TradingDisabled));
         }
         let mut request = req;
-        let capped = self.clamp_request_amount(&state, &request);
+        let capped = match self.clamp_request_amount(&state, &request) {
+            Ok(value) => value,
+            Err(status) => return Some(quote_status_response(request, status)),
+        };
         if capped == 0 {
             return None;
         }
         request.amount = capped;
-        if referral_missing(&state) {
-            let mut missing = build_quote_response(request, 0);
-            missing.status = QuoteStatus::MissingReferral;
-            return Some(missing);
-        }
-        if self.partner_mismatch(&state) {
-            let mut missing = build_quote_response(request, 0);
-            missing.status = QuoteStatus::MissingPartner;
-            return Some(missing);
-        }
+            if referral_missing(&state) || self.partner_mismatch(&state) {
+                let mut missing = build_quote_response(request, 0);
+                missing.status = QuoteStatus::HydrationPending;
+                return Some(missing);
+            }
         let simulation = simulate_cp_amm_exact_in(&state, &request, false)?;
         let mut response = build_quote_response(request, simulation.output_amount);
         response.amount_in = simulation.executed_input_amount;
@@ -1071,29 +1243,28 @@ impl ProtocolAdapter for CpAmmAdapter {
         if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
             return Some(quote_status_response(req, QuoteStatus::StaleState));
         }
-        if !state.meta_ready_for_slot(state.corecast_slot) {
+        if !self.meta_ready_within_lag(&state) {
             self.request_meta_refresh(state.pool);
+            self.record_meta_lag_event(&state, "quote_exact_out_meta_pending");
             return Some(quote_status_response(req, QuoteStatus::HydrationPending));
         }
         if !state.swap_enabled(req.slot, req.block_time_u64()) {
             return Some(quote_status_response(req, QuoteStatus::TradingDisabled));
         }
         let mut request = req;
-        let capped = self.clamp_request_output_amount(&state, &request);
+        let capped = match self.clamp_request_output_amount(&state, &request) {
+            Ok(value) => value,
+            Err(status) => return Some(quote_status_response(request, status)),
+        };
         if capped == 0 {
             return None;
         }
         request.amount = capped;
-        if referral_missing(&state) {
-            let mut missing = build_quote_response(request, 0);
-            missing.status = QuoteStatus::MissingReferral;
-            return Some(missing);
-        }
-        if self.partner_mismatch(&state) {
-            let mut missing = build_quote_response(request, 0);
-            missing.status = QuoteStatus::MissingPartner;
-            return Some(missing);
-        }
+            if referral_missing(&state) || self.partner_mismatch(&state) {
+                let mut missing = build_quote_response(request, 0);
+                missing.status = QuoteStatus::HydrationPending;
+                return Some(missing);
+            }
         let simulation = simulate_cp_amm_exact_out(&state, &request)?;
         let mut response = QuoteResponse {
             amount_in: simulation.executed_input_amount,
@@ -1187,8 +1358,9 @@ impl ProtocolAdapter for CpAmmAdapter {
             );
             return None;
         }
-        if !state.meta_ready_for_slot(state.corecast_slot) {
+        if !self.meta_ready_within_lag(&state) {
             self.request_meta_refresh(state.pool);
+            self.record_meta_lag_event(&state, "bidirectional_meta_pending");
             self.record_snapshot_issue(
                 &state,
                 snapshot.slot,
@@ -2092,12 +2264,11 @@ impl CpAmmPoolHydrator {
         let clients = Arc::new(client_list);
         let fetch_clients = clients.clone();
         let hydrator = AsyncHydrator::new("cp_amm_pool", endpoint_count, move |pool| {
-            fetch_cp_amm_meta(fetch_clients.as_ref(), pool)
-                .map(|meta| {
-                    let slot = Some(meta.hydrated_slot);
-                    let fetched_at = meta.hydrated_at;
-                    HydratedValue::with_timestamp(meta, slot, fetched_at)
-                })
+            fetch_cp_amm_meta(fetch_clients.as_ref(), pool).map(|meta| {
+                let slot = Some(meta.hydrated_slot);
+                let fetched_at = meta.hydrated_at;
+                HydratedValue::with_timestamp(meta, slot, fetched_at)
+            })
         });
 
         Some(Self {
@@ -2176,124 +2347,6 @@ fn fetch_cp_amm_meta(clients: &[Arc<RpcClient>], pool: Pubkey) -> Option<Hydrate
         }
     }
 
-    None
-}
-
-#[derive(Clone, Debug)]
-struct MintMetadata {
-    decimals: Option<u8>,
-    program_id: Pubkey,
-    hydrated_at: Instant,
-}
-
-struct MintMetadataHydrator {
-    hydrator: AsyncHydrator<Pubkey, MintMetadata>,
-    retry_backoff: Duration,
-    last_attempts: DashMap<Pubkey, Instant>,
-}
-
-impl MintMetadataHydrator {
-    fn new(config: &CpAmmAdapterConfig) -> Option<Self> {
-        if config.rpc_endpoints.is_empty() {
-            return None;
-        }
-
-        let timeout = Duration::from_millis(config.rpc_timeout_ms.max(100));
-        let client_list: Vec<Arc<RpcClient>> = config
-            .rpc_endpoints
-            .iter()
-            .map(|url| Arc::new(RpcClient::new_with_timeout(url.clone(), timeout)))
-            .collect();
-
-        if client_list.is_empty() {
-            return None;
-        }
-
-        let endpoint_count = client_list.len();
-        let clients = Arc::new(client_list);
-        let fetch_clients = clients.clone();
-        let hydrator = AsyncHydrator::new("mint_meta", endpoint_count, move |mint| {
-            fetch_mint_metadata(fetch_clients.as_ref(), mint)
-                .map(|meta| HydratedValue::new(meta, None))
-        });
-
-        Some(Self {
-            hydrator,
-            retry_backoff: Duration::from_millis(config.hydration_retry_ms.max(1)),
-            last_attempts: DashMap::new(),
-        })
-    }
-
-    fn hydrate(&self, mint: Pubkey) -> Option<MintMetadata> {
-        if let Some(meta) = self.hydrator.cached(&mint) {
-            if meta.hydrated_at.elapsed() >= self.retry_backoff {
-                if self.should_schedule(mint) {
-                    self.hydrator.schedule(mint);
-                }
-            }
-            return Some(meta);
-        }
-        if self.should_schedule(mint) {
-            self.hydrator.schedule(mint);
-        }
-        None
-    }
-
-    fn should_schedule(&self, mint: Pubkey) -> bool {
-        let now = Instant::now();
-        if let Some(last) = self.last_attempts.get(&mint) {
-            if now.duration_since(*last.value()) < self.retry_backoff {
-                return false;
-            }
-        }
-        self.last_attempts.insert(mint, now);
-        true
-    }
-}
-
-fn fetch_mint_metadata(clients: &[Arc<RpcClient>], mint: Pubkey) -> Option<MintMetadata> {
-    for client in clients {
-        match client.get_account(&mint) {
-            Ok(account) => {
-                let owner = account.owner;
-                let decimals = parse_mint_decimals(&owner, &account.data);
-                if decimals.is_none() {
-                    warn!(
-                        target = "adapter::cp_amm",
-                        mint = %mint,
-                        program = %owner,
-                        "unsupported mint program for metadata hydration"
-                    );
-                }
-                return Some(MintMetadata {
-                    decimals,
-                    program_id: owner,
-                    hydrated_at: Instant::now(),
-                });
-            }
-            Err(error) => {
-                warn!(
-                    target = "adapter::cp_amm",
-                    mint = %mint,
-                    %error,
-                    "failed to fetch mint account for metadata"
-                );
-            }
-        }
-    }
-
-    None
-}
-
-fn parse_mint_decimals(owner: &Pubkey, data: &[u8]) -> Option<u8> {
-    if owner == &*SPL_TOKEN_PROGRAM_PUBKEY {
-        return data.get(44).copied();
-    }
-    if owner == &*SPL_TOKEN_2022_PROGRAM_PUBKEY {
-        return StateWithExtensionsOwned::<SplToken2022Mint>::unpack(data.to_vec())
-            .ok()
-            .map(|mint| mint.base.decimals);
-    }
     None
 }
 
@@ -2600,13 +2653,45 @@ impl CpAmmState {
             && self.sqrt_max_price_x64.is_some()
     }
 
-    fn meta_ready_for_slot(&self, slot: u64) -> bool {
+    fn meta_ready_for_slot(
+        &self,
+        slot: u64,
+        slot_lag_tolerance: u64,
+        lag_ms_tolerance: u64,
+    ) -> bool {
         if !self.meta_ready() {
             return false;
         }
-        self.hydrated_meta_slot
-            .map(|hydrated_slot| hydrated_slot >= slot)
+        let slot_ready = self
+            .hydrated_meta_slot
+            .map(|hydrated_slot| Self::slot_within_tolerance(hydrated_slot, slot, slot_lag_tolerance))
+            .unwrap_or(false);
+        if slot_ready {
+            return true;
+        }
+        if lag_ms_tolerance == 0 {
+            return false;
+        }
+        self.last_hydrated_at
+            .map(|instant| instant.elapsed().as_millis() as u64 <= lag_ms_tolerance)
             .unwrap_or(false)
+    }
+
+    fn slot_within_tolerance(hydrated_slot: u64, target_slot: u64, tolerance: u64) -> bool {
+        hydrated_slot >= target_slot
+            || target_slot
+                .saturating_sub(hydrated_slot)
+                <= tolerance
+    }
+
+    fn hydration_lag_slots(&self, slot: u64) -> Option<u64> {
+        self.hydrated_meta_slot
+            .map(|hydrated_slot| slot.saturating_sub(hydrated_slot))
+    }
+
+    fn hydration_lag_ms(&self) -> Option<u64> {
+        self.last_hydrated_at
+            .map(|instant| instant.elapsed().as_millis() as u64)
     }
 
     fn hydration_stale(&self, ttl_ms: u64) -> bool {
@@ -4828,7 +4913,7 @@ mod tests {
 
         adapter.state.insert(pool, state);
         let quote = adapter.quote_exact_in(req).expect("quote produced");
-        assert_eq!(quote.status, QuoteStatus::MissingPartner);
+        assert_eq!(quote.status, QuoteStatus::HydrationPending);
     }
 
     #[test]
@@ -4899,6 +4984,75 @@ mod tests {
         let quote = adapter.quote_exact_in(req).expect("quote produced");
         assert_eq!(quote.status, QuoteStatus::Ok);
         assert!(quote.amount_out > 0);
+    }
+
+    #[test]
+    fn quote_exact_in_reports_price_impact_when_clamped_to_zero() {
+        let mut adapter_config = CpAmmAdapterConfig::default();
+        adapter_config.max_swap_utilization_bps = 1;
+        let adapter = CpAmmAdapter::new(adapter_config, None);
+
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let req = QuoteRequest {
+            pool_id: pool,
+            input_mint: mint_a,
+            output_mint: mint_b,
+            amount: 10_000,
+            slot: 3,
+            block_time: None,
+            direction: SwapDirection::ExactIn,
+        };
+
+        let state = CpAmmState {
+            pool,
+            pool_authority: None,
+            token_a_vault: None,
+            token_b_vault: None,
+            whitelisted_vault: None,
+            partner: None,
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            token_a_program: None,
+            token_b_program: None,
+            token_a_decimals: Some(6),
+            token_b_decimals: Some(6),
+            token_a_transfer_fee: None,
+            token_b_transfer_fee: None,
+            amp: None,
+            lp_fee_bps: Some(30),
+            protocol_fee_bps: Some(5),
+            referral_bps: None,
+            referral_token_account: None,
+            collect_fee_mode: None,
+            activation_point: Some(0),
+            activation_type: Some(ActivationType::Slot as u8),
+            pool_status: Some(PoolStatusFlag::Enable as u8),
+            pool_type: None,
+            pool_version: None,
+            token_a_flag: None,
+            token_b_flag: None,
+            permanent_lock_liquidity: None,
+            pool_fees: None,
+            sqrt_price_x64: Some(1_u128 << 64),
+            liquidity: Some(5_000_000_000),
+            sqrt_min_price_x64: Some(1_u128 << 60),
+            sqrt_max_price_x64: Some(1_u128 << 70),
+            vault_a_balance: 100,
+            vault_b_balance: 2_000_000,
+            corecast_slot: 0,
+            last_update_slot: 0,
+            last_update_at: Instant::now(),
+            last_hydrated_at: Some(Instant::now()),
+            hydrated_meta_slot: Some(0),
+            last_block_time_unix: None,
+        };
+
+        adapter.state.insert(pool, state);
+        let quote = adapter.quote_exact_in(req).expect("quote produced");
+        assert_eq!(quote.status, QuoteStatus::PriceImpactExceeded);
+        assert_eq!(quote.amount_out, 0);
     }
 
     #[test]

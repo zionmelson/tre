@@ -417,7 +417,9 @@
         "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
         "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
       ],
-      "hydration_retry_ms": 500
+      "hydration_retry_ms": 500,
+      "hydration_slot_lag_tolerance": 1200,
+      "hydration_lag_ms_tolerance": 45000
     },
     "cp_amm": {
       "rpc_endpoints": [
@@ -425,7 +427,9 @@
         "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
         "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
       ],
-      "hydration_retry_ms": 500
+      "hydration_retry_ms": 500,
+      "hydration_slot_lag_tolerance": 4000,
+      "hydration_lag_ms_tolerance": 45000
     },
     "lb_clmm": {
       "rpc_endpoints": [
@@ -433,15 +437,9 @@
         "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
         "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
       ],
-      "hydration_retry_ms": 500
-    },
-    "lifinity_v2": {
-      "rpc_endpoints": [
-        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
-        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
-        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
-      ],
-      "hydration_retry_ms": 500
+      "hydration_retry_ms": 500,
+      "hydration_slot_lag_tolerance": 4000,
+      "hydration_lag_ms_tolerance": 45000
     },
     "whirlpool": {
       "enabled": true,
@@ -454,7 +452,10 @@
       "pool_failure_backoff_ms": 5000,
       "tick_array_backoff_ms": 15000,
       "max_pool_failures": 5,
-      "max_tick_array_failures": 5
+      "max_tick_array_failures": 5,
+      "oracle_hydration_enabled": false,
+      "hydration_slot_lag_tolerance": 4000,
+      "hydration_lag_ms_tolerance": 45000
     }
   },
   "corecast": {
@@ -475,7 +476,8 @@
   },
   "watcher": {
     "max_tracked_pools": 256,
-    "min_ready_pools": 3
+    "min_ready_pools": 3,
+    "pool_stale_ttl_ms": 1000
   },
   "alt_manager": {
     "create_onchain": true,

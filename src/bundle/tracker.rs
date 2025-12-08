@@ -25,7 +25,6 @@ use crate::config::{AppConfig, SubmissionTrackingConfig};
 use crate::notifier::{BundleSubmissionEvent, BundleSubmissionStatus, Notifier};
 use crate::proto::bundle::{self, bundle_result, BundleResult, DroppedReason};
 use crate::proto::searcher::SubscribeBundleResultsRequest;
-use crate::telemetry::{self, BundleResultStatus};
 use crate::tip_pressure;
 
 use super::{connect_searcher, load_jito_ca, normalize_endpoints};
@@ -42,14 +41,12 @@ pub struct PendingSubmission {
     pub bundle_id: String,
     pub seq: u64,
     pub endpoint: String,
-    pub detected_at: Instant,
     pub tip_lamports: Option<u64>,
 }
 
 struct PendingBundle {
     seq: u64,
     endpoint: String,
-    detected_at: Instant,
     submitted_at: Instant,
     tip_lamports: Option<u64>,
     last_status: Option<BundleSubmissionStatus>,
@@ -146,7 +143,6 @@ impl BundleTracker {
         let entry = PendingBundle {
             seq: submission.seq,
             endpoint: submission.endpoint,
-            detected_at: submission.detected_at,
             submitted_at: Instant::now(),
             tip_lamports: submission.tip_lamports,
             last_status: Some(BundleSubmissionStatus::Submitted),
@@ -154,13 +150,7 @@ impl BundleTracker {
         self.pending.insert(submission.bundle_id, entry);
     }
 
-    pub fn record_stage3_failure(
-        &self,
-        seq: u64,
-        detected_at: Instant,
-        tip_lamports: Option<u64>,
-        detail: String,
-    ) {
+    pub fn record_stage3_failure(&self, seq: u64, tip_lamports: Option<u64>, detail: String) {
         info!(target = "bundle_tracker", seq, detail = %detail, "stage3 failure recorded");
         self.failed.insert(
             seq,
@@ -174,7 +164,6 @@ impl BundleTracker {
             bundle_id: None,
             endpoint: None,
             tip_lamports,
-            detection_latency: detected_at.elapsed(),
             slot: None,
             detail: Some(detail.clone()),
             error: Some(detail),
@@ -267,10 +256,6 @@ impl BundleTracker {
         slot: Option<u64>,
         detail: Option<String>,
     ) {
-        let detection_latency = entry.detected_at.elapsed();
-        if let Some(metric_status) = telemetry_status(status) {
-            telemetry::record_bundle_result(metric_status, detection_latency);
-        }
         tip_pressure::record_bundle_result_expiry(matches!(
             status,
             BundleSubmissionStatus::Expired
@@ -281,7 +266,6 @@ impl BundleTracker {
             bundle_id: Some(bundle_id.to_string()),
             endpoint: Some(entry.endpoint.clone()),
             tip_lamports: entry.tip_lamports,
-            detection_latency,
             slot,
             detail,
             error: None,
@@ -400,20 +384,6 @@ fn rejection_reason(rejected: &bundle::Rejected) -> String {
             format!("dropped bundle {}", reason.msg)
         }
         None => "rejected".to_string(),
-    }
-}
-
-fn telemetry_status(status: BundleSubmissionStatus) -> Option<BundleResultStatus> {
-    match status {
-        BundleSubmissionStatus::Accepted => Some(BundleResultStatus::Accepted),
-        BundleSubmissionStatus::Rejected => Some(BundleResultStatus::Rejected),
-        BundleSubmissionStatus::Processed => Some(BundleResultStatus::Processed),
-        BundleSubmissionStatus::Finalized => Some(BundleResultStatus::Finalized),
-        BundleSubmissionStatus::Dropped => Some(BundleResultStatus::Dropped),
-        BundleSubmissionStatus::AuctionWon => Some(BundleResultStatus::AuctionWon),
-        BundleSubmissionStatus::AuctionLost => Some(BundleResultStatus::AuctionLost),
-        BundleSubmissionStatus::Expired => Some(BundleResultStatus::Expired),
-        _ => None,
     }
 }
 

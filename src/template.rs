@@ -29,7 +29,6 @@ pub struct TemplateContext {
     pub expected_fee_amount: Option<u64>,
     pub partial_fill_remaining: Option<u64>,
     pub template_ready: bool,
-    pub alt_ready: bool,
 }
 
 impl Default for TemplateContext {
@@ -60,7 +59,6 @@ impl Default for TemplateContext {
             expected_fee_amount: None,
             partial_fill_remaining: None,
             template_ready: false,
-            alt_ready: false,
         }
     }
 }

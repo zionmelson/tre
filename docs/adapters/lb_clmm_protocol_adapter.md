@@ -22,7 +22,7 @@ Any upstream change across those modules should be mirrored here and in the hydr
 1. Quote lb_clmm pools exactly like `LbPairExtension::swap` would, including variable fee adjustments, host/referral fee distribution, and bitmap-assisted bin traversal.
 2. Emit deterministic `SwapTemplate` payloads for all supported instructions (`swap2`, `swap_with_price_impact2`, `swap_exact_out2`) so fast execution never re-derives PDAs or account order.
 3. Mirror Meteora SDK semantics for SPL Token vs Token-2022 pools, including transfer-hook account resolution for swap legs and reward harvests.
-4. Surface adapter-specific health signals (`PreActivation`, `VolatilityClamp`, `InsufficientBins`, `MissingBitmapExtension`) plus structured telemetry for state freshness, template composition, and transfer-hook success/failure.
+4. Surface adapter-specific health signals (`PreActivation`, `VolatilityClamp`, `HydrationPending`, `MissingBitmapExtension`) plus structured telemetry for state freshness, template composition, and transfer-hook success/failure.
 
 ## Data Inputs & Cached State
 
@@ -67,7 +67,7 @@ Whenever upstream adds a new helper in `commons/src/extensions`, we stub a Rust 
 3. **Per-bin execution** – For each bin, call the simulated `Bin::swap` to compute `amount_out`, `fee`, `protocol_fee`, and optional host fee. Respect `max_bin_walk` (default 800 bins) so we do not traverse unbounded ranges; once the walk exhausts that budget we fail the quote instead of degrading accuracy.
 4. **Fees** – Combine `LbPairExtension::get_base_fee()` and `get_variable_fee()` (which depends on `volatility_accumulator`) and apply host-fee overrides when `host_fee_in` is configured. Variable fee clamps must be mirrored from upstream to avoid quoting trades that on-chain would reject via `MAX_FEE_RATE`.
 5. **Guards** – Enforce `max_price_impact_bps` by comparing the execution price after bin walk with the pre-trade price computed via `price_math::get_price_from_id(active_bin_id, bin_step)`. If impact exceeds config, mark status `PriceImpactExceeded`.
-6. **Partial fills & insufficiency** – If the simulator runs out of bins (`next_bin_array_index_with_liquidity_internal` returns empty) before satisfying the request, set `QuoteResponse.status = InsufficientBins` and surface the filled amount. Strategies can downsize or refresh after hydration fetches more arrays. XYK fallbacks are no longer allowed; missing bin data now aborts the quote rather than approximating with a constant-product model.
+6. **Partial fills & insufficiency** – If the simulator runs out of bins (`next_bin_array_index_with_liquidity_internal` returns empty) before satisfying the request, set `QuoteResponse.status = HydrationPending` and surface the filled amount. Strategies can downsize or refresh after hydration fetches more arrays. XYK fallbacks are no longer allowed; missing bin data now aborts the quote rather than approximating with a constant-product model.
 
 ## Swap Template Generation
 
@@ -91,7 +91,7 @@ If both mint legs are SPL Token (non-2022), the resolver returns `None` and the 
 - `PairStatus` / `PairType` / `ActivationType` conversions: reuse the logic in `commons/src/conversions` to decide whether a pool is tradable (`PairStatus::Enabled`) and whether activation is slot- or timestamp-gated. Quotes for disabled or pre-activation pools should immediately return `QuoteStatus::PreActivation`.
 - `TokenProgramFlags` inform whether memo + remaining accounts are required for transfer fees; missing hooks should return `QuoteStatus::MissingAccounts` to avoid on-chain failures.
 - Staleness: mark `QuoteStatus::StaleState` when either `slot - last_update_slot > config.max_state_age_slots` or `slot - last_oracle_slot > max_oracle_lag_slots`.
-- Bin coverage: when bin traversal hits an uncached segment or `BinArrayBitmapExtExtension::next_bin_array_index_with_liquidity` returns `(idx, false)`, emit `InsufficientBins` and trigger a hydration refresh.
+- Bin coverage: when bin traversal hits an uncached segment or `BinArrayBitmapExtExtension::next_bin_array_index_with_liquidity` returns `(idx, false)`, emit `HydrationPending` and trigger a hydration refresh.
 - Telemetry fields: `pool`, `slot`, `swap_mode`, `bin_walk`, `dynamic_fee_bps`, `host_fee_applied`, `bitmap_extension_used`, plus rejection counters grouped by on-chain error (6003 missing accounts, 6042 insufficient liquidity, 6077 stale state).
 
 ## Integration / Testing Checklist

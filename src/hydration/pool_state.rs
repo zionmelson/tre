@@ -24,6 +24,8 @@ pub struct PoolState {
     pub block_hash: Option<String>,
     pub block_time_unix: Option<i64>,
     pub last_updated: Instant,
+    pub first_seen: Instant,
+    pub initial_ready_at: Option<Instant>,
     pub generation: u64,
     pub base_liquidity: u128,
     pub quote_liquidity: u128,
@@ -150,6 +152,23 @@ impl PoolStore {
                 }
             })
             .unwrap_or(0.0);
+        let existing_entry = self.inner.get(&pool_id);
+        let mut initial_ready_at = existing_entry
+            .as_ref()
+            .and_then(|entry| entry.initial_ready_at);
+        let first_seen = existing_entry
+            .as_ref()
+            .map(|entry| entry.first_seen)
+            .unwrap_or(last_updated);
+        drop(existing_entry);
+
+        let mut initial_latency_ms = None;
+        if initial_ready_at.is_none() && ready {
+            let delta = last_updated.saturating_duration_since(first_seen);
+            let clamped = delta.as_millis().min(u128::from(u64::MAX)) as u64;
+            initial_latency_ms = Some(clamped);
+            initial_ready_at = Some(last_updated);
+        }
         let effective_ready = ready;
         let state = PoolState {
             pool_id: pool_id.clone(),
@@ -158,6 +177,8 @@ impl PoolStore {
             block_hash: block_hash.clone(),
             block_time_unix,
             last_updated,
+            first_seen,
+            initial_ready_at,
             generation,
             base_liquidity: snapshot.base_post_amount,
             quote_liquidity: snapshot.quote_post_amount,
@@ -174,11 +195,21 @@ impl PoolStore {
             price,
             snapshot.base_post_amount,
             snapshot.quote_post_amount,
+            ready,
         );
         if let Some(previous) = self.inner.insert(pool_id.clone(), state) {
             self.update_ready_count(previous.ready, effective_ready);
         } else if effective_ready {
             self.ready_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(latency_ms) = initial_latency_ms {
+            telemetry::record_hydration_initial_latency(
+                &program_id,
+                &pool_id,
+                &snapshot.base_mint,
+                &snapshot.quote_mint,
+                latency_ms,
+            );
         }
         self.maybe_notify_ready();
         self.prune_if_needed();
@@ -255,11 +286,7 @@ impl PoolStore {
         removed
     }
 
-    pub fn flag_stale_candidates(
-        &self,
-        ttl: Option<Duration>,
-        slot_lag: Option<u64>,
-    ) -> usize {
+    pub fn flag_stale_candidates(&self, ttl: Option<Duration>, slot_lag: Option<u64>) -> usize {
         if ttl.is_none() && slot_lag.is_none() {
             return 0;
         }
@@ -278,6 +305,19 @@ impl PoolStore {
                 .map(|lag| latest_slot.saturating_sub(value.slot) >= lag)
                 .unwrap_or(false);
             if stale_by_time || stale_by_slot {
+                let ttl_ms = ttl.map(|threshold| threshold.as_millis() as u64);
+                debug!(
+                    target = "hydration",
+                    pool = %pool_id,
+                    program = %value.program_id,
+                    snapshot_slot = value.slot,
+                    latest_slot,
+                    ttl_ms,
+                    slot_lag,
+                    stale_by_time,
+                    stale_by_slot,
+                    "pool snapshot marked stale"
+                );
                 drop(entry);
                 if self.mark_snapshot_stale_and_queue(&pool_id) {
                     flagged += 1;
@@ -295,6 +335,12 @@ impl PoolStore {
                 requested_at: Instant::now(),
             },
         );
+        debug!(
+            target = "hydration",
+            pool = pool_id,
+            min_slot,
+            "queued pool refresh"
+        );
     }
 
     pub fn drain_refresh_queue(&self) -> Vec<(PoolState, u64)> {
@@ -307,6 +353,14 @@ impl PoolStore {
         for (pool_id, ticket) in pending {
             self.pending_refresh.remove(&pool_id);
             if let Some(state) = self.inner.get(&pool_id) {
+                let queued_ms = ticket.requested_at.elapsed().as_millis() as u64;
+                debug!(
+                    target = "hydration",
+                    pool = %pool_id,
+                    min_slot = ticket.min_slot,
+                    queued_ms,
+                    "dispatching pool refresh"
+                );
                 drained.push((state.value().clone(), ticket.min_slot));
             }
         }

@@ -1403,6 +1403,7 @@ mod tests {
             tlv_bytes: 0,
             template_hash: [0u8; 32],
             alt_handle: None,
+            alt_accounts: StdArc::from(Vec::new()),
             metadata: TemplateMetadata::Whirlpool {
                 account_specs: specs,
                 pool_accounts: Some(WhirlpoolPoolAccounts {
@@ -2568,6 +2569,7 @@ mod tests {
             tlv_bytes: 0,
             template_hash: [0u8; 32],
             alt_handle: None,
+            alt_accounts: StdArc::from(Vec::new()),
             metadata: TemplateMetadata::None,
             hydrated_at: Instant::now(),
         };
@@ -2604,6 +2606,7 @@ mod tests {
             tlv_bytes: 0,
             template_hash: [0u8; 32],
             alt_handle: None,
+            alt_accounts: StdArc::from(Vec::new()),
             metadata: TemplateMetadata::AmmV3 {
                 account_specs: specs,
                 pool_accounts: Some(pool_accounts),
@@ -2665,6 +2668,7 @@ mod tests {
             tlv_bytes: 0,
             template_hash: [0u8; 32],
             alt_handle: None,
+            alt_accounts: StdArc::from(Vec::new()),
             metadata: TemplateMetadata::Whirlpool {
                 account_specs: specs,
                 pool_accounts: Some(pool_accounts),

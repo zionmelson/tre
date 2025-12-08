@@ -26,8 +26,7 @@ use crate::telemetry::{self, Stage2PlanEvent};
 
 use crate::hydration::types::{PoolQuoteDirection, LB_CLMM_PROGRAM_ID};
 use crate::planner::types::{
-    BundleCandidate, FlashLoanSummary, PlannedInstruction, PlannedLookupTable, RouteLegPlan,
-    RoutePlan,
+    BundleCandidate, FlashLoanSummary, PlannedInstruction, RouteLegPlan, RoutePlan,
 };
 use crate::template::TemplateContext;
 
@@ -56,15 +55,10 @@ fn run(
     }
 
     let planner = InstructionPlanner::new(Some(&builder));
-    let mut last_alt_stats = Instant::now() - Duration::from_secs(30);
     let mev_revision = builder.mev_guard().current_revision();
     info!(mev_revision, "stage2 submit online");
     while !stop.load(Ordering::Relaxed) {
         builder.heartbeat(BuilderStage::SubmitHotPath);
-        if last_alt_stats.elapsed() >= Duration::from_secs(30) {
-            log_alt_manager_status(&builder);
-            last_alt_stats = Instant::now();
-        }
         if let Some(bundle) = consumer.pop() {
             process_bundle(bundle, &planner, &builder, &producer);
         } else {
@@ -441,7 +435,7 @@ impl<'a> InstructionPlanner<'a> {
                 fee_bps: leg.fee_bps,
                 template_fee_bps: leg.template_fee_bps,
                 direction: leg.direction,
-                lookup_table: self.lookup_table_for_leg(leg),
+                lookup_table: None,
                 sqrt_price_limit: leg.sqrt_price_limit,
                 min_output_amount,
                 limit_price: leg.limit_price,
@@ -506,42 +500,7 @@ impl<'a> InstructionPlanner<'a> {
             telemetry::record_stage2_pool_block(&leg.pool_id);
             bail!("template not ready for pool {}", leg.pool_id);
         }
-        if !leg.alt_ready {
-            telemetry::record_stage2_pool_block(&leg.pool_id);
-            bail!("ALT not ready for pool {}", leg.pool_id);
-        }
         Ok(())
-    }
-
-    fn lookup_table_for_leg(&self, leg: &RouteLegPlan) -> Option<PlannedLookupTable> {
-        let builder = self.builder?;
-        let pool_key = match Pubkey::from_str(&leg.pool_id) {
-            Ok(pk) => pk,
-            Err(err) => {
-                warn!(pool = %leg.pool_id, error = %err, "invalid pool id for ALT lookup");
-                return None;
-            }
-        };
-
-        let handle = match builder.alt_manager().handle_for_pool(pool_key) {
-            Some(handle) => handle,
-            None => {
-                debug!(pool = %leg.pool_id, "no ALT handle registered for pool");
-                return None;
-            }
-        };
-
-        builder
-            .alt_manager()
-            .table_info(handle)
-            .map(|info| PlannedLookupTable {
-                handle_id: handle.0,
-                table_address: info.address.to_string(),
-                authority: info.authority.to_string(),
-                creation_slot: info.creation_slot,
-                last_extended_slot: info.last_extended_slot,
-                accounts: info.addresses.iter().map(|pk| pk.to_string()).collect(),
-            })
     }
 
     fn plan_flash_loan(
@@ -637,13 +596,9 @@ impl<'a> InstructionPlanner<'a> {
             .filter(|ix| ix.lookup_table.is_none())
             .count();
         if missing > 0 {
-            let stats = builder.alt_manager().stats();
             warn!(
                 missing_lookup_tables = missing,
                 total_legs = instructions.len(),
-                ready_tables = stats.ready_tables,
-                pending_jobs = stats.pending_jobs,
-                registered_handles = stats.registered_handles,
                 "missing ALT coverage for planned route"
             );
         }
@@ -830,18 +785,6 @@ fn build_close_token_account_instruction(
         data: vec![9],
     }
 }
-fn log_alt_manager_status(builder: &BuilderHandle) {
-    let stats = builder.alt_manager().stats();
-    info!(
-        ready_tables = stats.ready_tables,
-        registered_handles = stats.registered_handles,
-        pending_jobs = stats.pending_jobs,
-        refresh_count = stats.refresh_count,
-        last_refresh_unix_ms = stats.last_refresh_unix_ms,
-        "alt manager status"
-    );
-}
-
 fn duration_ms(duration: Duration) -> u64 {
     let millis = duration.as_millis();
     millis.min(u128::from(u64::MAX)) as u64
@@ -970,7 +913,6 @@ mod tests {
                     price_impact_limit_bps: None,
                     context: TemplateContext::default(),
                     template_ready: true,
-                    alt_ready: true,
                 },
                 RouteLegPlan {
                     pool_id: "pool-bc".into(),
@@ -992,7 +934,6 @@ mod tests {
                     price_impact_limit_bps: None,
                     context: TemplateContext::default(),
                     template_ready: true,
-                    alt_ready: true,
                 },
             ],
             estimated_final_output_amount: Some(190),
@@ -1046,7 +987,6 @@ mod tests {
             price_impact_limit_bps: None,
             context: TemplateContext::default(),
             template_ready: true,
-            alt_ready: true,
         };
 
         let route = RoutePlan {
@@ -1095,7 +1035,6 @@ mod tests {
                 price_impact_limit_bps: None,
                 context: TemplateContext::default(),
                 template_ready: true,
-                alt_ready: true,
             }],
             estimated_final_output_amount: Some(950_000),
             flash_loan_permitted: false,
@@ -1135,7 +1074,6 @@ mod tests {
             price_impact_limit_bps: None,
             context: ctx,
             template_ready: true,
-            alt_ready: true,
         };
 
         let route = RoutePlan {
@@ -1172,6 +1110,7 @@ mod tests {
             tlv_bytes: 0,
             template_hash: [0; 32],
             alt_handle: None,
+            alt_accounts: Arc::from(Vec::new()),
             metadata: TemplateMetadata::None,
             hydrated_at: Instant::now(),
         };
@@ -1198,7 +1137,6 @@ mod tests {
             price_impact_limit_bps: None,
             context: TemplateContext::default(),
             template_ready: true,
-            alt_ready: true,
         };
         let route = RoutePlan {
             start_mint: WSOL_MINT_PUBKEY.to_string(),
@@ -1302,7 +1240,7 @@ mod tests {
             buy_amount: 100,
             sell_amount: 50,
         };
-        let opportunity = Opportunity::from_trade(seq, trade, None, None, Some(100.0));
+        let opportunity = Opportunity::from_trade(seq, trade, None, None, Some(100.0), None);
         BundleCandidate::from_opportunity(&opportunity)
     }
 }

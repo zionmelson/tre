@@ -15,7 +15,7 @@ use solana_client::rpc_config::{
 };
 use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
 use solana_client::rpc_response::{UiAccount, UiAccountData};
-use solana_sdk::{account::Account, pubkey::Pubkey};
+use solana_sdk::{account::Account, instruction::AccountMeta, pubkey::Pubkey};
 use spl_token_2022::extension::{
     transfer_fee::{TransferFee as SplTokenTransferFee, TransferFeeConfig as SplTransferFeeConfig},
     BaseStateWithExtensions, StateWithExtensionsOwned,
@@ -25,13 +25,19 @@ use tracing::{debug, info, trace, warn};
 use uint::construct_uint;
 
 use crate::builder::{AmmV3PoolMeta, BuilderHandle};
-use crate::hydration::token_fees::{apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee};
+use crate::hydration::mint_metadata::{MintMetadata, MintMetadataHydrator};
+use crate::hydration::token_fees::{
+    apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
+};
+use crate::hydration::transfer_hooks::{
+    TransferHookAccountContext, TransferHookAccountsResolver,
+};
 use crate::hydration::types::{
     HydrationComponent, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
     RaydiumTransferFeeConfig, RaydiumV3PoolExtras, RAYDIUM_V3_INPUT_UTILIZATION_BPS,
 };
-use crate::template::{TemplateContext, TransferFeeConfigHint};
 use crate::telemetry;
+use crate::template::{TemplateContext, TransferFeeConfigHint};
 
 use super::hydration::{AsyncHydrator, HydratedValue};
 use super::{
@@ -106,6 +112,11 @@ struct SnapshotStatusLogEntry {
     logged_at: Instant,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RaydiumTemplateRegistration {
+    epoch: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TransferFeeConfigSummary {
     epoch: u64,
@@ -163,6 +174,7 @@ struct MintAccountMeta {
 const DEFAULT_RAYDIUM_HYDRATION_RETRY_MS: u64 = 10_000;
 const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
 const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
+const HYDRATION_LAG_LOG_INTERVAL_MS: u64 = 15_000;
 
 #[derive(Debug, Clone)]
 pub struct RaydiumV3AdapterConfig {
@@ -173,6 +185,8 @@ pub struct RaydiumV3AdapterConfig {
     pub hydration_retry_ms: u64,
     pub tick_array_cache_ttl_ms: u64,
     pub max_swap_utilization_bps: u64,
+    pub hydration_slot_lag_tolerance: u64,
+    pub hydration_lag_ms_tolerance: u64,
 }
 
 impl Default for RaydiumV3AdapterConfig {
@@ -186,6 +200,8 @@ impl Default for RaydiumV3AdapterConfig {
             hydration_retry_ms: DEFAULT_RAYDIUM_HYDRATION_RETRY_MS,
             tick_array_cache_ttl_ms: 45_000,
             max_swap_utilization_bps: RAYDIUM_V3_INPUT_UTILIZATION_BPS,
+            hydration_slot_lag_tolerance: 400,
+            hydration_lag_ms_tolerance: 45_000,
         }
     }
 }
@@ -195,10 +211,14 @@ pub struct RaydiumV3Adapter {
     state: DashMap<Pubkey, RaydiumV3State>,
     config: RaydiumV3AdapterConfig,
     hydrator: Option<RaydiumPoolHydrator>,
+    mint_metadata_cache: Option<MintMetadataHydrator>,
+    transfer_fee_cache: Option<TokenTransferFeeHydrator>,
+    transfer_hook_resolver: Option<TransferHookAccountsResolver>,
     template_builder: Option<BuilderHandle>,
-    registered_templates: DashSet<Pubkey>,
+    registered_templates: DashMap<Pubkey, RaydiumTemplateRegistration>,
     snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
     missing_state_log: DashMap<Pubkey, Instant>,
+    lag_log: DashMap<(Pubkey, u8), Instant>,
 }
 
 impl RaydiumV3Adapter {
@@ -206,6 +226,18 @@ impl RaydiumV3Adapter {
         let program_id = Pubkey::from_str(RAYDIUM_V3_PROGRAM_ID)
             .expect("static Raydium AMM v3 program id should be valid");
         let hydrator = RaydiumPoolHydrator::new(&config, program_id);
+        let mint_metadata_cache = MintMetadataHydrator::new(
+            &config.rpc_endpoints,
+            config.rpc_timeout_ms,
+            config.hydration_retry_ms,
+        );
+        let transfer_fee_cache = TokenTransferFeeHydrator::new(
+            &config.rpc_endpoints,
+            config.rpc_timeout_ms,
+            config.hydration_retry_ms,
+        );
+        let transfer_hook_resolver =
+            TransferHookAccountsResolver::new(&config.rpc_endpoints, config.rpc_timeout_ms);
         if let Some(hydrator_ref) = hydrator.as_ref() {
             info!(
                 target = "adapter::raydium_v3",
@@ -223,10 +255,14 @@ impl RaydiumV3Adapter {
             state: DashMap::new(),
             config,
             hydrator,
+            mint_metadata_cache,
+            transfer_fee_cache,
+            transfer_hook_resolver,
             template_builder,
-            registered_templates: DashSet::new(),
+            registered_templates: DashMap::new(),
             snapshot_failure_log: DashMap::new(),
             missing_state_log: DashMap::new(),
+            lag_log: DashMap::new(),
         }
     }
 
@@ -272,7 +308,7 @@ impl RaydiumV3Adapter {
             return;
         };
 
-        let (extras, hydrated_meta_slot) =
+        let (extras, hydrated_meta_slot, hydrated_meta_at) =
             self.enrich_extras(pool_pubkey, base_mint, quote_mint, extras);
         let RaydiumV3PoolExtras {
             tick_spacing,
@@ -307,37 +343,43 @@ impl RaydiumV3Adapter {
             .map(|entry| entry.tick_array_cache.clone())
             .unwrap_or_default();
         let mut recorded_meta_slot = hydrated_meta_slot;
+        let mut recorded_meta_at = hydrated_meta_at;
         let mut recorded_tick_slot = previous_state
             .as_ref()
             .and_then(|entry| entry.hydrated_tick_arrays_slot);
 
+        let lag_tolerance = self.config.hydration_slot_lag_tolerance;
         if recorded_meta_slot.is_none() {
             if let Some(prev) = previous_state.as_ref() {
-                if prev
-                    .hydrated_meta_slot
-                    .map(|slot| slot >= update.slot)
-                    .unwrap_or(false)
-                {
+                if RaydiumV3State::hydration_slot_ready(
+                    prev.hydrated_meta_slot,
+                    update.slot,
+                    lag_tolerance,
+                ) {
                     recorded_meta_slot = prev.hydrated_meta_slot;
+                    recorded_meta_at = prev.last_hydrated_at;
                 }
             }
         }
 
-        if recorded_meta_slot
-            .map(|slot| slot < update.slot)
-            .unwrap_or(true)
-        {
+        if !RaydiumV3State::hydration_slot_ready(
+            recorded_meta_slot,
+            update.slot,
+            lag_tolerance,
+        ) {
             recorded_meta_slot = None;
+            recorded_meta_at = None;
             if let Some(hydrator) = self.hydrator.as_ref() {
                 hydrator.refresh_pool_meta(pool_pubkey);
             }
         }
 
         let mut refreshed_tick_arrays = false;
-        if recorded_tick_slot
-            .map(|slot| slot < update.slot)
-            .unwrap_or(true)
-        {
+        if !RaydiumV3State::hydration_slot_ready(
+            recorded_tick_slot,
+            update.slot,
+            lag_tolerance,
+        ) {
             tick_array_cache = TickArrayCache::default();
             recorded_tick_slot = None;
             refreshed_tick_arrays = true;
@@ -348,14 +390,31 @@ impl RaydiumV3Adapter {
             }
         }
 
+        let base_transfer_hook_program = self
+            .transfer_hook_program(base_mint)
+            .or_else(|| {
+                previous_state
+                    .as_ref()
+                    .and_then(|entry| entry.base_transfer_hook_program)
+            });
+        let quote_transfer_hook_program = self
+            .transfer_hook_program(quote_mint)
+            .or_else(|| {
+                previous_state
+                    .as_ref()
+                    .and_then(|entry| entry.quote_transfer_hook_program)
+            });
+
         drop(previous_state);
 
-        let state = RaydiumV3State {
+        let mut state = RaydiumV3State {
             pool_id: pool_pubkey,
             base_mint,
             quote_mint,
             base_token_program: base_token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID),
             quote_token_program: quote_token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID),
+            base_decimals: None,
+            quote_decimals: None,
             amm_config,
             observation_state,
             tick_spacing,
@@ -377,10 +436,15 @@ impl RaydiumV3Adapter {
             pool_status,
             base_transfer_fee,
             quote_transfer_fee,
+            base_transfer_hook_program,
+            quote_transfer_hook_program,
             hydrated_meta_slot: recorded_meta_slot,
+            last_hydrated_at: recorded_meta_at,
             hydrated_tick_arrays_slot: recorded_tick_slot,
             tick_array_cache,
         };
+
+        self.attach_mint_metadata(&mut state);
 
         trace!(
             target = "adapter::raydium_v3",
@@ -404,11 +468,13 @@ impl RaydiumV3Adapter {
             && state.liquidity.is_some()
             && state.current_tick.is_some()
     }
-
-    fn tick_cache_entry_ready(
-        entry: Option<&TickArrayCacheEntry>,
+        if !(slot_over || time_over) {
+            return false;
+        }
         ttl: Duration,
         target_slot: u64,
+        slot_lag_tolerance: u64,
+        lag_ms_tolerance: u64,
     ) -> bool {
         let Some(cache) = entry else {
             return false;
@@ -416,10 +482,18 @@ impl RaydiumV3Adapter {
         if cache.accounts.len() < REQUIRED_TICK_ARRAYS_PER_SIDE {
             return false;
         }
-        if cache.hydrated_slot < target_slot {
+        if ttl.as_millis() > 0 && cache.hydrated_at.elapsed() > ttl {
             return false;
         }
-        ttl.as_millis() == 0 || cache.hydrated_at.elapsed() <= ttl
+        if cache.hydrated_slot >= target_slot
+            || target_slot.saturating_sub(cache.hydrated_slot) <= slot_lag_tolerance
+        {
+            return true;
+        }
+        if lag_ms_tolerance == 0 {
+            return false;
+        }
+        cache.hydrated_at.elapsed().as_millis() as u64 <= lag_ms_tolerance
     }
 
     fn request_tick_arrays(&self, state: &RaydiumV3State) {
@@ -430,12 +504,7 @@ impl RaydiumV3Adapter {
         }
     }
 
-    fn eager_hydration(
-        &self,
-        pool: Pubkey,
-        base_mint: Option<Pubkey>,
-        quote_mint: Option<Pubkey>,
-    ) {
+    fn eager_hydration(&self, pool: Pubkey, base_mint: Option<Pubkey>, quote_mint: Option<Pubkey>) {
         if let Some(hydrator) = self.hydrator.as_ref() {
             hydrator.hydrate(pool);
             if let Some(base) = base_mint {
@@ -458,12 +527,13 @@ impl RaydiumV3Adapter {
         base_mint: Pubkey,
         quote_mint: Pubkey,
         mut extras: RaydiumV3PoolExtras,
-    ) -> (RaydiumV3PoolExtras, Option<u64>) {
+    ) -> (RaydiumV3PoolExtras, Option<u64>, Option<Instant>) {
         let Some(hydrator) = self.hydrator.as_ref() else {
-            return (extras, None);
+            return (extras, None, None);
         };
 
         let mut hydrated_slot = None;
+        let mut hydrated_at = None;
 
         if let Some(meta) = hydrator.hydrate(pool) {
             extras.tick_spacing = extras.tick_spacing.or(Some(meta.tick_spacing));
@@ -483,6 +553,7 @@ impl RaydiumV3Adapter {
                 .or(Some(meta.tick_array_bitmap_extension));
             extras.pool_status = extras.pool_status.or(Some(meta.pool_status));
             hydrated_slot = Some(meta.slot);
+            hydrated_at = hydrator.meta_hydrated_at(pool);
         }
 
         extras.base_token_program = extras
@@ -502,26 +573,49 @@ impl RaydiumV3Adapter {
                 .map(Into::into);
         }
 
-        (extras, hydrated_slot)
+        (extras, hydrated_slot, hydrated_at)
     }
 
     fn register_templates_with_builder(&self, state: &RaydiumV3State) {
+        self.ensure_templates_for_epoch(state, None, "adapter state update", false);
+    }
+
+    fn ensure_templates_for_epoch(
+        &self,
+        state: &RaydiumV3State,
+        epoch_override: Option<u64>,
+        reason: &'static str,
+        force_refresh: bool,
+    ) {
         let Some(builder) = self.template_builder.as_ref() else {
             return;
         };
-        if self.registered_templates.contains(&state.pool_id) {
-            let alt_missing = builder
-                .alt_manager()
-                .handle_for_pool(state.pool_id)
-                .is_none();
-            if !alt_missing {
-                return;
-            }
-            debug!(
+        let lag_slot_tolerance = self.config.hydration_slot_lag_tolerance;
+        let lag_ms_tolerance = self.config.hydration_lag_ms_tolerance;
+        if !state.meta_ready_within_lag(
+            state.corecast_slot,
+            lag_slot_tolerance,
+            lag_ms_tolerance,
+        ) {
+            trace!(
                 target = "adapter::raydium_v3",
                 pool = %state.pool_id,
-                "ALT handle missing; re-registering pool templates"
+                slot = state.corecast_slot,
+                reason = reason,
+                "deferring template registration until meta hydration completes"
             );
+            let reason_label = if Self::meta_ready(state) {
+                "meta_slot_lag"
+            } else {
+                "meta_missing"
+            };
+            telemetry::record_hydration_readiness_failure(self.name(), reason_label);
+            self.eager_hydration(state.pool_id, Some(state.base_mint), Some(state.quote_mint));
+            return;
+        }
+        let epoch = epoch_override.unwrap_or_else(|| builder.template_cache().epoch());
+        if !force_refresh && self.template_epoch_ready(state.pool_id, epoch) {
+            return;
         }
         let Some(fee_bps) = state.trade_fee_bps else {
             return;
@@ -581,6 +675,14 @@ impl RaydiumV3Adapter {
             owner_ata1,
         );
 
+        debug!(
+            target = "adapter::raydium_v3",
+            pool = %state.pool_id,
+            epoch,
+            reason = reason,
+            "registering raydium instruction templates"
+        );
+
         builder.register_amm_v3_pool(AmmV3PoolMeta {
             pool_id: state.pool_id,
             fee_tier_bps,
@@ -594,7 +696,15 @@ impl RaydiumV3Adapter {
             alt_handle: None,
         });
 
-        self.registered_templates.insert(state.pool_id);
+        self.registered_templates
+            .insert(state.pool_id, RaydiumTemplateRegistration { epoch });
+    }
+
+    fn template_epoch_ready(&self, pool: Pubkey, epoch: u64) -> bool {
+        self.registered_templates
+            .get(&pool)
+            .map(|entry| entry.epoch == epoch)
+            .unwrap_or(false)
     }
 
     fn log_state_cache_miss(&self, pool: Pubkey, slot: u64) {
@@ -728,14 +838,116 @@ impl RaydiumV3Adapter {
         );
 
         let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
-        let stage = if !state.meta_ready_for_slot(state.corecast_slot) {
+        let lag_slot_tolerance = self.config.hydration_slot_lag_tolerance;
+        let lag_ms_tolerance = self.config.hydration_lag_ms_tolerance;
+        let stage = if !state.meta_ready_within_lag(
+            state.corecast_slot,
+            lag_slot_tolerance,
+            lag_ms_tolerance,
+        ) {
+            self.record_hydration_lag_event(
+                state,
+                HydrationComponent::Meta,
+                "metrics_meta_pending",
+            );
             0
-        } else if !state.tick_arrays_ready_for_slot(state.corecast_slot, ttl) {
+        } else if !state.tick_arrays_ready_within_lag(
+            state.corecast_slot,
+            ttl,
+            lag_slot_tolerance,
+            lag_ms_tolerance,
+        ) {
+            self.record_hydration_lag_event(
+                state,
+                HydrationComponent::TickArrays,
+                "metrics_tick_pending",
+            );
             1
         } else {
             2
         };
         telemetry::record_hydration_stage(adapter, &state.pool_id.to_string(), stage);
+    }
+
+    fn record_hydration_lag_event(
+        &self,
+        state: &RaydiumV3State,
+        component: HydrationComponent,
+        context: &'static str,
+    ) {
+        let (lag_slots, lag_ms) = self.component_lag(state, component);
+        telemetry::record_hydration_component_pending(
+            self.name(),
+            component.as_str(),
+            lag_ms,
+            lag_slots,
+        );
+        if self.should_log_component_lag(state.pool_id, component, lag_slots, lag_ms) {
+            let hydrated_slot = match component {
+                HydrationComponent::Meta => state.hydrated_meta_slot,
+                HydrationComponent::TickArrays => state.hydrated_tick_arrays_slot,
+                _ => None,
+            };
+            warn!(
+                target = "adapter::raydium_v3",
+                pool = %state.pool_id,
+                component = component.as_str(),
+                context,
+                corecast_slot = state.corecast_slot,
+                hydrated_slot,
+                lag_slots,
+                lag_ms,
+                "raydium hydration lag exceeds tolerance"
+            );
+        }
+    }
+
+    fn component_lag(
+        &self,
+        state: &RaydiumV3State,
+        component: HydrationComponent,
+    ) -> (Option<u64>, Option<u64>) {
+        let lag_slots = match component {
+            HydrationComponent::Meta => state
+                .hydrated_meta_slot
+                .map(|slot| state.corecast_slot.saturating_sub(slot)),
+            HydrationComponent::TickArrays => state
+                .hydrated_tick_arrays_slot
+                .map(|slot| state.corecast_slot.saturating_sub(slot)),
+            _ => None,
+        };
+        let lag_ms = match component {
+            HydrationComponent::Meta => state.hydration_age_ms(),
+            HydrationComponent::TickArrays => state.tick_arrays_hydration_age_ms(),
+            _ => None,
+        };
+        (lag_slots, lag_ms)
+    }
+
+    fn should_log_component_lag(
+        &self,
+        pool: Pubkey,
+        component: HydrationComponent,
+        lag_slots: Option<u64>,
+        lag_ms: Option<u64>,
+    ) -> bool {
+        let slot_over = lag_slots
+            .map(|slots| slots > self.config.hydration_slot_lag_tolerance)
+            .unwrap_or(false);
+        let time_over = lag_ms
+            .map(|ms| ms > self.config.hydration_lag_ms_tolerance)
+            .unwrap_or(false);
+        let key = (pool, component.index() as u8);
+        if let Some(entry) = self.lag_log.get(&key) {
+            if entry.value().elapsed().as_millis() as u64 <= HYDRATION_LAG_LOG_INTERVAL_MS {
+                return false;
+            }
+        }
+        if !(slot_over || time_over) {
+            return false;
+        }
+        self.lag_log.insert(key, Instant::now());
+        true
     }
 
     fn decorate_quote_context(
@@ -804,6 +1016,130 @@ impl RaydiumV3Adapter {
                 context.whirlpool_tick_arrays = arrays;
             }
         }
+
+        self.attach_transfer_hook_accounts(state, context, input_mint, output_mint);
+    }
+
+    fn attach_transfer_hook_accounts(
+        &self,
+        state: &RaydiumV3State,
+        context: &mut TemplateContext,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+    ) {
+        let Some(resolver) = self.transfer_hook_resolver.as_ref() else {
+            return;
+        };
+
+        if let Some(accounts) = self.collect_transfer_hook_accounts(
+            resolver,
+            state,
+            context,
+            input_mint,
+            TransferHookFlow::Input,
+        ) {
+            context.remaining_accounts.extend(accounts);
+        }
+
+        if let Some(accounts) = self.collect_transfer_hook_accounts(
+            resolver,
+            state,
+            context,
+            output_mint,
+            TransferHookFlow::Output,
+        ) {
+            context.remaining_accounts.extend(accounts);
+        }
+    }
+
+    fn collect_transfer_hook_accounts(
+        &self,
+        resolver: &TransferHookAccountsResolver,
+        state: &RaydiumV3State,
+        context: &TemplateContext,
+        mint: Pubkey,
+        flow: TransferHookFlow,
+    ) -> Option<Vec<AccountMeta>> {
+        let program_id = state.transfer_hook_program_for_mint(mint)
+            .or_else(|| self.transfer_hook_program(mint))?;
+        let hook_context =
+            self.transfer_hook_account_context(state, context, mint, flow)?;
+        resolver.resolve_accounts(program_id, mint, &[hook_context])
+    }
+
+    fn transfer_hook_account_context(
+        &self,
+        state: &RaydiumV3State,
+        context: &TemplateContext,
+        mint: Pubkey,
+        flow: TransferHookFlow,
+    ) -> Option<TransferHookAccountContext> {
+        match flow {
+            TransferHookFlow::Input => {
+                let source = context.input_token_account?;
+                let destination = self.pool_vault_address(state, mint)?;
+                let authority = context.payer?;
+                Some(TransferHookAccountContext {
+                    source,
+                    destination,
+                    authority,
+                })
+            }
+            TransferHookFlow::Output => {
+                let source = self.pool_vault_address(state, mint)?;
+                let destination = context.output_token_account?;
+                Some(TransferHookAccountContext {
+                    source,
+                    destination,
+                    authority: state.pool_id,
+                })
+            }
+        }
+    }
+
+    fn pool_vault_address(
+        &self,
+        state: &RaydiumV3State,
+        mint: Pubkey,
+    ) -> Option<Pubkey> {
+        if mint != state.base_mint && mint != state.quote_mint {
+            return None;
+        }
+        Some(derive_pool_vault_address(
+            &self.program_id,
+            &state.pool_id,
+            &mint,
+        ))
+    }
+
+    fn transfer_hook_program(&self, mint: Pubkey) -> Option<Pubkey> {
+        let cache = self.transfer_fee_cache.as_ref()?;
+        if cache.transfer_hook_program(mint).is_none() {
+            let _ = cache.hydrate(mint);
+        }
+        cache.transfer_hook_program(mint)
+    }
+
+    fn mint_metadata(&self, mint: Pubkey) -> Option<MintMetadata> {
+        self.mint_metadata_cache
+            .as_ref()
+            .and_then(|cache| cache.hydrate(mint))
+    }
+
+    fn attach_mint_metadata(&self, state: &mut RaydiumV3State) {
+        if let Some(meta) = self.mint_metadata(state.base_mint) {
+            if state.base_decimals.is_none() {
+                state.base_decimals = meta.decimals;
+            }
+            state.base_token_program = meta.program_id;
+        }
+
+        if let Some(meta) = self.mint_metadata(state.quote_mint) {
+            if state.quote_decimals.is_none() {
+                state.quote_decimals = meta.decimals;
+            }
+            state.quote_token_program = meta.program_id;
+        }
     }
 
     fn mint_program_for(&self, state: &RaydiumV3State, mint: Pubkey) -> Option<Pubkey> {
@@ -843,50 +1179,64 @@ impl RaydiumV3Adapter {
         }
     }
 
-    fn clamp_request_amount(&self, state: &RaydiumV3State, req: &QuoteRequest) -> u64 {
+    fn clamp_request_amount(
+        &self,
+        state: &RaydiumV3State,
+        req: &QuoteRequest,
+    ) -> Result<u64, QuoteStatus> {
         if req.amount == 0 {
-            return 0;
+            return Ok(0);
         }
         let reserve = if req.input_mint == state.base_mint {
             state.vault_base
         } else if req.input_mint == state.quote_mint {
             state.vault_quote
         } else {
-            return req.amount;
+            return Ok(req.amount);
         };
+        if reserve == 0 {
+            return Err(QuoteStatus::InsufficientLiquidity);
+        }
         let utilization_bps = self.config.max_swap_utilization_bps.min(10_000);
         let capped = reserve.saturating_mul(utilization_bps as u128) / 10_000;
         if capped == 0 {
-            return 0;
+            return Err(QuoteStatus::PriceImpactExceeded);
         }
         let limit = capped.min(u64::MAX as u128) as u64;
         if limit == 0 {
-            return 0;
+            return Err(QuoteStatus::PriceImpactExceeded);
         }
-        req.amount.min(limit)
+        Ok(req.amount.min(limit))
     }
 
-    fn clamp_request_output_amount(&self, state: &RaydiumV3State, req: &QuoteRequest) -> u64 {
+    fn clamp_request_output_amount(
+        &self,
+        state: &RaydiumV3State,
+        req: &QuoteRequest,
+    ) -> Result<u64, QuoteStatus> {
         if req.amount == 0 {
-            return 0;
+            return Ok(0);
         }
         let reserve = if req.output_mint == state.base_mint {
             state.vault_base
         } else if req.output_mint == state.quote_mint {
             state.vault_quote
         } else {
-            return 0;
+            return Ok(0);
         };
+        if reserve == 0 {
+            return Err(QuoteStatus::InsufficientLiquidity);
+        }
         let utilization_bps = self.config.max_swap_utilization_bps.min(10_000);
         let capped = reserve.saturating_mul(utilization_bps as u128) / 10_000;
         if capped == 0 {
-            return 0;
+            return Err(QuoteStatus::PriceImpactExceeded);
         }
         let limit = capped.min(u64::MAX as u128) as u64;
         if limit == 0 {
-            return 0;
+            return Err(QuoteStatus::PriceImpactExceeded);
         }
-        req.amount.min(limit)
+        Ok(req.amount.min(limit))
     }
 
     fn resolve_tick_arrays(
@@ -949,10 +1299,14 @@ impl RaydiumV3Adapter {
                 entry.tick_array_cache.zero_for_one.as_ref(),
                 ttl,
                 entry.corecast_slot,
+                self.config.hydration_slot_lag_tolerance,
+                self.config.hydration_lag_ms_tolerance,
             ) && Self::tick_cache_entry_ready(
                 entry.tick_array_cache.one_for_zero.as_ref(),
                 ttl,
                 entry.corecast_slot,
+                self.config.hydration_slot_lag_tolerance,
+                self.config.hydration_lag_ms_tolerance,
             ) {
                 let zero_slot = entry
                     .tick_array_cache
@@ -1031,7 +1385,7 @@ impl RaydiumV3Adapter {
             math::sqrt_price_at_tick_x96(sqrt_limit_tick).ok_or(QuoteStatus::MissingState)?;
 
         let mut cursor = TickArrayCursor::new(hydrator, state.pool_id, tick_spacing)
-            .ok_or(QuoteStatus::MissingTickArrays)?;
+            .ok_or(QuoteStatus::HydrationPending)?;
         let mut amount_remaining = swap_budget as u128;
         let mut pool_input_consumed = 0u128;
         let mut trade_fee_total = 0u128;
@@ -1073,7 +1427,7 @@ impl RaydiumV3Adapter {
                 fee_bps,
                 zero_for_one,
             )
-            .ok_or(QuoteStatus::MissingTickArrays)?;
+            .ok_or(QuoteStatus::HydrationPending)?;
 
             if step.amount_in == 0 {
                 break;
@@ -1172,7 +1526,7 @@ impl RaydiumV3Adapter {
             direction: SwapDirection::ExactIn,
         };
 
-        let max_input = self.clamp_request_amount(state, &trial_req);
+        let max_input = self.clamp_request_amount(state, &trial_req)?;
         if max_input == 0 {
             return Err(QuoteStatus::InsufficientLiquidity);
         }
@@ -1243,7 +1597,24 @@ impl RaydiumV3Adapter {
         };
 
         let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
-        if !state.meta_ready_for_slot(slot) || !state.tick_arrays_ready_for_slot(slot, ttl) {
+        let lag_slot_tolerance = self.config.hydration_slot_lag_tolerance;
+        let lag_ms_tolerance = self.config.hydration_lag_ms_tolerance;
+        let meta_ready = state.meta_ready_within_lag(slot, lag_slot_tolerance, lag_ms_tolerance);
+        let ticks_ready = state.tick_arrays_ready_within_lag(
+            slot,
+            ttl,
+            lag_slot_tolerance,
+            lag_ms_tolerance,
+        );
+        if !(meta_ready && ticks_ready) {
+            if !meta_ready {
+                telemetry::record_hydration_readiness_failure(self.name(), "snapshot_meta_pending");
+                self.eager_hydration(state.pool_id, Some(state.base_mint), Some(state.quote_mint));
+            }
+            if !ticks_ready {
+                telemetry::record_hydration_readiness_failure(self.name(), "snapshot_tick_pending");
+                self.request_tick_arrays(state);
+            }
             self.record_snapshot_issue(
                 state,
                 slot,
@@ -1478,7 +1849,9 @@ impl ProtocolAdapter for RaydiumV3Adapter {
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
-        if state.meta_ready_for_slot(snapshot.slot) {
+        let lag_slot_tolerance = self.config.hydration_slot_lag_tolerance;
+        let lag_ms_tolerance = self.config.hydration_lag_ms_tolerance;
+        if state.meta_ready_within_lag(snapshot.slot, lag_slot_tolerance, lag_ms_tolerance) {
             if let Some(slot) = state.hydrated_meta_slot {
                 snapshot
                     .hydration
@@ -1486,7 +1859,12 @@ impl ProtocolAdapter for RaydiumV3Adapter {
             }
         }
         let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
-        if state.tick_arrays_ready_for_slot(snapshot.slot, ttl) {
+        if state.tick_arrays_ready_within_lag(
+            snapshot.slot,
+            ttl,
+            lag_slot_tolerance,
+            lag_ms_tolerance,
+        ) {
             if let Some(slot) = state.hydrated_tick_arrays_slot {
                 snapshot
                     .hydration
@@ -1513,6 +1891,30 @@ impl ProtocolAdapter for RaydiumV3Adapter {
         }
     }
 
+    fn refresh_templates(&self, epoch: u64) {
+        if self.template_builder.is_none() {
+            return;
+        }
+        let states: Vec<RaydiumV3State> = self.state.iter().map(|entry| entry.clone()).collect();
+        for state in states {
+            self.ensure_templates_for_epoch(&state, Some(epoch), "cache epoch refresh", false);
+        }
+    }
+
+    fn refresh_pool_templates(&self, pool: Pubkey, epoch: u64) {
+        if self.template_builder.is_none() {
+            return;
+        }
+        if let Some(state) = self.get_state(&pool) {
+            self.ensure_templates_for_epoch(
+                &state,
+                Some(epoch),
+                "template readiness refresh",
+                true,
+            );
+        }
+    }
+
     fn quote_exact_in(&self, mut req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
@@ -1529,15 +1931,41 @@ impl ProtocolAdapter for RaydiumV3Adapter {
             return Some(response);
         }
         let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
-        if !state.meta_ready_for_slot(req.slot) || !state.tick_arrays_ready_for_slot(req.slot, ttl) {
+        let lag_slot_tolerance = self.config.hydration_slot_lag_tolerance;
+        let lag_ms_tolerance = self.config.hydration_lag_ms_tolerance;
+        let meta_ready =
+            state.meta_ready_within_lag(req.slot, lag_slot_tolerance, lag_ms_tolerance);
+        let ticks_ready = state.tick_arrays_ready_within_lag(
+            req.slot,
+            ttl,
+            lag_slot_tolerance,
+            lag_ms_tolerance,
+        );
+        if !(meta_ready && ticks_ready) {
+            if !meta_ready {
+                telemetry::record_hydration_readiness_failure(self.name(), "quote_meta_pending");
+                self.eager_hydration(state.pool_id, Some(state.base_mint), Some(state.quote_mint));
+            }
+            if !ticks_ready {
+                telemetry::record_hydration_readiness_failure(self.name(), "quote_tick_pending");
+                self.request_tick_arrays(&state);
+            }
             let mut response = build_quote_response(req, 0);
             response.status = QuoteStatus::HydrationPending;
             return Some(response);
         }
-        req.amount = self.clamp_request_amount(&state, &req);
-        if req.amount == 0 {
+        let clamped_input = match self.clamp_request_amount(&state, &req) {
+            Ok(value) => value,
+            Err(status) => {
+                let mut response = build_quote_response(req, 0);
+                response.status = status;
+                return Some(response);
+            }
+        };
+        if clamped_input == 0 {
             return None;
         }
+        req.amount = clamped_input;
         let simulation = match self.quote_amount_out(&state, &req) {
             Ok(sim) => sim,
             Err(status) => {
@@ -1582,16 +2010,43 @@ impl ProtocolAdapter for RaydiumV3Adapter {
             return Some(response);
         }
         let ttl = Duration::from_millis(self.config.tick_array_cache_ttl_ms.max(1));
-        if !state.meta_ready_for_slot(req.slot) || !state.tick_arrays_ready_for_slot(req.slot, ttl) {
+        let lag_slot_tolerance = self.config.hydration_slot_lag_tolerance;
+        let lag_ms_tolerance = self.config.hydration_lag_ms_tolerance;
+        let meta_ready =
+            state.meta_ready_within_lag(req.slot, lag_slot_tolerance, lag_ms_tolerance);
+        let ticks_ready = state.tick_arrays_ready_within_lag(
+            req.slot,
+            ttl,
+            lag_slot_tolerance,
+            lag_ms_tolerance,
+        );
+        if !(meta_ready && ticks_ready) {
+            if !meta_ready {
+                telemetry::record_hydration_readiness_failure(self.name(), "quote_meta_pending");
+                self.eager_hydration(state.pool_id, Some(state.base_mint), Some(state.quote_mint));
+            }
+            if !ticks_ready {
+                telemetry::record_hydration_readiness_failure(self.name(), "quote_tick_pending");
+                self.request_tick_arrays(&state);
+            }
             let mut response = build_quote_response(req, 0);
             response.status = QuoteStatus::HydrationPending;
             return Some(response);
         }
 
-        req.amount = self.clamp_request_output_amount(&state, &req);
-        if req.amount == 0 {
+        let clamped_output = match self.clamp_request_output_amount(&state, &req) {
+            Ok(value) => value,
+            Err(status) => {
+                let mut response = build_quote_response(req, 0);
+                response.status = status;
+                return Some(response);
+            }
+        };
+        if clamped_output == 0 {
             return None;
         }
+
+        req.amount = clamped_output;
 
         let simulation = match self.quote_amount_out_exact_out(&state, &req) {
             Ok(sim) => sim,
@@ -1693,6 +2148,8 @@ pub struct RaydiumV3State {
     pub quote_mint: Pubkey,
     pub base_token_program: Pubkey,
     pub quote_token_program: Pubkey,
+    pub base_decimals: Option<u8>,
+    pub quote_decimals: Option<u8>,
     pub amm_config: Option<Pubkey>,
     pub observation_state: Option<Pubkey>,
     pub tick_spacing: Option<i32>,
@@ -1714,7 +2171,10 @@ pub struct RaydiumV3State {
     pub pool_status: Option<u8>,
     pub base_transfer_fee: Option<TransferFeeConfigSummary>,
     pub quote_transfer_fee: Option<TransferFeeConfigSummary>,
+    pub base_transfer_hook_program: Option<Pubkey>,
+    pub quote_transfer_hook_program: Option<Pubkey>,
     pub hydrated_meta_slot: Option<u64>,
+    pub last_hydrated_at: Option<Instant>,
     pub hydrated_tick_arrays_slot: Option<u64>,
     tick_array_cache: TickArrayCache,
 }
@@ -1727,31 +2187,92 @@ impl RaydiumV3State {
         Some(self.vault_quote as f64 / self.vault_base as f64)
     }
 
-    pub fn meta_ready_for_slot(&self, slot: u64) -> bool {
-        self.hydrated_meta_slot
-            .map(|value| value >= slot)
+    pub fn meta_ready_within_lag(
+        &self,
+        slot: u64,
+        lag_slot_tolerance: u64,
+        lag_ms_tolerance: u64,
+    ) -> bool {
+        if !RaydiumV3Adapter::meta_ready(self) {
+            return false;
+        }
+        if Self::hydration_slot_ready(self.hydrated_meta_slot, slot, lag_slot_tolerance) {
+            return true;
+        }
+        if lag_ms_tolerance == 0 {
+            return false;
+        }
+        self.hydration_age_ms()
+            .map(|age| age <= lag_ms_tolerance)
             .unwrap_or(false)
-            && RaydiumV3Adapter::meta_ready(self)
     }
 
-    pub fn tick_arrays_ready_for_slot(
+    pub fn tick_arrays_ready_within_lag(
         &self,
         slot: u64,
         ttl: Duration,
+        slot_lag_tolerance: u64,
+        lag_ms_tolerance: u64,
     ) -> bool {
-        self.hydrated_tick_arrays_slot
-            .map(|value| value >= slot)
+        let zero_ready = RaydiumV3Adapter::tick_cache_entry_ready(
+            self.tick_array_cache.zero_for_one.as_ref(),
+            ttl,
+            slot,
+            slot_lag_tolerance,
+            lag_ms_tolerance,
+        );
+        let one_ready = RaydiumV3Adapter::tick_cache_entry_ready(
+            self.tick_array_cache.one_for_zero.as_ref(),
+            ttl,
+            slot,
+            slot_lag_tolerance,
+            lag_ms_tolerance,
+        );
+        if !(zero_ready && one_ready) {
+            return false;
+        }
+
+        if Self::hydration_slot_ready(
+            self.hydrated_tick_arrays_slot,
+            slot,
+            slot_lag_tolerance,
+        ) {
+            return true;
+        }
+
+        if lag_ms_tolerance == 0 {
+            return false;
+        }
+
+        self.tick_arrays_hydration_age_ms()
+            .map(|age| age <= lag_ms_tolerance)
             .unwrap_or(false)
-            && RaydiumV3Adapter::tick_cache_entry_ready(
-                self.tick_array_cache.zero_for_one.as_ref(),
-                ttl,
-                slot,
-            )
-            && RaydiumV3Adapter::tick_cache_entry_ready(
-                self.tick_array_cache.one_for_zero.as_ref(),
-                ttl,
-                slot,
-            )
+    }
+
+    pub fn tick_arrays_hydration_age_ms(&self) -> Option<u64> {
+        let zero_age = self
+            .tick_array_cache
+            .zero_for_one
+            .as_ref()
+            .map(|entry| entry.hydrated_at.elapsed().as_millis() as u64)?;
+        let one_age = self
+            .tick_array_cache
+            .one_for_zero
+            .as_ref()
+            .map(|entry| entry.hydrated_at.elapsed().as_millis() as u64)?;
+        Some(zero_age.max(one_age))
+    }
+
+    fn hydration_slot_ready(slot: Option<u64>, target: u64, lag_tolerance: u64) -> bool {
+        slot.map(|value| {
+            value >= target || target.saturating_sub(value) <= lag_tolerance
+        })
+        .unwrap_or(false)
+    }
+
+    pub fn hydration_age_ms(&self) -> Option<u64> {
+        self.last_hydrated_at
+            .map(|instant| instant.elapsed().as_millis() as u64)
     }
 
     pub fn is_disabled(&self) -> bool {
@@ -1767,6 +2288,16 @@ impl RaydiumV3State {
         let instant_fresh =
             self.last_update_at.elapsed().as_millis() as u64 <= config.stale_after_ms;
         !(slot_fresh && instant_fresh)
+    }
+
+    fn transfer_hook_program_for_mint(&self, mint: Pubkey) -> Option<Pubkey> {
+        if mint == self.base_mint {
+            self.base_transfer_hook_program
+        } else if mint == self.quote_mint {
+            self.quote_transfer_hook_program
+        } else {
+            None
+        }
     }
 }
 
@@ -1937,6 +2468,12 @@ fn classify_swap_direction(
     } else {
         None
     }
+}
+
+#[derive(Clone, Copy)]
+enum TransferHookFlow {
+    Input,
+    Output,
 }
 
 fn apply_liquidity_delta(liquidity: u128, liquidity_net: i128, zero_for_one: bool) -> Option<u128> {
@@ -2205,6 +2742,12 @@ impl RaydiumPoolHydrator {
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
         self.pool_cache.get_or_schedule(pool)
+    }
+
+    fn meta_hydrated_at(&self, pool: Pubkey) -> Option<Instant> {
+        self.pool_cache
+            .cached_entry(&pool)
+            .map(|entry| entry.fetched_at)
     }
 
     fn refresh_pool_meta(&self, pool: Pubkey) {
@@ -3229,8 +3772,7 @@ mod tests {
         let recent_epoch: u64 = 99;
         data[cursor..cursor + 8].copy_from_slice(&recent_epoch.to_le_bytes());
 
-        let array =
-            parse_tick_array_account(address, &data, 0).expect("tick array should parse");
+        let array = parse_tick_array_account(address, &data, 0).expect("tick array should parse");
         assert_eq!(array.address, address);
         assert_eq!(array.pool_id, pool);
         assert_eq!(array.start_tick_index, start_tick_index);

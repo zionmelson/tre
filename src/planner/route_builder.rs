@@ -18,7 +18,6 @@ pub struct RouteBuilder {
     builder: BuilderHandle,
     pool_store: PoolStoreView,
     freshness_budget: Duration,
-    require_alt_ready: bool,
 }
 
 pub struct RouteBuildResult {
@@ -32,13 +31,11 @@ impl RouteBuilder {
         builder: BuilderHandle,
         pool_store: PoolStoreView,
         freshness_budget: Duration,
-        require_alt_ready: bool,
     ) -> Self {
         Self {
             builder,
             pool_store,
             freshness_budget,
-            require_alt_ready,
         }
     }
 
@@ -69,9 +66,6 @@ impl RouteBuilder {
                 .builder
                 .template_readiness(&pool_key, template_direction);
             if !readiness.template_ready {
-                return None;
-            }
-            if self.require_alt_ready && !readiness.alt_ready {
                 return None;
             }
 
@@ -123,7 +117,6 @@ impl RouteBuilder {
                 .map(|side| side.context.clone())
                 .unwrap_or_else(TemplateContext::default);
             context.template_ready = readiness.template_ready;
-            context.alt_ready = readiness.alt_ready;
             if let Some(side) = quote_side {
                 if let (Some(fee), notional) = (context.expected_fee_amount, side.notional) {
                     let scaled = scale_partial_fill_remaining(fee, current_amount, notional);
@@ -160,7 +153,6 @@ impl RouteBuilder {
                 price_impact_limit_bps,
                 context,
                 template_ready: readiness.template_ready,
-                alt_ready: readiness.alt_ready,
             });
             current_amount = estimated_output;
         }

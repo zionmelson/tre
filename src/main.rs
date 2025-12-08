@@ -13,7 +13,13 @@ use solana_sdk::hash::Hash;
 use solana_sdk::message::{v0::Message as V0Message, Message, VersionedMessage};
 use solana_sdk::signature::{read_keypair_file, Keypair, Signer};
 use solana_sdk::transaction::VersionedTransaction;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{
+    filter::filter_fn,
+    fmt,
+    layer::{Layer, SubscriberExt},
+    util::SubscriberInitExt,
+    EnvFilter,
+};
 use tre_arb_bot::{config::AppConfig, runtime, telemetry};
 
 #[derive(Parser, Debug)]
@@ -97,10 +103,17 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn,tre-arb-bot=info,stage0=info,corecast=info"));
 
-    fmt()
-        .with_env_filter(filter)
+    let fmt_layer = fmt::layer()
         .with_target(false)
         .compact()
+        .with_filter(filter_fn(|metadata| {
+            let target = metadata.target();
+            !(target.starts_with("h2::proto") || target.starts_with("hyper::proto::h2"))
+        }));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
         .init();
 }
 

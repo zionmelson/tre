@@ -522,6 +522,7 @@ mod tests {
             estimated_edge_bps: edge_bps,
             created_at: Instant::now() - age,
             route_plan: Some(sample_route_plan()),
+            readiness: None,
         }
     }
 
@@ -549,7 +550,6 @@ mod tests {
                 price_impact_limit_bps: None,
                 context: TemplateContext::default(),
                 template_ready: false,
-                alt_ready: false,
             }],
             estimated_final_output_amount: Some(TEST_INPUT_LAMPORTS + TEST_PROFIT_LAMPORTS),
             flash_loan_permitted: true,

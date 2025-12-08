@@ -166,6 +166,18 @@ impl AppConfig {
             .and_then(|entry| entry.tick_array_backoff_ms)
     }
 
+    pub fn protocol_hydration_slot_lag_tolerance(&self, protocol: &str) -> Option<u64> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.hydration_slot_lag_tolerance)
+    }
+
+    pub fn protocol_hydration_lag_ms_tolerance(&self, protocol: &str) -> Option<u64> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.hydration_lag_ms_tolerance)
+    }
+
     pub fn protocol_max_pool_failures(&self, protocol: &str) -> Option<u32> {
         self.protocols
             .get(protocol)
@@ -182,6 +194,12 @@ impl AppConfig {
         self.protocols
             .get(protocol)
             .and_then(|entry| entry.prefer_exact_out_quotes)
+    }
+
+    pub fn protocol_oracle_hydration_enabled(&self, protocol: &str) -> Option<bool> {
+        self.protocols
+            .get(protocol)
+            .and_then(|entry| entry.oracle_hydration_enabled)
     }
 
     pub fn protocol_borrow_pct(&self, protocol: &str) -> f64 {
@@ -233,6 +251,30 @@ impl AppConfig {
         ensure!(
             self.corecast.cache.warm_capacity <= self.corecast.cache.channel_capacity,
             "corecast.cache.warm_capacity must be less than or equal to channel_capacity"
+        );
+        ensure!(
+            self.corecast.timeouts.http_request_timeout_ms > 0,
+            "corecast.timeouts.http_request_timeout_ms must be greater than zero"
+        );
+        ensure!(
+            self.corecast.timeouts.http_connect_timeout_ms > 0,
+            "corecast.timeouts.http_connect_timeout_ms must be greater than zero"
+        );
+        ensure!(
+            self.corecast.timeouts.grpc_connect_timeout_ms > 0,
+            "corecast.timeouts.grpc_connect_timeout_ms must be greater than zero"
+        );
+        ensure!(
+            self.corecast.timeouts.channel_acquire_timeout_ms > 0,
+            "corecast.timeouts.channel_acquire_timeout_ms must be greater than zero"
+        );
+        ensure!(
+            self.corecast.timeouts.subscribe_timeout_ms > 0,
+            "corecast.timeouts.subscribe_timeout_ms must be greater than zero"
+        );
+        ensure!(
+            self.corecast.timeouts.stream_idle_timeout_ms > 0,
+            "corecast.timeouts.stream_idle_timeout_ms must be greater than zero"
         );
         ensure!(
             !self.flash_loans.is_empty(),
@@ -472,6 +514,8 @@ pub struct CoreCastConfig {
     pub authorization: String,
     #[serde(default)]
     pub cache: CoreCastCache,
+    #[serde(default)]
+    pub timeouts: CoreCastTimeouts,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -479,6 +523,30 @@ pub struct CoreCastConfig {
 pub struct CoreCastCache {
     pub warm_capacity: usize,
     pub channel_capacity: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CoreCastTimeouts {
+    pub http_request_timeout_ms: u64,
+    pub http_connect_timeout_ms: u64,
+    pub grpc_connect_timeout_ms: u64,
+    pub channel_acquire_timeout_ms: u64,
+    pub subscribe_timeout_ms: u64,
+    pub stream_idle_timeout_ms: u64,
+}
+
+impl Default for CoreCastTimeouts {
+    fn default() -> Self {
+        Self {
+            http_request_timeout_ms: 5_000,
+            http_connect_timeout_ms: 5_000,
+            grpc_connect_timeout_ms: 5_000,
+            channel_acquire_timeout_ms: 5_000,
+            subscribe_timeout_ms: 5_000,
+            stream_idle_timeout_ms: 15_000,
+        }
+    }
 }
 
 impl Default for CoreCastCache {
@@ -552,7 +620,7 @@ impl Default for WatcherConfig {
             max_tracked_pools: 256,
             min_ready_pools: 3,
             initial_ready_timeout_ms: 5_000,
-            pool_stale_ttl_ms: None,
+            pool_stale_ttl_ms: Some(1_000),
             pool_stale_slot_lag: None,
             pool_stale_sweep_ms: 250,
             queue_capacity: 1_024,
@@ -604,6 +672,10 @@ pub struct ProtocolConfig {
     #[serde(default)]
     pub tick_array_backoff_ms: Option<u64>,
     #[serde(default)]
+    pub hydration_slot_lag_tolerance: Option<u64>,
+    #[serde(default)]
+    pub hydration_lag_ms_tolerance: Option<u64>,
+    #[serde(default)]
     pub max_pool_failures: Option<u32>,
     #[serde(default)]
     pub max_tick_array_failures: Option<u32>,
@@ -613,6 +685,8 @@ pub struct ProtocolConfig {
     pub prefer_exact_out_quotes: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_pubkey")]
     pub required_partner: Option<Pubkey>,
+    #[serde(default)]
+    pub oracle_hydration_enabled: Option<bool>,
 }
 
 impl ProtocolConfig {
@@ -631,11 +705,14 @@ impl Default for ProtocolConfig {
             max_price_impact_bps: None,
             pool_failure_backoff_ms: None,
             tick_array_backoff_ms: None,
+            hydration_slot_lag_tolerance: None,
+            hydration_lag_ms_tolerance: None,
             max_pool_failures: None,
             max_tick_array_failures: None,
             borrow_pct: None,
             prefer_exact_out_quotes: None,
             required_partner: None,
+            oracle_hydration_enabled: None,
         }
     }
 }

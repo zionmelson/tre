@@ -8,7 +8,7 @@ use std::{
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use dashmap::{DashMap, DashSet};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::telemetry::{self, HydrationJobStatus};
 
@@ -129,14 +129,21 @@ where
                 return Some(entry.value().value.clone());
             }
         }
+        let max_age_ms = max_age.map(|ttl| ttl.as_millis() as u64);
+        debug!(
+            target = "hydration",
+            worker = self.name,
+            ?key,
+            min_slot,
+            max_age_ms,
+            "hydration cache miss; scheduling fetch"
+        );
         self.schedule(key);
         None
     }
 
     pub(crate) fn cached(&self, key: &K) -> Option<V> {
-        self.cache
-            .get(key)
-            .map(|entry| entry.value().value.clone())
+        self.cache.get(key).map(|entry| entry.value().value.clone())
     }
 
     pub(crate) fn cached_entry(&self, key: &K) -> Option<HydratedValue<V>> {
@@ -146,6 +153,12 @@ where
     pub(crate) fn invalidate(&self, key: &K) {
         self.cache.remove(key);
         self.pending.remove(key);
+        debug!(
+            target = "hydration",
+            worker = self.name,
+            ?key,
+            "hydration cache invalidated"
+        );
     }
 
     pub(crate) fn invalidate_if_stale(
@@ -158,6 +171,15 @@ where
             if !entry.value().is_fresh(min_slot, max_age) {
                 drop(entry);
                 self.invalidate(key);
+                let max_age_ms = max_age.map(|ttl| ttl.as_millis() as u64);
+                debug!(
+                    target = "hydration",
+                    worker = self.name,
+                    ?key,
+                    min_slot,
+                    max_age_ms,
+                    "hydration cache invalidated (stale)"
+                );
                 return true;
             }
         }
@@ -166,6 +188,12 @@ where
 
     pub(crate) fn refresh(&self, key: K) {
         self.invalidate(&key);
+        debug!(
+            target = "hydration",
+            worker = self.name,
+            ?key,
+            "hydration refresh requested"
+        );
         self.schedule(key);
     }
 
@@ -176,6 +204,12 @@ where
         match self.sender.try_send(key) {
             Ok(()) => {
                 telemetry::record_hydration_job_scheduled(self.name);
+                debug!(
+                    target = "hydration",
+                    worker = self.name,
+                    ?key,
+                    "hydration job enqueued"
+                );
             }
             Err(TrySendError::Full(_)) => {
                 self.pending.remove(&key);
@@ -232,9 +266,31 @@ where
                         backoff_delay = Some(failure_backoff_delay(consecutive_failures));
                     }
                     pending.remove(&key);
-                    telemetry::record_hydration_job_finished(name, status, job_start.elapsed());
+                    let elapsed = job_start.elapsed();
+                    telemetry::record_hydration_job_finished(name, status, elapsed);
+                    let status_label = match status {
+                        HydrationJobStatus::Success => "success",
+                        HydrationJobStatus::Failure => "failure",
+                    };
+                    debug!(
+                        target = "hydration",
+                        worker = name,
+                        ?key,
+                        status = status_label,
+                        latency_ms = elapsed.as_millis() as u64,
+                        consecutive_failures,
+                        "hydration job completed"
+                    );
                     if let Some(delay) = backoff_delay {
                         telemetry::record_hydration_job_backoff(name, delay);
+                        debug!(
+                            target = "hydration",
+                            worker = name,
+                            ?key,
+                            backoff_ms = delay.as_millis() as u64,
+                            consecutive_failures,
+                            "hydration worker backing off after failure"
+                        );
                         thread::sleep(delay);
                     }
                 }

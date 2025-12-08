@@ -37,6 +37,10 @@ This document is the single source of truth for our Raydium CLMM adapter. It tie
 
 Eviction happens whenever `slot` drift exceeds `config.stale_slot_threshold` or wall-clock age exceeds `config.stale_after_ms`.
 
+### Configuration knobs
+
+- `config.json -> protocols.raydium_v3.{hydration_slot_lag_tolerance, hydration_lag_ms_tolerance}` let operators widen or tighten the slot and wall-clock windows before the adapter considers a pool hydrated. Slot lag still governs when we refresh on-chain state, while the ms tolerance reuses the hydrator's `last_hydrated_at` timestamps so quotes/templates can proceed when RPC is briefly behind even though the existing meta is only a few seconds old.
+
 ## Pricing Architecture
 
 ### Simulation Path
@@ -80,7 +84,7 @@ The adapter now mirrors the Raydium TypeScript SDK (`@raydium-io/raydium-sdk`, `
 
 - `QuoteResponse.status` enumerations:
   - `Ok` – simulation succeeded.
-  - `MissingTickArrays` – hydrator could not fetch 3 arrays (quote will be XYK-based).
+  - `HydrationPending` – hydrator could not fetch contiguous tick arrays (quote will be XYK-based until arrays land).
   - `StaleState` – TTL eviction flagged the pool before quoting.
   - `InsufficientLiquidity` – `simulate_clmm_exact_in` exhausted liquidity before finishing.
   - `TokenFeeUnsupported` – raised when transfer-fee math produces zero executable budget (mirrors SDK guardrails).
