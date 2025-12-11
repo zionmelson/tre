@@ -1,11 +1,7 @@
-use std::str::FromStr;
 use std::time::Duration;
 
-use solana_sdk::pubkey::Pubkey;
-
-use crate::builder::{templates::SwapTemplateDirection, BuilderHandle};
-use crate::hydration::types::{PoolQuoteDirection, PoolQuoteSide, PoolSnapshot};
-use crate::hydration::PoolStoreView;
+use crate::corecast::PoolStoreView;
+use crate::watch::types::{PoolQuoteDirection, PoolQuoteSide, PoolSnapshot};
 use crate::planner::graph_manager::{PathLeg, PoolPath};
 use crate::planner::types::{RouteLegPlan, RoutePlan};
 use crate::template::TemplateContext;
@@ -15,7 +11,6 @@ const DEFAULT_LEG_SLIPPAGE_BPS: u64 = 50;
 
 #[derive(Clone)]
 pub struct RouteBuilder {
-    builder: BuilderHandle,
     pool_store: PoolStoreView,
     freshness_budget: Duration,
 }
@@ -27,13 +22,8 @@ pub struct RouteBuildResult {
 }
 
 impl RouteBuilder {
-    pub fn new(
-        builder: BuilderHandle,
-        pool_store: PoolStoreView,
-        freshness_budget: Duration,
-    ) -> Self {
+    pub fn new(pool_store: PoolStoreView, freshness_budget: Duration) -> Self {
         Self {
-            builder,
             pool_store,
             freshness_budget,
         }
@@ -57,17 +47,6 @@ impl RouteBuilder {
 
             let (direction, price, available_input_liquidity, quote_side) =
                 price_for_leg(&snapshot, leg)?;
-            let pool_key = Pubkey::from_str(&leg.pool_id).ok()?;
-            let template_direction = match direction {
-                PoolQuoteDirection::BaseToQuote => SwapTemplateDirection::BaseIn,
-                PoolQuoteDirection::QuoteToBase => SwapTemplateDirection::BaseOut,
-            };
-            let readiness = self
-                .builder
-                .template_readiness(&pool_key, template_direction);
-            if !readiness.template_ready {
-                return None;
-            }
 
             let mut estimated_output = ((current_amount as f64) * price).round() as u64;
             if estimated_output == 0 {
@@ -116,7 +95,6 @@ impl RouteBuilder {
             let mut context = quote_side
                 .map(|side| side.context.clone())
                 .unwrap_or_else(TemplateContext::default);
-            context.template_ready = readiness.template_ready;
             if let Some(side) = quote_side {
                 if let (Some(fee), notional) = (context.expected_fee_amount, side.notional) {
                     let scaled = scale_partial_fill_remaining(fee, current_amount, notional);
@@ -152,7 +130,6 @@ impl RouteBuilder {
                 limit_price,
                 price_impact_limit_bps,
                 context,
-                template_ready: readiness.template_ready,
             });
             current_amount = estimated_output;
         }

@@ -26,7 +26,7 @@ use solana_sdk::transaction::Transaction;
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
-use crate::hydration::template_cache::AltHandleId;
+use crate::builder::AltHandleId;
 
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const ALT_REGISTRY_PATH_ENV: &str = "TRE_ALT_REGISTRY";

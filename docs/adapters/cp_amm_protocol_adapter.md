@@ -19,7 +19,7 @@ Any upstream change in those files should be reflected here and in `docs/swaps/c
 
 1. Quote Meteora cp*amm pools with the same curve math (`ProcessSwapParams` → `process_swap*\*`) that on-chain `swap2` uses, including transfer-fee adjustments and referral splits.
 2. Produce deterministic `swap2` templates (covering `ExactIn`, `PartialFill`, `ExactOut`) so the fast execution lane never needs to re-derive account order or serialize `SwapParameters2`.
-3. Surface adapter-specific health signals (`RateLimited`, `HydrationPending`, `StaleState`) and structured telemetry so strategies know when to trust cp_amm quotes.
+3. Surface adapter-specific health signals (`RateLimited`, `MissingState`) and structured telemetry so strategies know when to trust cp_amm quotes.
 
 ## Data Inputs & Cached State
 
@@ -33,7 +33,7 @@ Any upstream change in those files should be reflected here and in `docs/swaps/c
 | Token program IDs (SPL vs Token-2022) | Builder hint, metadata fallback, then RPC            | Matches Anchor `InterfaceAccount` requirements in `ix_swap.rs`. |
 | Referral ATA                          | CoreCast metadata or config override                 | Optional account in `SwapCtx`.                                  |
 
-`CpAmmState` stores mutable balances + fee params along with a static `PoolMeta` bundle (pool authority `HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC`, vault/mint pubkeys, referral ATA). When metadata is missing we hydrate decimals + owner program directly from mint accounts, then store them on the state so every subsequent quote has the same inputs the Meteora SDK would have pulled. The cache is backed by a `DashMap<Pubkey, CpAmmState>`; eviction is based on `config.stale_slot_threshold` and `config.stale_after_ms`.
+`CpAmmState` stores mutable balances + fee params along with a static `PoolMeta` bundle (pool authority `HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC`, vault/mint pubkeys, referral ATA). When metadata is missing we hydrate decimals + owner program directly from mint accounts, then store them on the state so every subsequent quote has the same inputs the Meteora SDK would have pulled. The cache is backed by a `DashMap<Pubkey, CpAmmState>` and now latches once populated; we only invalidate entries when hydration detects structural changes or corrupted data, so slot drift alone never ejects a pool.
 
 ## Instruction Semantics (`swap2`)
 
@@ -108,9 +108,9 @@ If you change how the SDK derives mint/program metadata, update `CpAmmAdapter::d
 
 - `QuoteResponse::status` values:
   - `Ok` – simulation succeeded and template assembled.
-  - `StaleState` – state older than TTL.
-  - `HydrationPending` – prerequisite metadata or accounts are still being hydrated (includes referral ATA discovery and partner enforcement).
+  - `MissingState` – prerequisite metadata or accounts are still missing (includes referral ATA discovery and partner enforcement); quotes request hydration in the background but still return a terminal status.
   - `InsufficientLiquidity` – simulator detected vault shortfall or amp math failure.
+  - `TradingDisabled` – pool-level access validator blocked swaps (mirrors on-chain `PoolError::PoolDisabled`).
   - `RateLimited` – recent swap failure logged with `PoolError::FailToValidateSingleSwapInstruction` or limiter triggered.
 - Emit tracing fields: `pool`, `slot`, `swap_mode`, `amount_in/out`, `fee_mode`, `referral_fee`, `rate_limiter_applied`.
 - Count XYK fallback events separately (should never happen if hydration is healthy since cp_amm math is simple enough to keep in-process).
@@ -126,7 +126,7 @@ If you change how the SDK derives mint/program metadata, update `CpAmmAdapter::d
 ## Known Gaps / TODOs
 
 - Persist rate-limiter cooldown timing in state so strategies can skip pools for a few slots after a limiter trip.
-- Improve referral ATA discovery (maybe query Meteora’s registry) to avoid repetitive `HydrationPending` statuses tied to referral checks.
+- Improve referral ATA discovery (maybe query Meteora’s registry) to avoid repetitive `MissingState` statuses tied to referral checks.
 - Add end-to-end tests that run `swap_partial_fill` to verify `amount_left` arithmetic under real Token-2022 fee schedules.
 - Backfill block-time data for historical CoreCast snapshots so activation gating stays accurate even when the upstream feed omits timestamps.
 

@@ -1,21 +1,18 @@
+mod alt_manager;
 mod blockhash;
 mod bundle_builder;
+mod flash_loan;
 mod mev_guard;
+mod template_cache;
 mod template_loader;
 pub mod templates;
 mod tx_graph;
 
-use std::{
-    collections::HashMap,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 
 use crate::config::AppConfig;
-use crate::hydration::readiness::ReadinessRegistry;
 use blockhash::BlockhashCache;
 use solana_sdk::hash::Hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -23,21 +20,19 @@ use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Keypair, Signer};
 use solana_sdk::transaction::VersionedTransaction;
-use tracing::{debug, warn};
+use tracing::warn;
 
-pub use crate::hydration::alt_manager::AltManager;
-pub use crate::hydration::flash_loan::{
+pub use alt_manager::AltManager;
+pub use flash_loan::{
     compute_flash_loan_fee, FlashLoanPlanner, FlashLoanRoutePlan, FLASH_LOAN_BPS_DENOMINATOR,
     SOLEND_FLASH_LOAN_FEE_BPS,
 };
-pub use crate::hydration::template_cache::{
+pub use template_cache::{
     AltHandleId, AmmV3Field, AmmV3FieldLayout, AmmV3PoolAccounts, AmmV3TemplateParams, CpAmmField,
     CpAmmFieldLayout, CpAmmTemplateParams, InstructionTemplate, LbClmmField, LbClmmFieldLayout,
-    LbClmmTemplateParams, TemplateCache, TemplateCacheKey, TemplateCacheStats, TemplateFieldKind,
-    TemplateMetadata, TemplatePatch, TemplateSlice, WhirlpoolField, WhirlpoolFieldLayout,
-    WhirlpoolTemplateParams,
+    LbClmmTemplateParams, TemplateCache, TemplateCacheKey, TemplateFieldKind, TemplateMetadata,
+    TemplatePatch, TemplateSlice, WhirlpoolField, WhirlpoolFieldLayout, WhirlpoolTemplateParams,
 };
-pub use crate::hydration::TemplateReadiness;
 pub use bundle_builder::{BundleBuildContext, BundleInstructionPlan, BundleLookupTablePlan};
 pub use mev_guard::MevGuard;
 pub use tx_graph::TxGraph;
@@ -45,26 +40,11 @@ pub use tx_graph::TxGraph;
 #[derive(Clone)]
 pub struct BuilderHandle(Arc<BuilderContext>);
 
-const TEMPLATE_FRESHNESS_TTL: Duration = Duration::from_millis(40);
 const LEGACY_COMPUTE_UNIT_LIMIT: u32 = 200_000;
 
 impl BuilderHandle {
     pub fn new(config: Arc<AppConfig>) -> Result<Self> {
-        Self::new_with_option(config, None)
-    }
-
-    pub fn new_with_readiness(
-        config: Arc<AppConfig>,
-        readiness: ReadinessRegistry,
-    ) -> Result<Self> {
-        Self::new_with_option(config, Some(readiness))
-    }
-
-    fn new_with_option(
-        config: Arc<AppConfig>,
-        readiness: Option<ReadinessRegistry>,
-    ) -> Result<Self> {
-        Ok(Self(Arc::new(BuilderContext::new(config, readiness)?)))
+        Ok(Self(Arc::new(BuilderContext::new(config)?)))
     }
 
     pub fn template_cache(&self) -> &TemplateCache {
@@ -145,7 +125,7 @@ impl BuilderHandle {
     ) -> Result<Option<BundleLookupTablePlan>> {
         let pool = Pubkey::from_str(&plan.pool_id)
             .with_context(|| format!("invalid pool id {}", plan.pool_id))?;
-        let key = TemplateCacheKey::new(pool, plan.direction);
+        let key = TemplateCacheKey::new(pool, plan.direction, plan.template_hash);
         let template = self.0.template_cache.get(&key).with_context(|| {
             format!(
                 "missing template for pool {} direction {:?}",
@@ -213,25 +193,6 @@ impl BuilderHandle {
         }
     }
 
-    pub fn template_readiness(
-        &self,
-        pool: &Pubkey,
-        direction: templates::SwapTemplateDirection,
-    ) -> TemplateReadiness {
-        let key = TemplateCacheKey::new(*pool, direction);
-        if let Some(template) = self.0.template_cache.get(&key) {
-            let now = Instant::now();
-            let template_deadline = template.fresh_until(TEMPLATE_FRESHNESS_TTL);
-            let template_ready = template.is_hydrated() && now <= template_deadline;
-            TemplateReadiness {
-                template_ready,
-                template_fresh_until: Some(template_deadline),
-            }
-        } else {
-            TemplateReadiness::missing()
-        }
-    }
-
     pub fn register_amm_v3_pool(&self, meta: AmmV3PoolMeta) {
         if let Err(err) = template_loader::register_amm_v3_pool(&self.0.template_cache, &meta) {
             warn!(error = ?err, pool = %meta.pool_id, fee_bps = meta.fee_tier_bps, "failed to register amm_v3 templates");
@@ -256,16 +217,7 @@ impl BuilderHandle {
         }
     }
 
-    pub fn reset_template_cache(&self) -> u64 {
-        let epoch = self.0.template_cache.clear();
-        template_loader::populate_static_templates(&self.0.template_cache, self.0.config.as_ref());
-        debug!(
-            target = "builder",
-            epoch, "template cache reset; static templates reloaded"
-        );
-        epoch
     }
-}
 
 fn lookup_table_required(
     plan: &bundle_builder::BundleInstructionPlan,
@@ -301,16 +253,11 @@ struct BuilderContext {
     auth_pubkey: Pubkey,
     token_atas: HashMap<Pubkey, Pubkey>,
     host_fee_accounts: HashMap<Pubkey, Pubkey>,
-    config: Arc<AppConfig>,
 }
 
 impl BuilderContext {
-    fn new(config: Arc<AppConfig>, readiness: Option<ReadinessRegistry>) -> Result<Self> {
-        let template_cache = if let Some(registry) = readiness.clone() {
-            TemplateCache::with_readiness(config.clone(), registry)
-        } else {
-            TemplateCache::new(config.clone())
-        };
+    fn new(config: Arc<AppConfig>) -> Result<Self> {
+        let template_cache = TemplateCache::new(config.clone());
         template_loader::populate_static_templates(&template_cache, config.as_ref());
 
         let payer_path = config.wallets.payer.path.clone();
@@ -360,7 +307,6 @@ impl BuilderContext {
             auth,
             token_atas,
             host_fee_accounts,
-            config,
         })
     }
 }

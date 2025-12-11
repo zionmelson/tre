@@ -9,14 +9,12 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, TryRecvError};
 use tracing::trace;
 
-use crate::builder::BuilderHandle;
 use crate::core::pin_current_thread;
-use crate::hydration::types::PoolSnapshot;
-use crate::hydration::{PoolStateEvent, PoolStateUpdate, PoolStoreView};
+use crate::corecast::{PoolStateEvent, PoolStateUpdate, PoolStoreView};
+use crate::watch::types::PoolSnapshot;
 use crate::planner::graph_manager::{ArbitrageOpportunity, GraphManager, PoolPath};
 use crate::planner::route_builder::RouteBuilder;
 use crate::planner::PlannerConfig;
-use crate::telemetry;
 
 #[derive(Clone)]
 pub struct GraphHandle {
@@ -32,8 +30,8 @@ struct GraphState {
 }
 
 impl GraphState {
-    fn new(pool_store: PoolStoreView, builder: BuilderHandle, config: PlannerConfig) -> Self {
-        let route_builder = RouteBuilder::new(builder, pool_store.clone(), config.freshness_budget);
+    fn new(pool_store: PoolStoreView, config: PlannerConfig) -> Self {
+        let route_builder = RouteBuilder::new(pool_store.clone(), config.freshness_budget);
         Self {
             pool_store,
             graph: RwLock::new(GraphManager::new()),
@@ -79,9 +77,6 @@ impl GraphWorker {
 impl GraphState {
     fn apply_snapshot(&self, snapshot: PoolSnapshot) {
         let pool_id = snapshot.pool_id.clone();
-        let latency = snapshot.updated_at.elapsed();
-        telemetry::record_graph_pool_count(self.pool_store.len());
-        telemetry::record_graph_snapshot_latency(latency);
         let cycles = if let Ok(mut graph) = self.graph.write() {
             graph.index_pool(&snapshot);
             graph.latest_profitable_cycles().to_vec()
@@ -100,7 +95,6 @@ impl GraphState {
             Vec::new()
         };
         self.refresh_routes(cycles);
-        telemetry::record_graph_pool_count(self.pool_store.len());
         trace!(target = "graph", pool = %pool_id, "pool snapshot removed");
     }
 
@@ -135,7 +129,6 @@ impl GraphState {
                 planned.push(cycle);
             }
         }
-        telemetry::record_graph_cycle_count(planned.len());
         if let Ok(mut guard) = self.routes.write() {
             *guard = planned;
         }
@@ -197,10 +190,9 @@ pub fn spawn_graph_service(
     core_id: Option<usize>,
     updates: Receiver<PoolStateUpdate>,
     pool_store: PoolStoreView,
-    builder: BuilderHandle,
     planner_config: PlannerConfig,
 ) -> Result<(GraphHandle, thread::JoinHandle<Result<()>>)> {
-    let state = Arc::new(GraphState::new(pool_store, builder, planner_config));
+    let state = Arc::new(GraphState::new(pool_store, planner_config));
     let handle = GraphHandle {
         state: state.clone(),
     };

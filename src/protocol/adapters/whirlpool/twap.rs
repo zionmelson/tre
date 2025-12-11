@@ -8,10 +8,8 @@ use super::{math, sqrt_price_x64_from_x96};
 
 #[derive(Clone, Debug)]
 pub struct WhirlpoolTwapObservation {
-    pub slot: u64,
     pub timestamp: u64,
     pub tick: i32,
-    pub sqrt_price_x64: u128,
     pub liquidity: u128,
     pub cumulative_tick: i128,
     pub cumulative_seconds_per_liquidity_x64: u128,
@@ -19,10 +17,8 @@ pub struct WhirlpoolTwapObservation {
 
 #[derive(Clone, Debug)]
 pub struct WhirlpoolTwapEstimate {
-    pub start_timestamp: u64,
     pub end_timestamp: u64,
     pub window_seconds: u64,
-    pub average_tick: f64,
     pub average_tick_rounded: i32,
     pub average_price: Option<f64>,
     pub seconds_per_liquidity_x64: Option<u128>,
@@ -58,10 +54,8 @@ impl WhirlpoolTwapCache {
     pub fn observe(
         &self,
         pool: Pubkey,
-        slot: u64,
         timestamp: u64,
         tick: i32,
-        sqrt_price_x64: u128,
         liquidity: u128,
     ) {
         if liquidity == 0 {
@@ -73,10 +67,8 @@ impl WhirlpoolTwapCache {
             .or_insert_with(WhirlpoolTwapSeries::default);
         entry.record(
             self.horizon,
-            slot,
             timestamp,
             tick,
-            sqrt_price_x64,
             liquidity,
         );
     }
@@ -100,10 +92,8 @@ impl WhirlpoolTwapSeries {
     fn record(
         &mut self,
         horizon: Duration,
-        slot: u64,
         timestamp: u64,
         tick: i32,
-        sqrt_price_x64: u128,
         liquidity: u128,
     ) {
         let mut effective_timestamp = timestamp;
@@ -126,10 +116,8 @@ impl WhirlpoolTwapSeries {
         };
 
         self.observations.push_back(WhirlpoolTwapObservation {
-            slot,
             timestamp: effective_timestamp,
             tick,
-            sqrt_price_x64,
             liquidity,
             cumulative_tick,
             cumulative_seconds_per_liquidity_x64,
@@ -182,10 +170,8 @@ impl WhirlpoolTwapSeries {
             .saturating_sub(start.cumulative_seconds_per_liquidity_x64);
         let average_price = tick_to_price(average_tick_rounded);
         Some(WhirlpoolTwapEstimate {
-            start_timestamp: start.timestamp,
             end_timestamp: end.timestamp,
             window_seconds: elapsed,
-            average_tick,
             average_tick_rounded,
             average_price,
             seconds_per_liquidity_x64: Some(seconds_per_liquidity_x64),
@@ -235,8 +221,8 @@ mod tests {
     fn computes_twap_with_multiple_observations() {
         let cache = WhirlpoolTwapCache::new(Duration::from_secs(300));
         let pool = Pubkey::new_unique();
-        cache.observe(pool, 1, 100, 100, 1u128 << 64, 1_000_000);
-        cache.observe(pool, 2, 160, 120, 1u128 << 64, 1_000_000);
+        cache.observe(pool, 100, 100, 1_000_000);
+        cache.observe(pool, 160, 120, 1_000_000);
         let estimate = cache
             .twap(&pool, Duration::from_secs(30))
             .expect("missing twap");

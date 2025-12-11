@@ -1,6 +1,11 @@
 # tre-arb-bot
 
-Ultra-light Solana arbitrage executor tuned for the hydrator ↔ watcher architecture. Hydrator threads consume CoreCast streams, decode pool state directly in memory, and broadcast fresh price/liquidity snapshots to the watcher. The watcher owns strategy/graph search, clamps borrow sizing, and submits bundles to the Jito block engine within the 45 ms freshness budget—no disk caches or legacy stages in the hot path.
+Ultra-light Solana arbitrage executor built as a CoreCast-first pipeline. Everything runs inside one process, fed entirely by streamed pool/trade deltas and guarded by four pillars:
+
+1. **CoreCast Watcher** – Boots each pool exactly once, decodes CoreCast deltas, and keeps `PoolStore` fresh without tiers or demotions.
+2. **Template & Resource Builder** – Generates immutable swap templates, lookup tables, and flash-loan routes keyed by content hash.
+3. **FastLane Planner** – Merges CoreCast deltas, trade hints, and strategy constraints to emit bundle candidates guarded by slot-lag checks.
+4. **Bundle Builder & Submitter** – Signs bundles, enforces tip policy, streams results from the Jito block engine, and exports telemetry.
 
 ## Status
 
@@ -8,20 +13,20 @@ This repository currently provides:
 
 - Cargo project scaffolding with Tokio/tonic/prost wiring
 - Proto compilation for Bitquery CoreCast and Jito MEV endpoints
-- CPU-affine runtime with lock-free channels + slabs wiring hydrator threads to the fast watcher lane (`runtime.rs`, `core/`, `hydration/`, `planner.rs`)
-- A CoreCast → Hydrator → Watcher pipeline with config management, IDL caching, instruction template hydration, flash-loan planning, and Prometheus-friendly telemetry
+- CPU-affine runtime with lock-free channels + slabs wiring the four CoreCast-first pillars together (`runtime.rs`, `core/`, `hydration/`, `planner.rs`)
+- Single-shot CoreCast → Watcher → Planner → Submitter flow with config management, IDL caching, template generation, flash-loan planning, and Prometheus-friendly telemetry
 - Bundle lifecycle tracking that streams `SubscribeBundleResults`, taps the state-auction websocket feed, and publishes per-bundle alerts/metrics for accepted, rejected, finalized, or expired bundles
-- Documentation covering hydrator/watcher responsibilities and deployment assumptions (see `docs/architecture.md` and `docs/deploy_latitude.md`)
+- Documentation covering the CoreCast-first pipeline and deployment assumptions (see `docs/architecture.md` and `docs/deploy_latitude.md`)
 - An operational CLI with `run` (default) and `resign` subcommands so operators can either launch the executor or refresh archived bundles without spinning up the full runtime
 
 ## Runtime Overview
 
 - `src/main.rs` exposes the user-facing CLI. `tre-arb-bot run` (default) spins up the executor, while `tre-arb-bot resign` reloads a logged bundle, fetches a fresh blockhash, and re-signs it with the configured payer.
-- `runtime::ExecutorRuntime` bridges the config, `BuilderHandle`, `HydrationService`, planners, submission lane, and graceful shutdown (`SIGINT` stops every thread via an `AtomicBool`).
-- `hydration/service.rs` owns CoreCast ingestion, the `AdapterBook`, template cache, ALT manager, flash-loan planner, RPC refreshers, and the shared `PoolStore`. It periodically publishes `HydrationSnapshot`s so planners know template/ALT freshness.
-- `planner/` hosts the graph service, CoreCast trade feed, and `FastLanePlanner`. The planner consumes `PoolStateUpdate`s + `HydrationSnapshot`s, calls into `StrategyEngine`, and emits `BundleCandidate` leases via an SPSC ring backed by slab allocators from `core/`.
+- `runtime::ExecutorRuntime` bridges the config, CoreCast watcher, builder, planners, submission lane, and graceful shutdown (`SIGINT` stops every thread via an `AtomicBool`).
+- `hydration/service.rs` (the watcher) owns CoreCast ingestion, the `AdapterBook`, template cache, ALT manager, flash-loan planner, and the shared `PoolStore`. It bootstraps pools once and keeps their static metadata pinned until restart.
+- `planner/` hosts the graph service, CoreCast trade feed, and `FastLanePlanner`. The planner consumes `PoolStateUpdate`s, calls into `StrategyEngine`, gates on CoreCast slot lag, and emits `BundleCandidate` leases via an SPSC ring backed by slab allocators from `core/`.
 - `submission.rs` and `bundle/` house the fast-lane submitter, Jito gRPC client, and `BundleTracker`. Successful sends go through `BundleClient`; lifecycle updates stream from result + auction feeds and are mirrored via `Notifier` + telemetry.
-- Telemetry (`telemetry.rs`) exports Prometheus counters/histograms that cover hydration freshness, graph state, planner queues, submission success, and bundle outcomes. Modes such as `pipeline.hydration_only_mode` and `pipeline.dry_run_mode` gate planner or submitter threads without code changes.
+- Telemetry (`telemetry.rs`) exports Prometheus counters/histograms that cover CoreCast freshness, graph state, planner queues, submission success, and bundle outcomes. `pipeline.dry_run_mode` keeps the pipeline hot without submitting bundles so you can soak CoreCast freshness end-to-end.
 
 ## Quick Start
 
@@ -64,9 +69,9 @@ docker run --rm \
 
 ### Pool Inventory Validation
 
-`./scripts/check-pools.sh` runs four sequential validations so you can confirm the local pool inventory is coherent before starting the hydrator:
+`./scripts/check-pools.sh` runs four sequential validations so you can confirm the local pool inventory is coherent before the CoreCast watcher spins up:
 
-1. Config + watcher thresholds (`config_inventory_valid`)
+1. Config inventory (`config_inventory_valid`)
 2. ALT registry readiness (`alt_registry_ready_and_consistent`)
 3. On-chain ALT account existence (`alt_registry_accounts_exist_on_chain`)
 4. IDL program IDs (`idl_program_ids_match_expectations`)
@@ -86,8 +91,7 @@ Environment variables:
 - `TRE_JITO_API_TOKEN`, `TRE_JITO_TIP_FLOOR_URL`, `TRE_JITO_TIP_STREAM_URL`, `TRE_JITO_CA_PEM`: override sensitive Jito parameters without storing them on disk.
 - `TRE_BAM_VALIDATOR_CSV`: override the BAM validator CSV path.
 - `TRE_QUICKNODE_RPCS`: override the Quicknode RPC list.
-- `TRE_HYDRATION_ONLY_MODE`: set to `true` to disable planner/submission lanes entirely (hydrator soak tests).
-- `TRE_DRY_RUN_MODE`: set to `true` to keep the planner hot while discarding bundle submissions (the `--dry-run` script flag toggles this automatically).
+- `TRE_DRY_RUN_MODE`: set to `true` to keep the CoreCast watcher + planner hot while discarding bundle submissions (the `--dry-run` script flag toggles this automatically). Use it for end-to-end soaks without touching the block engine.
 - `alerts.webhook_url`: optional HTTPS endpoint that receives JSON bundle/arbitrage lifecycle events; pair with `alerts.environment` to tag messages by deployment.
 
 ### ALT Reuse & Testing
@@ -128,21 +132,21 @@ Set `alerts.webhook_url` in `config.json` to mirror every arbitrage, bundle cand
 ### Prometheus / Grafana
 
 - Expose metrics by setting `PROMETHEUS_METRICS_ADDR="0.0.0.0:9898"` (or any open port). Prometheus scrapes `/` for counters, histograms, and gauges.
-- Hydrator health: watch `hydration_adapter_ingest_total` (per adapter), `hydrator_queue_depth`, `hydrator_update_latency_ms`, and `hydration_stale_pool_total`. Sustained queue depth or stale pools mean CoreCast isn’t keeping up.
-- Watcher health: track `watcher_update_age_ms` (age of pool data when consumed), `watcher_strategy_latency_ms`, and `bundle_execution_retry_events_total{reason="sign|submit|context"}` for send issues.
-- Template/flash readiness: keep `hydration_template_age_ms`, `hydration_flash_routes_prepared`, and `hydration_template_cache_entries` on a single dashboard to highlight upstream starvation.
+- CoreCast freshness: watch `corecast_delta_lag_ms`, `pool_bootstrap_total{status}`, and `corecast_stream_reconnects_total`. Sustained lag means the stream stalled or credentials expired.
+- Planner & fast lane: track `watcher_update_age_ms`, `fastlane_ring_depth_pct`, `fastlane_ring_drop_events_total`, and `bundle_execution_retry_events_total{reason="sign|submit|context"}`.
+- Template & flash readiness: keep `template_build_total{protocol}`, `template_cache_entries`, and `flash_route_ready_total` on a single dashboard to highlight upstream starvation.
 - Recommended alert:
 
   ```yaml
-  - alert: HydratorQueueLag
-    expr: avg_over_time(hydrator_queue_depth[1m]) > 0.7 * hydrator_queue_capacity
+  - alert: CoreCastLag
+    expr: corecast_delta_lag_ms > 200
     for: 1m
     labels:
       severity: critical
       service: tre-arb-bot
     annotations:
-      summary: Hydrator queue is saturating
-      description: "{{ $labels.environment }} hydrator queue is above 70% for >1m; watcher will soon see stale pools."
+      summary: CoreCast stream is stale
+      description: "{{ $labels.environment }} corecast_delta_lag_ms is above 200 for >1m; planner will soon drop opportunities."
   ```
 
 - Grafana tip: overlay `quantile_over_time(0.99, watcher_update_age_ms[1m])` with `bundle_execution_latency_ms` and `bundle_execution_tip_multiplier_milli` to correlate stale data with missed fills. Label series by adapter/protocol for faster triage.
@@ -154,11 +158,11 @@ bitquery/               # CoreCast protos (compiled via build.rs)
 idls/pools/             # Pool IDLs → const instruction bytes (codegen emits pools_static.rs)
 jito/                   # Jito block engine/searcher protos
 src/
-  core/                 # Lock-free rings + slab allocator primitives shared by hydrator/watcher
-  hydration/            # CoreCast ingest, adapter decoders, runtime pool map, template cache
-  planner.rs            # Watcher fast lane: subscribes to hydrator feed, runs StrategyEngine
-  runtime.rs            # Thread wiring + graceful shutdown for hydrator, watcher, submitter
-  config.rs             # Config loader + validation (hydrator queues, borrow pct, endpoints)
+  core/                 # Lock-free rings + slab allocator primitives shared by watcher/planner/submitter lanes
+  hydration/            # CoreCast watcher: ingest, adapter decoders, runtime pool map, template cache
+  planner.rs            # Fast lane: subscribes to CoreCast feed, runs StrategyEngine
+  runtime.rs            # Thread wiring + graceful shutdown for watcher, planner, submitter
+  config.rs             # Config loader + validation (borrow pct, endpoints, runtime sizing)
   corecast.rs           # Credentialed CoreCast client + stream/channel pool management
   strategy.rs           # Opportunity evaluation, borrow sizing, and dynamic tip policy
   bundle.rs             # Bundle tracker, telemetry, and submission helpers

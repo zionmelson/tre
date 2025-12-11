@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -9,11 +8,10 @@ use crossbeam_channel::{select, Receiver};
 use tracing::{debug, info, warn};
 
 use crate::core::{pin_current_thread, Lease, RingProducer, SlabPool};
-use crate::hydration::pool_state::PoolState;
-use crate::hydration::readiness::{PoolReadinessState, ReadinessEvent, ReadinessRegistry};
-use crate::hydration::types::{HydrationComponent, PoolUpdate, TradeUpdate};
-use crate::hydration::PoolStore;
+use crate::corecast::{PoolState, PoolStore};
+use crate::watch::types::{PoolUpdate, TradeUpdate};
 use crate::planner::types::{BundleCandidate, Opportunity, RoutePlan};
+use crate::telemetry;
 
 pub mod graph;
 pub mod graph_manager;
@@ -33,15 +31,7 @@ pub struct PlannerConfig {
     pub min_edge_bps: f64,
     pub max_leg_slippage_bps: f64,
     pub backpressure_threshold_pct: u8,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ReadinessDiagnostics {
-    tracked: bool,
-    hydrated: bool,
-    hydration_fresh: bool,
-    template_ready: bool,
-    template_fresh: bool,
+    pub max_corecast_slot_lag: u64,
 }
 
 impl Default for PlannerConfig {
@@ -53,6 +43,7 @@ impl Default for PlannerConfig {
             min_edge_bps: 5.0,
             max_leg_slippage_bps: 150.0,
             backpressure_threshold_pct: 85,
+            max_corecast_slot_lag: 20,
         }
     }
 }
@@ -60,7 +51,6 @@ impl Default for PlannerConfig {
 pub fn spawn_fast_lane_planner(
     stop: Arc<AtomicBool>,
     config: PlannerConfig,
-    readiness: ReadinessRegistry,
     trade_rx: Receiver<TradeUpdate>,
     pool_rx: Receiver<PoolUpdate>,
     bundle_producer: RingProducer<Lease<BundleCandidate>>,
@@ -69,11 +59,8 @@ pub fn spawn_fast_lane_planner(
     graph: GraphHandle,
     core_id: Option<usize>,
 ) -> Result<thread::JoinHandle<Result<()>>> {
-    let readiness_rx = readiness.subscribe();
     let worker = FastLanePlanner::new(
         config,
-        readiness,
-        readiness_rx,
         trade_rx,
         pool_rx,
         bundle_producer,
@@ -89,25 +76,21 @@ pub fn spawn_fast_lane_planner(
 
 struct FastLanePlanner {
     config: PlannerConfig,
-    readiness: ReadinessRegistry,
-    readiness_rx: Receiver<ReadinessEvent>,
     trade_rx: Receiver<TradeUpdate>,
     pool_rx: Receiver<PoolUpdate>,
     bundle_producer: RingProducer<Lease<BundleCandidate>>,
     bundle_pool: SlabPool<BundleCandidate>,
     pool_store: Arc<PoolStore>,
     graph: GraphHandle,
-    readiness_cache: HashMap<String, PoolReadinessState>,
     ring_capacity: usize,
     last_backpressure_log: Option<Instant>,
     next_seq: u64,
+    tip_slot: u64,
 }
 
 impl FastLanePlanner {
     fn new(
         config: PlannerConfig,
-        readiness: ReadinessRegistry,
-        readiness_rx: Receiver<ReadinessEvent>,
         trade_rx: Receiver<TradeUpdate>,
         pool_rx: Receiver<PoolUpdate>,
         bundle_producer: RingProducer<Lease<BundleCandidate>>,
@@ -118,18 +101,16 @@ impl FastLanePlanner {
         let ring_capacity = bundle_producer.capacity();
         Self {
             config,
-            readiness,
-            readiness_rx,
             trade_rx,
             pool_rx,
             bundle_producer,
             bundle_pool,
             pool_store,
             graph,
-            readiness_cache: HashMap::new(),
             ring_capacity,
             last_backpressure_log: None,
             next_seq: 0,
+            tip_slot: 0,
         }
     }
 
@@ -150,12 +131,6 @@ impl FastLanePlanner {
                 recv(self.pool_rx) -> msg => {
                     if let Ok(update) = msg {
                         self.handle_pool_update(update);
-                        did_work = true;
-                    }
-                },
-                recv(self.readiness_rx) -> msg => {
-                    if let Ok(event) = msg {
-                        self.handle_readiness_event(event);
                         did_work = true;
                     }
                 },
@@ -183,14 +158,12 @@ impl FastLanePlanner {
 
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let readiness = self.readiness_cache.get(&trade.pool_id).cloned();
         let mut opportunity = Opportunity::from_trade(
             seq,
             trade,
             Some(state.snapshot.clone()),
             Some(state.generation),
             None,
-            readiness.clone(),
         );
 
         if let Some(route_plan) = self.pick_route(&opportunity.trade.pool_id) {
@@ -204,135 +177,32 @@ impl FastLanePlanner {
         self.enqueue_candidate(opportunity);
     }
 
-    fn handle_pool_update(&self, update: PoolUpdate) {
+    fn handle_pool_update(&mut self, update: PoolUpdate) {
         let pool_id = update.pool_id.clone();
         let slot = update.slot;
-        let ready = self.pool_ready(&pool_id);
+        self.tip_slot = self.tip_slot.max(slot);
         let snapshot = update.into_snapshot();
-        self.pool_store.update(snapshot, ready);
-        debug!(target = "planner", pool = %pool_id, slot, ready, "pool snapshot indexed");
-    }
-
-    fn handle_readiness_event(&mut self, event: ReadinessEvent) {
-        match event {
-            ReadinessEvent::PoolDiscovered { pool_id } => {
-                info!(target = "planner", pool = %pool_id, "pool discovered via readiness registry");
-                if let Some(state) = self.readiness.state_for_pool(&pool_id) {
-                    self.readiness_cache.insert(pool_id.clone(), state);
-                }
-            }
-            ReadinessEvent::PoolUpdated { pool_id, slot } => {
-                debug!(target = "planner", pool = %pool_id, slot, "pool updated");
-            }
-            ReadinessEvent::HydrationTransition {
-                pool_id,
-                ready,
-                hydrated_slot,
-                ..
-            } => {
-                if ready {
-                    debug!(target = "planner", pool = %pool_id, hydrated_slot, "hydration ready");
-                } else {
-                    warn!(target = "planner", pool = %pool_id, "hydration expired; pool warming");
-                }
-            }
-            ReadinessEvent::TemplateTransition {
-                pool_id,
-                ready,
-                template_epoch,
-                ..
-            } => {
-                if ready {
-                    debug!(
-                        target = "planner",
-                        pool = %pool_id,
-                        template_epoch,
-                        "template ready"
-                    );
-                } else {
-                    let latest_state = self.latest_state(&pool_id);
-                    let corecast_slot = latest_state.as_ref().map(|state| state.slot);
-                    let hydrated_meta_slot = latest_state
-                        .as_ref()
-                        .and_then(|state| {
-                            state
-                                .snapshot
-                                .hydration
-                                .component_slot(HydrationComponent::Meta)
-                        });
-                    let readiness_epoch = self
-                        .readiness_cache
-                        .get(&pool_id)
-                        .and_then(|state| state.template_epoch);
-                    warn!(
-                        target = "planner",
-                        pool = %pool_id,
-                        corecast_slot,
-                        hydrated_meta_slot,
-                        template_epoch,
-                        readiness_epoch,
-                        "template expired; awaiting refresh"
-                    );
-                }
-            }
-            ReadinessEvent::ReadinessChanged { pool_id, state } => {
-                let ready = self.state_ready(&state);
-                self.readiness_cache.insert(pool_id.clone(), state.clone());
-                if ready {
-                    info!(target = "planner", pool = %pool_id, "pool ready");
-                } else {
-                    let diag = Self::readiness_diagnostics(&state);
-                    warn!(
-                        target = "planner",
-                        pool = %pool_id,
-                        tracked = diag.tracked,
-                        hydrated = diag.hydrated,
-                        hydration_fresh = diag.hydration_fresh,
-                        hydration_deadline = ?state.hydration_ready_until,
-                        template_ready = diag.template_ready,
-                        template_fresh = diag.template_fresh,
-                        template_deadline = ?state.template_ready_until,
-                        last_update_slot = state.last_update_slot,
-                        hydrated_slot = state.hydrated_slot,
-                        template_hash = ?state.template_hash,
-                        "pool left ready state; readiness breakdown"
-                    );
-                }
-            }
-        }
+        self.pool_store.update(snapshot);
+        debug!(target = "planner", pool = %pool_id, slot, "pool snapshot indexed");
     }
 
     fn pool_ready(&self, pool_id: &str) -> bool {
-        if let Some(state) = self.readiness_cache.get(pool_id) {
-            return self.state_ready(state);
-        }
-        self.readiness
-            .state_for_pool(pool_id)
-            .map(|state| self.state_ready(&state))
-            .unwrap_or(false)
-    }
+        let Some(state) = self.pool_store.latest(pool_id) else {
+            return false;
+        };
 
-    fn state_ready(&self, state: &PoolReadinessState) -> bool {
-        state.is_ready()
-    }
-
-    fn readiness_diagnostics(state: &PoolReadinessState) -> ReadinessDiagnostics {
-        let now = Instant::now();
-        ReadinessDiagnostics {
-            tracked: state.tracked,
-            hydrated: state.hydrated,
-            hydration_fresh: state.hydrated
-                && state
-                    .hydration_ready_until
-                    .map(|deadline| deadline >= now)
-                    .unwrap_or(true),
-            template_ready: state.template_ready,
-            template_fresh: state.template_ready
-                && state
-                    .template_ready_until
-                    .map(|deadline| deadline >= now)
-                    .unwrap_or(true),
+        if self.config.max_corecast_slot_lag == 0 {
+            return true;
         }
+
+        let tip_slot = self.tip_slot;
+        if tip_slot == 0 {
+            return true;
+        }
+
+        let lag = tip_slot.saturating_sub(state.slot);
+        telemetry::record_corecast_delta_lag(state.snapshot.updated_at.elapsed());
+        lag <= self.config.max_corecast_slot_lag
     }
 
     fn latest_state(&self, pool_id: &str) -> Option<PoolState> {
@@ -372,18 +242,7 @@ impl FastLanePlanner {
             }
         }
 
-        if let Some(readiness) = opportunity.readiness.as_ref() {
-            if readiness.last_transition.elapsed() > self.config.freshness_budget {
-                debug!(target = "planner", pool = %pool, "readiness stale; waiting for refresh");
-                return false;
-            }
-        }
-
         if let Some(plan) = opportunity.route_plan.as_ref() {
-            if !self.route_plan_ready(plan) {
-                debug!(target = "planner", pool = %pool, "route plan missing template readiness");
-                return false;
-            }
             if plan
                 .legs
                 .iter()
@@ -395,10 +254,6 @@ impl FastLanePlanner {
         }
 
         true
-    }
-
-    fn route_plan_ready(&self, plan: &RoutePlan) -> bool {
-        plan.legs.iter().all(|leg| leg.template_ready)
     }
 
     fn enqueue_candidate(&mut self, opportunity: Opportunity) {

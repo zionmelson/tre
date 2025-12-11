@@ -82,6 +82,10 @@ impl TransferHookAccountsResolver {
         None
     }
 
+    pub fn prime_mint_program(&self, mint: Pubkey, program: Pubkey) {
+        self.mint_program_cache.insert(mint, program);
+    }
+
     pub fn resolve_accounts(
         &self,
         program_id: Pubkey,

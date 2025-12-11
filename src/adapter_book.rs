@@ -1,46 +1,39 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, info};
 
-use crate::builder::BuilderHandle;
+use crate::bootstrap::StaticPoolRegistry;
 use crate::config::AppConfig;
-use crate::hydration::adapters::{
-    AdapterReadiness, CpAmmAdapter, CpAmmAdapterConfig, LbClmmAdapter, LbClmmAdapterConfig,
-    ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, RaydiumV3Adapter,
-    RaydiumV3AdapterConfig, SwapDirection, WhirlpoolAdapter, WhirlpoolAdapterConfig,
+use crate::protocol::adapters::{
+    CpAmmAdapter, CpAmmAdapterConfig, LbClmmAdapter, LbClmmAdapterConfig, ProtocolAdapter,
+    QuoteRequest, QuoteResponse, RaydiumV3Adapter, RaydiumV3AdapterConfig, SwapDirection,
+    WhirlpoolAdapter, WhirlpoolAdapterConfig,
 };
-use crate::hydration::logging::{adapter_log_target, describe_pending_components};
-use crate::hydration::types::{
-    HydrationComponent, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
-    TradeUpdate,
-};
-use crate::telemetry;
-use crate::template::TemplateContext;
+use crate::watch::types::{PoolBidirectionalQuotes, PoolSnapshot, PoolUpdate, TradeUpdate};
 
 const BPS_DENOMINATOR: u64 = 10_000;
 
 pub struct AdapterBook {
     adapters: HashMap<String, Arc<dyn ProtocolAdapter>>, // key = program id string
     relaxed_price_programs: HashSet<String>, // programs allowed to opt out of strict pricing
-    pending_logs: DashMap<String, Instant>,
+    registry: Arc<StaticPoolRegistry>,
 }
 
 impl AdapterBook {
-    pub fn new(config: Arc<AppConfig>, builder: BuilderHandle) -> Self {
+    pub fn new(config: Arc<AppConfig>) -> Self {
         let mut adapters: HashMap<String, Arc<dyn ProtocolAdapter>> = HashMap::new();
         let relaxed_price_programs: HashSet<String> = HashSet::new();
+        let registry = Arc::new(StaticPoolRegistry::new());
 
         if config.protocol_enabled("raydium_v3") {
             register_adapter(
                 &mut adapters,
                 Arc::new(RaydiumV3Adapter::new(
                     raydium_config(config.as_ref()),
-                    Some(builder.clone()),
+                    registry.clone(),
                 )),
             );
         } else {
@@ -56,7 +49,7 @@ impl AdapterBook {
                 &mut adapters,
                 Arc::new(CpAmmAdapter::new(
                     cp_amm_config(config.as_ref()),
-                    Some(builder.clone()),
+                    registry.clone(),
                 )),
             );
         } else {
@@ -72,7 +65,7 @@ impl AdapterBook {
                 &mut adapters,
                 Arc::new(LbClmmAdapter::new(
                     lb_clmm_config(config.as_ref()),
-                    Some(builder.clone()),
+                    registry.clone(),
                 )),
             );
         } else {
@@ -86,7 +79,7 @@ impl AdapterBook {
         if config.protocol_enabled("whirlpool") {
             let whirlpool_adapter = Arc::new(WhirlpoolAdapter::new(
                 whirlpool_config(config.as_ref()),
-                Some(builder),
+                registry.clone(),
             ));
             register_adapter(&mut adapters, whirlpool_adapter);
         } else {
@@ -100,7 +93,7 @@ impl AdapterBook {
         Self {
             adapters,
             relaxed_price_programs,
-            pending_logs: DashMap::new(),
+            registry,
         }
     }
 
@@ -128,27 +121,17 @@ impl AdapterBook {
 
     pub fn snapshot_quotes(&self, snapshot: &mut PoolSnapshot) -> Option<PoolBidirectionalQuotes> {
         snapshot.allow_reserve_backfill = !self.requires_authoritative_quotes(&snapshot.program_id);
-        let adapter = self.adapters.get(&snapshot.program_id)?;
-        if !snapshot.hydration.ready() {
-            let pending = snapshot.hydration.pending_components();
-            debug!(
-                target = "adapter_book",
-                program = %snapshot.program_id,
-                pool = %snapshot.pool_id,
-                components = ?pending,
-                "quotes blocked pending hydration"
-            );
-            telemetry::record_hydration_quote_blocked(adapter.name());
-            self.log_pending_components(adapter.name(), snapshot);
-            return Some(build_hydration_pending_quotes(snapshot));
-        }
-        debug!(
-            target = "adapter_book",
-            program = %snapshot.program_id,
-            pool = %snapshot.pool_id,
-            "hydration ready; generating quotes"
-        );
-        adapter.bidirectional_quotes(snapshot)
+        self.adapters
+            .get(&snapshot.program_id)
+            .and_then(|adapter| {
+                debug!(
+                    target = "adapter_book",
+                    program = %snapshot.program_id,
+                    pool = %snapshot.pool_id,
+                    "generating quotes"
+                );
+                adapter.bidirectional_quotes(snapshot)
+            })
     }
 
     pub fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
@@ -191,111 +174,12 @@ impl AdapterBook {
         adapter.quote_exact_in(fallback)
     }
 
-    pub fn warm_components(&self, snapshot: &PoolSnapshot, components: &[HydrationComponent]) {
-        if components.is_empty() {
-            return;
-        }
-        if let Some(adapter) = self.adapters.get(&snapshot.program_id) {
-            adapter.warm_components(snapshot, components);
-        }
-    }
-
     pub fn requires_authoritative_quotes(&self, program_id: &str) -> bool {
         !self.relaxed_price_programs.contains(program_id)
     }
 
-    pub fn readiness_diagnostics(&self) -> AdapterReadiness {
-        let mut summary = AdapterReadiness::default();
-        for adapter in self.adapters.values() {
-            summary.extend(adapter.readiness_blockers());
-        }
-        summary
-    }
-
-    pub fn refresh_templates(&self, epoch: u64) {
-        debug!(
-            target = "adapter_book",
-            epoch, "broadcasting template cache refresh"
-        );
-        for adapter in self.adapters.values() {
-            adapter.refresh_templates(epoch);
-        }
-    }
-
-    pub fn refresh_pool_templates(&self, program_id: &str, pool: Pubkey, epoch: u64) {
-        if let Some(adapter) = self.adapters.get(program_id) {
-            debug!(
-                target = "adapter_book",
-                program = %program_id,
-                pool = %pool,
-                epoch,
-                "refreshing pool templates"
-            );
-            adapter.refresh_pool_templates(pool, epoch);
-        }
-    }
-}
-
-impl AdapterBook {
-    fn log_pending_components(&self, adapter_name: &'static str, snapshot: &PoolSnapshot) {
-        let summary = describe_pending_components(snapshot);
-        if summary.is_empty() {
-            return;
-        }
-        let target = adapter_log_target(adapter_name);
-        let warn = summary.lag_ms > 2_000 || summary.lag_slots > 50;
-        if !self.should_emit_pending_log(&snapshot.pool_id, warn) {
-            return;
-        }
-        let component_names = summary.component_names();
-        let detail = summary.detail_string();
-        if warn {
-            tracing::warn!(
-                target = target,
-                pool = %snapshot.pool_id,
-                slot = snapshot.slot,
-                lag_ms = summary.lag_ms,
-                lag_slots = summary.lag_slots,
-                components = %component_names,
-                details = %detail,
-                "hydration pending; quotes blocked"
-            );
-        } else {
-            tracing::info!(
-                target = target,
-                pool = %snapshot.pool_id,
-                slot = snapshot.slot,
-                lag_ms = summary.lag_ms,
-                lag_slots = summary.lag_slots,
-                components = %component_names,
-                details = %detail,
-                "hydration warming components"
-            );
-        }
-        for component in summary.components {
-            telemetry::record_hydration_component_pending(
-                adapter_name,
-                component.component.as_str(),
-                Some(component.age_ms),
-                component.slot_delta,
-            );
-        }
-    }
-
-    fn should_emit_pending_log(&self, pool_id: &str, warn: bool) -> bool {
-        let throttle = if warn {
-            Duration::from_secs(1)
-        } else {
-            Duration::from_secs(5)
-        };
-        let now = Instant::now();
-        if let Some(entry) = self.pending_logs.get(pool_id) {
-            if now.duration_since(*entry.value()) < throttle {
-                return false;
-            }
-        }
-        self.pending_logs.insert(pool_id.to_string(), now);
-        true
+    pub fn registry(&self) -> Arc<StaticPoolRegistry> {
+        self.registry.clone()
     }
 }
 
@@ -306,49 +190,10 @@ fn register_adapter(
     map.insert(adapter.program_id().to_string(), adapter);
 }
 
-fn build_hydration_pending_quotes(snapshot: &PoolSnapshot) -> PoolBidirectionalQuotes {
-    PoolBidirectionalQuotes {
-        base_to_quote: build_hydration_pending_side(
-            &snapshot.base_mint,
-            &snapshot.quote_mint,
-            snapshot.slot,
-        ),
-        quote_to_base: build_hydration_pending_side(
-            &snapshot.quote_mint,
-            &snapshot.base_mint,
-            snapshot.slot,
-        ),
-    }
-}
-
-fn build_hydration_pending_side(input_mint: &str, output_mint: &str, slot: u64) -> PoolQuoteSide {
-    PoolQuoteSide {
-        input_mint: input_mint.to_string(),
-        output_mint: output_mint.to_string(),
-        notional: 0,
-        expected_output: 0,
-        fee_bps: 0,
-        template_fee_bps: 0,
-        effective_price: 0.0,
-        estimated_slippage_bps: 0.0,
-        sqrt_price_limit: None,
-        min_output_amount: None,
-        limit_price: None,
-        price_impact_limit_bps: None,
-        amount_specified_is_input: true,
-        context: TemplateContext::default(),
-        status: QuoteStatus::HydrationPending,
-        sqrt_price_before_x64: None,
-        sqrt_price_after_x64: None,
-        tick_arrays_used: Vec::new(),
-        cache_slot: Some(slot),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::QuoteStatus;
+    use crate::watch::types::QuoteStatus;
     use crate::template::TemplateContext;
 
     struct FakeAdapter {
@@ -442,7 +287,7 @@ mod tests {
         AdapterBook {
             adapters,
             relaxed_price_programs: HashSet::new(),
-            pending_logs: DashMap::new(),
+            registry: Arc::new(StaticPoolRegistry::new()),
         }
     }
 
@@ -484,38 +329,17 @@ mod tests {
 }
 
 fn raydium_config(config: &AppConfig) -> RaydiumV3AdapterConfig {
-    let mut adapter_config = RaydiumV3AdapterConfig {
+    let adapter_config = RaydiumV3AdapterConfig {
         rpc_endpoints: config.protocol_rpc_endpoints("raydium_v3"),
         ..Default::default()
     };
-    if let Some(retry_ms) = config.protocol_hydration_retry_ms("raydium_v3") {
-        adapter_config.hydration_retry_ms = retry_ms.max(1);
-    }
-    if let Some(slot_lag) = config.protocol_hydration_slot_lag_tolerance("raydium_v3") {
-        adapter_config.hydration_slot_lag_tolerance = slot_lag;
-    }
-    if let Some(lag_ms) = config.protocol_hydration_lag_ms_tolerance("raydium_v3") {
-        adapter_config.hydration_lag_ms_tolerance = lag_ms;
-    }
     adapter_config
 }
 
 fn cp_amm_config(config: &AppConfig) -> CpAmmAdapterConfig {
-    let mut adapter_config = CpAmmAdapterConfig {
-        rpc_endpoints: config.protocol_rpc_endpoints("cp_amm"),
-        ..Default::default()
-    };
-    if let Some(retry_ms) = config.protocol_hydration_retry_ms("cp_amm") {
-        adapter_config.hydration_retry_ms = retry_ms.max(1);
-    }
+    let mut adapter_config = CpAmmAdapterConfig::default();
     if let Some(util_bps) = config.protocol_max_utilization_bps("cp_amm") {
         adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
-    }
-    if let Some(slot_lag) = config.protocol_hydration_slot_lag_tolerance("cp_amm") {
-        adapter_config.hydration_slot_lag_tolerance = slot_lag;
-    }
-    if let Some(lag_ms) = config.protocol_hydration_lag_ms_tolerance("cp_amm") {
-        adapter_config.hydration_lag_ms_tolerance = lag_ms;
     }
     if let Some(protocol) = config.protocols.get("cp_amm") {
         adapter_config.required_partner = protocol.required_partner;
@@ -524,24 +348,12 @@ fn cp_amm_config(config: &AppConfig) -> CpAmmAdapterConfig {
 }
 
 fn lb_clmm_config(config: &AppConfig) -> LbClmmAdapterConfig {
-    let mut adapter_config = LbClmmAdapterConfig {
-        rpc_endpoints: config.protocol_rpc_endpoints("lb_clmm"),
-        ..Default::default()
-    };
-    if let Some(retry_ms) = config.protocol_hydration_retry_ms("lb_clmm") {
-        adapter_config.hydration_retry_ms = retry_ms.max(1);
-    }
+    let mut adapter_config = LbClmmAdapterConfig::default();
     if let Some(util_bps) = config.protocol_max_utilization_bps("lb_clmm") {
         adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
     }
     if let Some(guard_bps) = config.protocol_price_impact_guard_bps("lb_clmm") {
         adapter_config.max_price_impact_bps = guard_bps.max(1u16);
-    }
-    if let Some(slot_lag) = config.protocol_hydration_slot_lag_tolerance("lb_clmm") {
-        adapter_config.hydration_slot_lag_tolerance = slot_lag;
-    }
-    if let Some(lag_ms) = config.protocol_hydration_lag_ms_tolerance("lb_clmm") {
-        adapter_config.hydration_lag_ms_tolerance = lag_ms;
     }
     adapter_config
 }
@@ -551,35 +363,11 @@ fn whirlpool_config(config: &AppConfig) -> WhirlpoolAdapterConfig {
         rpc_endpoints: config.protocol_rpc_endpoints("whirlpool"),
         ..Default::default()
     };
-    if let Some(retry_ms) = config.protocol_hydration_retry_ms("whirlpool") {
-        adapter_config.hydration_retry_ms = retry_ms.max(1);
-    }
     if let Some(util_bps) = config.protocol_max_utilization_bps("whirlpool") {
         adapter_config.max_swap_utilization_bps = util_bps.clamp(1, BPS_DENOMINATOR);
     }
-    if let Some(backoff_ms) = config.protocol_pool_backoff_ms("whirlpool") {
-        adapter_config.pool_failure_backoff_ms = backoff_ms.max(1);
-    }
-    if let Some(backoff_ms) = config.protocol_tick_array_backoff_ms("whirlpool") {
-        adapter_config.tick_array_backoff_ms = backoff_ms.max(1);
-    }
-    if let Some(max_failures) = config.protocol_max_pool_failures("whirlpool") {
-        adapter_config.max_pool_failures = max_failures.max(1);
-    }
-    if let Some(max_failures) = config.protocol_max_tick_array_failures("whirlpool") {
-        adapter_config.max_tick_array_failures = max_failures.max(1);
-    }
     if let Some(prefer_exact_out) = config.protocol_prefer_exact_out_quotes("whirlpool") {
         adapter_config.prefer_exact_out_quotes = prefer_exact_out;
-    }
-    if let Some(enabled) = config.protocol_oracle_hydration_enabled("whirlpool") {
-        adapter_config.oracle_hydration_enabled = enabled;
-    }
-    if let Some(slot_lag) = config.protocol_hydration_slot_lag_tolerance("whirlpool") {
-        adapter_config.hydration_slot_lag_tolerance = slot_lag;
-    }
-    if let Some(lag_ms) = config.protocol_hydration_lag_ms_tolerance("whirlpool") {
-        adapter_config.hydration_lag_ms_tolerance = lag_ms;
     }
     adapter_config
 }

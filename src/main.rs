@@ -20,7 +20,7 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     EnvFilter,
 };
-use tre_arb_bot::{config::AppConfig, runtime, telemetry};
+use tre_arb_bot::{config::AppConfig, runtime};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -79,7 +79,6 @@ async fn main() -> Result<()> {
 async fn run_executor(args: RunArgs) -> Result<()> {
     install_rustls_crypto_provider()?;
     init_tracing();
-    telemetry::init_from_env().await?;
 
     let config_path = resolve_config_path(args.config);
     let app_config = AppConfig::load(&config_path)

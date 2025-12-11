@@ -33,13 +33,13 @@ This document is the single source of truth for our Raydium CLMM adapter. It tie
 - Fee tiers (`trade_fee_bps`, `protocol_fee_bps`, `fund_fee_bps`) exactly as parsed from AMM config PDA.
 - Tick-array bitmap extension address and `pool_status` byte (needed for SDK-style remaining-account slices).
 - Transfer-fee summaries for each mint (epoch/max/bps); used both for hinting template hydration and for the simulation math.
-- Hydrated tick-array cache (3 accounts per direction) plus TTL, matching router expectations.
+- Hydrated tick-array cache (3 accounts per direction) tagged with readiness slots so router calls only proceed when lag stays inside tolerance.
 
-Eviction happens whenever `slot` drift exceeds `config.stale_slot_threshold` or wall-clock age exceeds `config.stale_after_ms`.
+State no longer expires on slot drift. Once a component hydrates successfully the adapter keeps it until hydration explicitly invalidates the pool (structural change, corrupt RPC read, or operator reset). Slot/ms lag knobs now only influence readiness gating and template inheritance, never eviction.
 
 ### Configuration knobs
 
-- `config.json -> protocols.raydium_v3.{hydration_slot_lag_tolerance, hydration_lag_ms_tolerance}` let operators widen or tighten the slot and wall-clock windows before the adapter considers a pool hydrated. Slot lag still governs when we refresh on-chain state, while the ms tolerance reuses the hydrator's `last_hydrated_at` timestamps so quotes/templates can proceed when RPC is briefly behind even though the existing meta is only a few seconds old.
+- `config.json -> protocols.raydium_v3` exposes the standard adapter knobs (`stale_slot_threshold`, `stale_after_ms`, `rpc_timeout_ms`, `max_swap_utilization_bps`) so operators can decide when cached state should be rehydrated and how much of a vault we are willing to consume per quote. Once meta/tick windows hydrate successfully the adapter keeps them until an explicit invalidation.
 
 ## Pricing Architecture
 
@@ -85,7 +85,6 @@ The adapter now mirrors the Raydium TypeScript SDK (`@raydium-io/raydium-sdk`, `
 - `QuoteResponse.status` enumerations:
   - `Ok` – simulation succeeded.
   - `HydrationPending` – hydrator could not fetch contiguous tick arrays (quote will be XYK-based until arrays land).
-  - `StaleState` – TTL eviction flagged the pool before quoting.
   - `InsufficientLiquidity` – `simulate_clmm_exact_in` exhausted liquidity before finishing.
   - `TokenFeeUnsupported` – raised when transfer-fee math produces zero executable budget (mirrors SDK guardrails).
 - Metrics/logs (tracing target `adapter::raydium_v3`): hydration retries, cache hits, XYK fallback rate, ALT registration failures.

@@ -58,6 +58,7 @@ pub struct BundleInstructionPlan {
     pub fee_bps: u16,
     pub template_fee_bps: u16,
     pub direction: SwapTemplateDirection,
+    pub template_hash: [u8; 32],
     pub sqrt_price_limit: Option<u128>,
     pub min_output_amount: Option<u64>,
     pub limit_price: Option<i64>,
@@ -140,7 +141,7 @@ fn resolve_template(
 ) -> Result<Arc<InstructionTemplate>> {
     let pool = Pubkey::from_str(&plan.pool_id)
         .with_context(|| format!("invalid pool id {}", plan.pool_id))?;
-    let key = TemplateCacheKey::new(pool, plan.direction);
+    let key = TemplateCacheKey::new(pool, plan.direction, plan.template_hash);
     cache.get(&key).with_context(|| {
         format!(
             "missing template for pool {} direction {:?}",
@@ -1209,6 +1210,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -1377,7 +1379,7 @@ mod tests {
         let token_mint_b = Pubkey::new_unique();
 
         let template = InstructionTemplate {
-            key: TemplateCacheKey::new(pool, SwapTemplateDirection::BaseIn),
+            key: TemplateCacheKey::new(pool, SwapTemplateDirection::BaseIn, [0u8; 32]),
             program_id,
             discriminator: [0u8; 8],
             accounts: StdArc::from(accounts),
@@ -1417,7 +1419,6 @@ mod tests {
                     oracle: Some(Pubkey::new_unique()),
                 }),
             },
-            hydrated_at: Instant::now(),
         };
         cache.insert(template);
 
@@ -1445,6 +1446,7 @@ mod tests {
             fee_bps: 10,
             template_fee_bps: 10,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: Some(140),
             limit_price: None,
@@ -1516,6 +1518,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -1562,6 +1565,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -1607,6 +1611,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -1652,6 +1657,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -1718,6 +1724,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -1786,6 +1793,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -1851,6 +1859,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -1913,6 +1922,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: Some(explicit_min),
             limit_price: None,
@@ -1965,6 +1975,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -2017,6 +2028,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -2075,6 +2087,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -2148,6 +2161,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -2241,6 +2255,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -2323,6 +2338,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -2429,6 +2445,7 @@ mod tests {
             fee_bps: 5,
             template_fee_bps: 5,
             direction: SwapTemplateDirection::BaseIn,
+            template_hash: [0; 32],
             sqrt_price_limit: None,
             min_output_amount: None,
             limit_price: None,
@@ -2509,6 +2526,7 @@ mod tests {
             amount_specified_is_input: true,
             fee_bps: 5,
             template_fee_bps: 5,
+            template_hash: [0; 32],
             direction: SwapTemplateDirection::BaseIn,
             sqrt_price_limit: None,
             min_output_amount: None,
@@ -2557,7 +2575,7 @@ mod tests {
         accounts: Vec<AccountMeta>,
         patches: Vec<TemplatePatch>,
     ) -> Pubkey {
-        let key = TemplateCacheKey::new(pool, direction);
+        let key = TemplateCacheKey::new(pool, direction, [0u8; 32]);
         let template = InstructionTemplate {
             key,
             program_id,
@@ -2571,7 +2589,6 @@ mod tests {
             alt_handle: None,
             alt_accounts: StdArc::from(Vec::new()),
             metadata: TemplateMetadata::None,
-            hydrated_at: Instant::now(),
         };
         cache.insert(template);
         program_id
@@ -2596,7 +2613,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let template = InstructionTemplate {
-            key: TemplateCacheKey::new(pool, direction),
+            key: TemplateCacheKey::new(pool, direction, [0u8; 32]),
             program_id,
             discriminator: [0u8; 8],
             accounts: StdArc::from(accounts),
@@ -2611,7 +2628,6 @@ mod tests {
                 account_specs: specs,
                 pool_accounts: Some(pool_accounts),
             },
-            hydrated_at: Instant::now(),
         };
         cache.insert(template);
     }
@@ -2658,7 +2674,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let template = InstructionTemplate {
-            key: TemplateCacheKey::new(pool, direction),
+            key: TemplateCacheKey::new(pool, direction, [0u8; 32]),
             program_id,
             discriminator: [0u8; 8],
             accounts: StdArc::from(accounts),
@@ -2673,7 +2689,6 @@ mod tests {
                 account_specs: specs,
                 pool_accounts: Some(pool_accounts),
             },
-            hydrated_at: Instant::now(),
         };
         cache.insert(template);
     }

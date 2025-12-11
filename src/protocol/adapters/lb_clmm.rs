@@ -3,873 +3,13 @@ use std::{
     convert::TryFrom,
     str::FromStr,
     sync::Arc,
-    thread,
     time::{Duration, Instant},
 };
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use solana_client::rpc_client::RpcClient;
-use solana_client::rpc_config::{
-    RpcAccountInfoConfig, RpcProgramAccountsConfig, UiAccountEncoding,
-};
-use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
-use solana_client::rpc_response::{UiAccount, UiAccountData};
-use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
-#[cfg(test)]
-use spl_token_2022::extension::transfer_fee::TransferFee;
-use tracing::{debug, info, trace, warn};
-use uint::construct_uint;
-
-use crate::builder::{BuilderHandle, LbClmmPoolAccounts, LbClmmPoolMeta};
-#[cfg(test)]
-use crate::hydration::types::HydrationStatus;
-use crate::hydration::{
-    mint_metadata::{MintMetadata, MintMetadataHydrator},
-    token_fees::{
-        apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
-    },
-    transfer_hooks::{TransferHookAccountContext, TransferHookAccountsResolver},
-    types::{
-        compute_edge_bps, HydrationComponent, LbClmmBinArrayExtras, LbClmmBinLiquidityExtras,
-        LbClmmBitmapExtras, LbClmmPoolExtras, LbClmmRewardExtras, PoolBidirectionalQuotes,
-        PoolQuoteSide, PoolSnapshot, PoolUpdate, LB_CLMM_INPUT_UTILIZATION_BPS,
-    },
-};
-use crate::telemetry;
-use crate::template::{
-    LbClmmAccountsType, LbClmmRemainingAccountsSlice, LbClmmRewardAccountContext, TemplateContext,
-    TransferFeeConfigHint,
-};
-
-use super::{
-    build_quote_response,
-    hydration::{AsyncHydrator, HydratedValue},
-    ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, SwapDirection,
-};
-
-const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
-const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const SPL_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const BPS_DENOMINATOR: u64 = 10_000;
-const DEFAULT_DYNAMIC_FEE_BPS: u16 = 30;
-const MAX_BIN_PER_ARRAY: i32 = 70;
-const BIN_STRUCT_LEN: usize = 144;
-const BIN_ARRAY_HEADER_LEN: usize = 8 /* index */ + 1 /* version */ + 7 /* padding */ + 32;
-const BIN_ARRAY_ACCOUNT_LEN: usize =
-    BIN_ARRAY_HEADER_LEN + (MAX_BIN_PER_ARRAY as usize) * BIN_STRUCT_LEN;
-const BIN_ARRAY_LB_PAIR_OFFSET: usize = 16;
-const BIN_ARRAY_INDEX_OFFSET: usize = 0;
-const BITMAP_EXTENSION_ACCOUNT_LEN: usize = 32 + (2 * 12 * 8 * 8);
-const SNAPSHOT_PROBE_DIVISOR: u128 = 10_000;
-const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
-const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
-const PRICE_IMPACT_FLOOR_BPS: u16 = 25;
-const PRICE_IMPACT_PADDING_BPS: u16 = 10;
-const LB_CLMM_DEFAULT_CU_LIMIT: u32 = 420_000;
-const LB_CLMM_DEFAULT_CU_PRICE: u64 = 5_000;
-const DEFAULT_LB_CLMM_HYDRATION_RETRY_MS: u64 = 60_000;
-const DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE: u64 = 3_000;
-const DEFAULT_HYDRATION_LAG_MS_TOLERANCE: u64 = 30_000;
-const TARGETED_BIN_ARRAY_RADIUS: i64 = 4;
-const BIN_WINDOW_EDGE_BUFFER_BINS: i32 = MAX_BIN_PER_ARRAY * 2;
-const DEFAULT_MAX_BIN_WALK: usize = 800;
-const DEFAULT_MAX_PRICE_IMPACT_BPS: u16 = 500;
-const HOST_FEE_SHARE_BPS: u64 = 2_000;
-const BIN_ARRAY_BITMAP_SIZE_I32: i32 = 1024;
-const DEFAULT_BITMAP_WORDS: usize = 16; // 1024 bits
-const BITMAP_SEGMENT_WORDS: usize = 8; // 512 bits
-const BITMAP_SEGMENT_BYTES: usize = BITMAP_SEGMENT_WORDS * 8;
-const Q64_SCALE_OFFSET: u32 = 64;
-const Q64_ONE: u128 = 1u128 << Q64_SCALE_OFFSET;
-const MAX_Q64_EXPONENT: u32 = 0x80000;
-const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
-const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
-const HYDRATION_LAG_LOG_INTERVAL_MS: u64 = 15_000;
-
-construct_uint! {
-    pub struct U256(4);
-}
-
-#[derive(Clone)]
-struct SnapshotStatusLogEntry {
-    status: QuoteStatus,
-    logged_at: Instant,
-}
-
-#[derive(Clone, Debug, Default)]
-struct LbTemplateRegistration {
-    epoch: u64,
-}
-
-static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program id should be valid")
-});
-static SPL_TOKEN_2022_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str(SPL_TOKEN_2022_PROGRAM_ID)
-        .expect("static spl token 2022 program id should be valid")
-});
-static ASSOCIATED_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID)
-        .expect("static associated token program id should be valid")
-});
-
-#[derive(Debug, Clone)]
-pub struct LbClmmAdapterConfig {
-    pub stale_slot_threshold: u64,
-    pub stale_after_ms: u64,
-    pub rpc_endpoints: Vec<String>,
-    pub rpc_timeout_ms: u64,
-    pub hydration_retry_ms: u64,
-    pub hydration_slot_lag_tolerance: u64,
-    pub hydration_lag_ms_tolerance: u64,
-    pub max_swap_utilization_bps: u64,
-    pub max_bin_walk: usize,
-    pub max_price_impact_bps: u16,
-}
-
-impl Default for LbClmmAdapterConfig {
-    fn default() -> Self {
-        Self {
-            stale_slot_threshold: 400,
-            stale_after_ms: 2_000,
-            rpc_endpoints: Vec::new(),
-            // lb_clmm bin array/bitmap fetches can be slow; give RPC plenty of time.
-            rpc_timeout_ms: 15_000,
-            hydration_retry_ms: DEFAULT_LB_CLMM_HYDRATION_RETRY_MS,
-            hydration_slot_lag_tolerance: DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE,
-            hydration_lag_ms_tolerance: DEFAULT_HYDRATION_LAG_MS_TOLERANCE,
-            max_swap_utilization_bps: LB_CLMM_INPUT_UTILIZATION_BPS,
-            max_bin_walk: DEFAULT_MAX_BIN_WALK,
-            max_price_impact_bps: DEFAULT_MAX_PRICE_IMPACT_BPS,
-        }
-    }
-}
-
-pub struct LbClmmAdapter {
-    program_id: Pubkey,
-    state: DashMap<Pubkey, LbClmmState>,
-    config: LbClmmAdapterConfig,
-    hydrator: Option<LbClmmPoolHydrator>,
-    mint_metadata_cache: Option<MintMetadataHydrator>,
-    transfer_fee_cache: Option<TokenTransferFeeHydrator>,
-    transfer_hook_resolver: Option<TransferHookAccountsResolver>,
-    template_builder: Option<BuilderHandle>,
-    registered_templates: DashMap<Pubkey, LbTemplateRegistration>,
-    snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
-    missing_state_log: DashMap<Pubkey, Instant>,
-    lag_log: DashMap<(Pubkey, u8), Instant>,
-}
-
-impl LbClmmAdapter {
-    pub fn new(config: LbClmmAdapterConfig, template_builder: Option<BuilderHandle>) -> Self {
-        let program_id = Pubkey::from_str(LB_CLMM_PROGRAM_ID)
-            .expect("static lb_clmm program id should be valid");
-        let hydrator = LbClmmPoolHydrator::new(program_id, &config);
-        let mint_metadata_cache = MintMetadataHydrator::new(
-            &config.rpc_endpoints,
-            config.rpc_timeout_ms,
-            config.hydration_retry_ms,
-        );
-        let transfer_fee_cache = TokenTransferFeeHydrator::new(
-            &config.rpc_endpoints,
-            config.rpc_timeout_ms,
-            config.hydration_retry_ms,
-        );
-        let transfer_hook_resolver =
-            TransferHookAccountsResolver::new(&config.rpc_endpoints, config.rpc_timeout_ms);
-        if let Some(hydrator_ref) = hydrator.as_ref() {
-            info!(
-                target = "adapter::lb_clmm",
-                endpoints = hydrator_ref.client_count(),
-                "lb_clmm pool hydrator online"
-            );
-        } else {
-            debug!(
-                target = "adapter::lb_clmm",
-                "lb_clmm pool hydrator disabled (no rpc endpoints)"
-            );
-        }
-        Self {
-            program_id,
-            state: DashMap::new(),
-            config,
-            hydrator,
-            mint_metadata_cache,
-            transfer_fee_cache,
-            transfer_hook_resolver,
-            template_builder,
-            registered_templates: DashMap::new(),
-            snapshot_failure_log: DashMap::new(),
-            missing_state_log: DashMap::new(),
-            lag_log: DashMap::new(),
-        }
-    }
-
-    pub fn get_state(&self, pool: &Pubkey) -> Option<LbClmmState> {
-        self.state.get(pool).map(|entry| entry.clone())
-    }
-
-    fn evict_stale(&self, current_slot: u64) {
-        let ttl = self.config.stale_after_ms;
-        self.state.retain(|_, state| {
-            let slot_fresh = current_slot.saturating_sub(state.last_update_slot)
-                <= self.config.stale_slot_threshold;
-            let instant_fresh = state.last_update_at.elapsed().as_millis() as u64 <= ttl;
-            if !(slot_fresh && instant_fresh) {
-                trace!(
-                    target = "adapter::lb_clmm",
-                    pool = %state.lb_pair,
-                    last_slot = state.last_update_slot,
-                    "evicting stale lb_clmm state"
-                );
-            }
-            slot_fresh && instant_fresh
-        });
-    }
-
-    fn upsert_state(&self, update: &PoolUpdate, extras: LbClmmPoolExtras) {
-        let Some(pool_pubkey) = parse_pubkey(&update.pool_id) else {
-            warn!(
-                target = "adapter::lb_clmm",
-                pool = %update.pool_id,
-                "dropping pool update with invalid pool pubkey"
-            );
-            return;
-        };
-
-        let previous_state = self.state.get(&pool_pubkey);
-        let extras = self.enrich_extras(pool_pubkey, extras);
-        let Some(token_x_mint) = extras
-            .token_x_mint
-            .as_ref()
-            .and_then(|value| parse_pubkey(value))
-        else {
-            warn!(target = "adapter::lb_clmm", pool = %update.pool_id, "missing token_x mint");
-            return;
-        };
-
-        let Some(token_y_mint) = extras
-            .token_y_mint
-            .as_ref()
-            .and_then(|value| parse_pubkey(value))
-        else {
-            warn!(target = "adapter::lb_clmm", pool = %update.pool_id, "missing token_y mint");
-            return;
-        };
-
-        let mut active_bitmap = extras.active_bitmap.clone().map(LbClmmBinBitmap::from);
-        if let (Some(active_bin), Some(bitmap)) = (extras.active_bin_id, active_bitmap.as_mut()) {
-            bitmap.anchor_with_bin(active_bin);
-        }
-
-        let bin_liquidity = build_bin_liquidity_map(&extras);
-        let meta_slot_from_update = extras.hydrated_slot.is_some();
-        let mut hydrated_meta_slot = extras.hydrated_slot;
-        if hydrated_meta_slot
-            .map(|slot| slot < update.slot)
-            .unwrap_or(true)
-        {
-            if let Some(existing) = previous_state.as_ref() {
-                if existing
-                    .hydrated_meta_slot
-                    .map(|slot| slot >= update.slot)
-                    .unwrap_or(false)
-                {
-                    hydrated_meta_slot = existing.hydrated_meta_slot;
-                }
-            }
-        }
-
-        let window_data_present = !bin_liquidity.is_empty();
-        let mut hydrated_window_slot = if window_data_present {
-            extras.hydrated_slot
-        } else {
-            None
-        };
-        if hydrated_window_slot
-            .map(|slot| slot < update.slot)
-            .unwrap_or(true)
-        {
-            if let Some(existing) = previous_state.as_ref() {
-                if existing
-                    .hydrated_window_slot
-                    .map(|slot| slot >= update.slot)
-                    .unwrap_or(false)
-                {
-                    hydrated_window_slot = existing.hydrated_window_slot;
-                }
-            }
-        }
-
-        let mut meta_hydrated_at = extras.hydrated_at.or_else(|| {
-            previous_state
-                .as_ref()
-                .and_then(|state| state.meta_hydrated_at)
-        });
-        if meta_slot_from_update && extras.hydrated_at.is_none() {
-            meta_hydrated_at = Some(Instant::now());
-        }
-
-        let mut window_hydrated_at = if window_data_present {
-            extras.hydrated_at
-        } else {
-            None
-        }
-        .or_else(|| {
-            previous_state
-                .as_ref()
-                .and_then(|state| state.window_hydrated_at)
-        });
-        if window_data_present && extras.hydrated_at.is_none() {
-            window_hydrated_at = Some(Instant::now());
-        }
-
-        let mut state = LbClmmState {
-            lb_pair: pool_pubkey,
-            token_x_mint,
-            token_y_mint,
-            token_x_decimals: None,
-            token_y_decimals: None,
-            token_x_program: extras
-                .token_x_program
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            token_y_program: extras
-                .token_y_program
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            reserve_x: extras
-                .reserve_x
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            reserve_y: extras
-                .reserve_y
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            oracle: extras.oracle.as_ref().and_then(|value| parse_pubkey(value)),
-            bin_array_bitmap_extension: extras
-                .bin_array_bitmap_extension
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            host_fee_account: extras
-                .host_fee_account
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            rewards: extras
-                .rewards
-                .iter()
-                .filter_map(|reward| {
-                    let mint = reward.mint.as_ref().and_then(|value| parse_pubkey(value))?;
-                    let vault = reward
-                        .vault
-                        .as_ref()
-                        .and_then(|value| parse_pubkey(value))?;
-                    let funder = reward
-                        .funder
-                        .as_ref()
-                        .and_then(|value| parse_pubkey(value))
-                        .unwrap_or_else(Pubkey::default);
-                    Some(LbClmmRewardInfo {
-                        index: reward.index,
-                        mint,
-                        vault,
-                        funder,
-                    })
-                })
-                .collect(),
-            bin_step: extras.bin_step,
-            active_bin_id: extras.active_bin_id,
-            dynamic_fee_bps: extras.dynamic_fee_bps,
-            protocol_fee_bps: extras.protocol_fee_bps,
-            reserve_x_balance: extras.reserve_x_balance,
-            reserve_y_balance: extras.reserve_y_balance,
-            volatility_bps: extras.volatility_bps,
-            bin_liquidity,
-            active_bitmap,
-            corecast_slot: update.slot,
-            hydrated_meta_slot,
-            hydrated_window_slot,
-            meta_hydrated_at,
-            window_hydrated_at,
-            last_update_slot: update.slot,
-            last_update_at: Instant::now(),
-            token_x_transfer_fee: None,
-            token_y_transfer_fee: None,
-        };
-        self.attach_mint_metadata(&mut state);
-        self.ensure_token_programs(&mut state);
-        self.attach_transfer_fees(&mut state);
-        if !self.meta_ready_within_lag(&state) {
-            if let Some(hydrator) = self.hydrator.as_ref() {
-                hydrator.hydrate(pool_pubkey);
-            }
-        }
-        trace!(
-            target = "adapter::lb_clmm",
-            pool = %update.pool_id,
-            slot = update.slot,
-            base = %update.base_post_amount,
-            quote = %update.quote_post_amount,
-            "upserting lb_clmm pool state"
-        );
-
-        self.refresh_window(&state, state.active_bin_id);
-        self.register_templates_with_builder(&state);
-        self.record_hydration_metrics(&state);
-        drop(previous_state);
-        self.state.insert(pool_pubkey, state);
-        self.evict_stale(update.slot);
-    }
-
-    fn enrich_extras(&self, pool: Pubkey, mut extras: LbClmmPoolExtras) -> LbClmmPoolExtras {
-        let hydrator_ref = self.hydrator.as_ref();
-        if !needs_hydration(&extras) {
-            if let (Some(hydrator), Some(active_bin_id)) = (hydrator_ref, extras.active_bin_id) {
-                hydrator.ensure_window(pool, active_bin_id);
-            }
-            return extras;
-        }
-
-        let Some(hydrator) = hydrator_ref else {
-            return extras;
-        };
-
-        let meta = hydrator
-            .hydrate(pool)
-            .or_else(|| hydrator.hydrate_blocking(pool));
-
-        if let Some(meta) = meta {
-            extras.token_x_mint = extras
-                .token_x_mint
-                .or_else(|| Some(meta.token_x_mint.to_string()));
-            extras.token_y_mint = extras
-                .token_y_mint
-                .or_else(|| Some(meta.token_y_mint.to_string()));
-            extras.reserve_x = extras
-                .reserve_x
-                .or_else(|| Some(meta.reserve_x.to_string()));
-            extras.reserve_y = extras
-                .reserve_y
-                .or_else(|| Some(meta.reserve_y.to_string()));
-            extras.oracle = extras.oracle.or_else(|| Some(meta.oracle.to_string()));
-            extras.token_x_program = extras
-                .token_x_program
-                .or_else(|| meta.token_x_program.map(|pk| pk.to_string()));
-            extras.token_y_program = extras
-                .token_y_program
-                .or_else(|| meta.token_y_program.map(|pk| pk.to_string()));
-            extras.bin_step = extras.bin_step.or(Some(meta.bin_step));
-            extras.active_bin_id = extras.active_bin_id.or(Some(meta.active_bin_id));
-            if extras.bin_arrays.is_empty() && !meta.bin_arrays.is_empty() {
-                extras.bin_arrays = meta.bin_arrays.clone();
-            }
-            if extras.active_bitmap.is_none() {
-                extras.active_bitmap = Some(meta.active_bitmap.clone());
-            }
-            if extras.rewards.is_empty() && !meta.rewards.is_empty() {
-                extras.rewards = meta
-                    .rewards
-                    .iter()
-                    .map(|reward| LbClmmRewardExtras {
-                        index: reward.index,
-                        mint: Some(reward.mint.to_string()),
-                        vault: Some(reward.vault.to_string()),
-                        funder: Some(reward.funder.to_string()),
-                    })
-                    .collect();
-            }
-            extras.hydrated_slot = Some(meta.hydrated_slot);
-            extras.hydrated_at = Some(meta.hydrated_at);
-        }
-
-        if let Some(active_bin_id) = extras.active_bin_id {
-            hydrator.ensure_window(pool, active_bin_id);
-        }
-
-        extras
-    }
-
-    fn register_templates_with_builder(&self, state: &LbClmmState) {
-        self.ensure_templates_for_epoch(state, None, "adapter state update", false);
-    }
-
-    fn ensure_templates_for_epoch(
-        &self,
-        state: &LbClmmState,
-        epoch_override: Option<u64>,
-        reason: &'static str,
-        force_refresh: bool,
-    ) {
-        let Some(builder) = self.template_builder.as_ref() else {
-            return;
-        };
-
-        if !self.meta_ready_within_lag(state) {
-            trace!(
-                target = "adapter::lb_clmm",
-                pool = %state.lb_pair,
-                slot = state.corecast_slot,
-                reason = reason,
-                "deferring template registration until meta hydration completes"
-            );
-            self.record_component_lag_event(state, HydrationComponent::Meta, reason);
-            return;
-        }
-
-        let epoch = epoch_override.unwrap_or_else(|| builder.template_cache().epoch());
-        if !force_refresh && self.template_epoch_ready(state.lb_pair, epoch) {
-            return;
-        }
-
-        let (Some(token_x_program), Some(token_y_program)) =
-            (state.token_x_program, state.token_y_program)
-        else {
-            warn!(
-                target = "adapter::lb_clmm",
-                pool = %state.lb_pair,
-                "lb_clmm pool missing token program metadata; skipping registration"
-            );
-            return;
-        };
-        let alt_accounts = build_lb_clmm_alt_accounts(state, token_x_program, token_y_program);
-
-        let fee_tier_bps = state.taker_fee_bps().min(u64::from(u16::MAX)) as u16;
-        let pool_accounts = LbClmmPoolAccounts {
-            reserve_x: state.reserve_x,
-            reserve_y: state.reserve_y,
-            token_x_mint: state.token_x_mint,
-            token_y_mint: state.token_y_mint,
-            oracle: state.oracle,
-            bin_array_bitmap_extension: state.bin_array_bitmap_extension,
-            token_x_program,
-            token_y_program,
-            host_fee_in: state.host_fee_account,
-        };
-
-        debug!(
-            target = "adapter::lb_clmm",
-            pool = %state.lb_pair,
-            epoch,
-            reason = reason,
-            "registering lb_clmm instruction templates"
-        );
-
-        builder.register_lb_clmm_pool(LbClmmPoolMeta {
-            pool_id: state.lb_pair,
-            fee_tier_bps,
-            alt_accounts,
-            alt_handle: None,
-            accounts: pool_accounts,
-        });
-
-        self.registered_templates
-            .insert(state.lb_pair, LbTemplateRegistration { epoch });
-    }
-
-    fn template_epoch_ready(&self, pool: Pubkey, epoch: u64) -> bool {
-        self.registered_templates
-            .get(&pool)
-            .map(|entry| entry.epoch == epoch)
-            .unwrap_or(false)
-    }
-
-    fn meta_ready_within_lag(&self, state: &LbClmmState) -> bool {
-        state.meta_ready_within_lag(
-            state.corecast_slot,
-            self.config.hydration_slot_lag_tolerance,
-            self.config.hydration_lag_ms_tolerance,
-        )
-    }
-
-    fn window_ready_within_lag(&self, state: &LbClmmState) -> bool {
-        state.bin_window_ready_within_lag(
-            state.corecast_slot,
-            self.config.hydration_slot_lag_tolerance,
-            self.config.hydration_lag_ms_tolerance,
-        )
-    }
-
-    fn component_lag(
-        &self,
-        state: &LbClmmState,
-        component: HydrationComponent,
-    ) -> (Option<u64>, Option<u64>) {
-        let lag_slots = match component {
-            HydrationComponent::Meta => state.meta_lag_slots(state.corecast_slot),
-            HydrationComponent::BinWindow => state.window_lag_slots(state.corecast_slot),
-            _ => None,
-        };
-        let lag_ms = match component {
-            HydrationComponent::Meta => state.meta_hydration_age_ms(),
-            HydrationComponent::BinWindow => state.window_hydration_age_ms(),
-            _ => None,
-        };
-        (lag_slots, lag_ms)
-    }
-
-    fn should_log_component_lag(
-        &self,
-        pool: Pubkey,
-        component: HydrationComponent,
-        lag_slots: Option<u64>,
-        lag_ms: Option<u64>,
-    ) -> bool {
-        let slot_over = lag_slots
-            .map(|slots| slots > self.config.hydration_slot_lag_tolerance)
-            .unwrap_or(false);
-        let time_over = lag_ms
-            .map(|ms| ms > self.config.hydration_lag_ms_tolerance)
-            .unwrap_or(false);
-        if !(slot_over || time_over) {
-            return false;
-        }
-        let key = (pool, component.index() as u8);
-        if let Some(entry) = self.lag_log.get(&key) {
-            if entry.value().elapsed().as_millis() as u64 <= HYDRATION_LAG_LOG_INTERVAL_MS {
-                return false;
-            }
-        }
-        self.lag_log.insert(key, Instant::now());
-        true
-    }
-
-    fn record_component_lag_event(
-        &self,
-        state: &LbClmmState,
-        component: HydrationComponent,
-        context: &'static str,
-    ) {
-        let (lag_slots, lag_ms) = self.component_lag(state, component);
-        telemetry::record_hydration_component_pending(
-            self.name(),
-            component.as_str(),
-            lag_ms,
-            lag_slots,
-        );
-        if self.should_log_component_lag(state.lb_pair, component, lag_slots, lag_ms) {
-            let hydrated_slot = match component {
-                HydrationComponent::Meta => state.hydrated_meta_slot,
-                HydrationComponent::BinWindow => state.hydrated_window_slot,
-                _ => None,
-            };
-            warn!(
-                target = "adapter::lb_clmm",
-                pool = %state.lb_pair,
-                component = component.as_str(),
-                context,
-                corecast_slot = state.corecast_slot,
-                hydrated_slot,
-                lag_slots,
-                lag_ms,
-                "lb_clmm hydration lag exceeds tolerance"
-            );
-        }
-    }
-
-    fn record_hydration_metrics(&self, state: &LbClmmState) {
-        let adapter = "lb_clmm";
-        let meta_slot = state.hydrated_meta_slot.unwrap_or(0);
-        let window_slot = state.hydrated_window_slot.unwrap_or(0);
-        let meta_delta = state.corecast_slot.saturating_sub(meta_slot);
-        let window_delta = state.corecast_slot.saturating_sub(window_slot);
-
-        telemetry::record_hydration_component_slot_delta(
-            adapter,
-            HydrationComponent::Meta.as_str(),
-            meta_delta,
-        );
-        telemetry::record_hydration_component_slot_delta(
-            adapter,
-            HydrationComponent::BinWindow.as_str(),
-            window_delta,
-        );
-
-        let meta_ready = self.meta_ready_within_lag(state);
-        let window_ready = self.window_ready_within_lag(state);
-        let stage = if !meta_ready {
-            0
-        } else if !window_ready {
-            1
-        } else {
-            2
-        };
-        telemetry::record_hydration_stage(adapter, &state.lb_pair.to_string(), stage);
-        if !meta_ready {
-            self.record_component_lag_event(state, HydrationComponent::Meta, "metrics_meta_pending");
-        }
-        if !window_ready {
-            self.record_component_lag_event(state, HydrationComponent::BinWindow, "metrics_window_pending");
-        }
-    }
-
-    fn mint_metadata(&self, mint: Pubkey) -> Option<MintMetadata> {
-        self.mint_metadata_cache
-            .as_ref()
-            .and_then(|cache| cache.hydrate(mint))
-    }
-
-    fn attach_mint_metadata(&self, state: &mut LbClmmState) {
-        if let Some(meta) = self.mint_metadata(state.token_x_mint) {
-            if state.token_x_decimals.is_none() {
-                state.token_x_decimals = meta.decimals;
-            }
-            if state.token_x_program.is_none() {
-                state.token_x_program = Some(meta.program_id);
-            }
-        }
-
-        if let Some(meta) = self.mint_metadata(state.token_y_mint) {
-            if state.token_y_decimals.is_none() {
-                state.token_y_decimals = meta.decimals;
-            }
-            if state.token_y_program.is_none() {
-                state.token_y_program = Some(meta.program_id);
-            }
-        }
-    }
-
-    fn ensure_token_programs(&self, state: &mut LbClmmState) {
-        if state.token_x_program.is_none() {
-            state.token_x_program = self.resolve_token_program(state.token_x_mint);
-        }
-        if state.token_y_program.is_none() {
-            state.token_y_program = self.resolve_token_program(state.token_y_mint);
-        }
-    }
-
-    fn attach_transfer_fees(&self, state: &mut LbClmmState) {
-        state.token_x_transfer_fee =
-            self.resolve_transfer_fee(state.token_x_mint, state.token_x_program);
-        state.token_y_transfer_fee =
-            self.resolve_transfer_fee(state.token_y_mint, state.token_y_program);
-    }
-
-    fn resolve_token_program(&self, mint: Pubkey) -> Option<Pubkey> {
-        if let Some(cache) = self.mint_metadata_cache.as_ref() {
-            if let Some(meta) = cache.hydrate(mint) {
-                return Some(meta.program_id);
-            }
-        }
-        self.transfer_fee_cache
-            .as_ref()
-            .and_then(|cache| cache.mint_program(mint))
-    }
-
-    fn resolve_transfer_fee(
-        &self,
-        mint: Pubkey,
-        program: Option<Pubkey>,
-    ) -> Option<TokenTransferFee> {
-        let cache = self.transfer_fee_cache.as_ref()?;
-        let program_id = match program {
-            Some(id) => id,
-            None => cache.mint_program(mint)?,
-        };
-        if program_id != *SPL_TOKEN_2022_PROGRAM_PUBKEY {
-            return None;
-        }
-        cache.hydrate(mint)
-    }
-
-    fn decorate_swap_context(
-        &self,
-        state: &LbClmmState,
-        context: &mut TemplateContext,
-        input_mint: Pubkey,
-        output_mint: Pubkey,
-    ) {
-        let input_program = token_program_for_mint(state, &input_mint);
-        let output_program = token_program_for_mint(state, &output_mint);
-        if context.input_token_program.is_none() {
-            context.input_token_program = Some(input_program);
-        }
-        if context.output_token_program.is_none() {
-            context.output_token_program = Some(output_program);
-        }
-        if context.input_transfer_fee_config.is_none() {
-            context.input_transfer_fee_config =
-                transfer_fee_hint(state.transfer_fee_for_mint(input_mint));
-        }
-        if context.output_transfer_fee_config.is_none() {
-            context.output_transfer_fee_config =
-                transfer_fee_hint(state.transfer_fee_for_mint(output_mint));
-        }
-
-        let Some(builder) = self.template_builder.as_ref() else {
-            return;
-        };
-        if context.payer.is_none() {
-            context.payer = Some(builder.payer_pubkey());
-        }
-
-        if context.input_token_account.is_none() {
-            if let Some(ata) = builder.token_account_for_mint(&input_mint) {
-                context.input_token_account = Some(ata);
-            } else {
-                warn!(
-                    target = "adapter::lb_clmm",
-                    pool = %state.lb_pair,
-                    mint = %input_mint,
-                    "missing configured input token ATA"
-                );
-            }
-        }
-
-        if context.output_token_account.is_none() {
-            if let Some(ata) = builder.token_account_for_mint(&output_mint) {
-                context.output_token_account = Some(ata);
-            } else {
-                warn!(
-                    target = "adapter::lb_clmm",
-                    pool = %state.lb_pair,
-                    mint = %output_mint,
-                    "missing configured output token ATA"
-                );
-            }
-        }
-
-        if context.host_fee_account.is_none() {
-            if let Some(host_fee) = builder.host_fee_account_for_mint(&input_mint) {
-                context.host_fee_account = Some(host_fee);
-            }
-        }
-    }
-
-    fn attach_transfer_hook_accounts(
-        &self,
-        state: &LbClmmState,
-        context: &mut TemplateContext,
-        input_mint: Pubkey,
-        output_mint: Pubkey,
-    ) {
-        let builder = self.template_builder.as_ref();
-        if let Some(resolver) = self.transfer_hook_resolver.as_ref() {
-            let token_types = [
-                LbClmmAccountsType::TransferHookX,
-                LbClmmAccountsType::TransferHookY,
-            ];
-
-            for accounts_type in token_types {
-                if let Some((accounts, slice)) = self.collect_transfer_hook_accounts(
-                    resolver,
-                    state,
-                    context,
-                    accounts_type,
-                    input_mint,
-                    output_mint,
-                ) {
-                    if !accounts.is_empty() {
-                        context.remaining_accounts.extend(accounts.into_iter());
-                        context.lb_clmm_remaining_accounts.push(slice);
-                    }
-                }
-            }
         }
         self.attach_reward_transfer_hook_accounts(
-            builder,
             self.transfer_hook_resolver.as_ref(),
             state,
             context,
@@ -938,7 +78,6 @@ impl LbClmmAdapter {
 
     fn attach_reward_transfer_hook_accounts(
         &self,
-        builder: Option<&BuilderHandle>,
         resolver: Option<&TransferHookAccountsResolver>,
         state: &LbClmmState,
         context: &mut TemplateContext,
@@ -950,9 +89,7 @@ impl LbClmmAdapter {
         let mut rewards: Vec<_> = state.rewards.iter().collect();
         rewards.sort_by_key(|reward| reward.index);
 
-        let reward_authority = context
-            .payer
-            .or_else(|| builder.map(|handle| handle.payer_pubkey()));
+        let reward_authority = context.payer;
         let mut token_2022_entries = Vec::new();
         for reward in rewards {
             let mut token_program = *SPL_TOKEN_PROGRAM_PUBKEY;
@@ -962,17 +99,9 @@ impl LbClmmAdapter {
                 }
             }
 
-            let mut user_token_account =
-                builder.and_then(|handle| handle.token_account_for_mint(&reward.mint));
-            if user_token_account.is_none() {
-                if let Some(owner) = reward_authority {
-                    user_token_account = Some(derive_associated_token_address(
-                        &owner,
-                        &reward.mint,
-                        &token_program,
-                    ));
-                }
-            }
+            let mut user_token_account = reward_authority.map(|owner| {
+                derive_associated_token_address(&owner, &reward.mint, &token_program)
+            });
             let mut reward_context = LbClmmRewardAccountContext {
                 pool: state.lb_pair,
                 index: reward.index,
@@ -1121,29 +250,13 @@ impl LbClmmAdapter {
         hook_contexts
     }
 
-    fn refresh_window(&self, state: &LbClmmState, target_bin: Option<i32>) {
-        let Some(bin_id) = target_bin.or(state.active_bin_id) else {
-            return;
-        };
-        if let Some(hydrator) = self.hydrator.as_ref() {
-            hydrator.ensure_window(state.lb_pair, bin_id);
-        }
-    }
-
     fn eager_hydration(
         &self,
         pool: Pubkey,
         token_x_hint: Option<Pubkey>,
         token_y_hint: Option<Pubkey>,
     ) {
-        if let Some(hydrator) = self.hydrator.as_ref() {
-            hydrator.hydrate(pool);
-        }
-
         if let Some(state) = self.get_state(&pool) {
-            if let (Some(bin_id), Some(hydrator)) = (state.active_bin_id, self.hydrator.as_ref()) {
-                hydrator.ensure_window(pool, bin_id);
-            }
             self.warm_state_mints(&state);
             return;
         }
@@ -1165,9 +278,6 @@ impl LbClmmAdapter {
     }
 
     fn warm_mint_artifacts(&self, mint: Pubkey) {
-        if let Some(cache) = self.mint_metadata_cache.as_ref() {
-            cache.hydrate(mint);
-        }
         if let Some(cache) = self.transfer_fee_cache.as_ref() {
             cache.hydrate(mint);
         }
@@ -1176,57 +286,21 @@ impl LbClmmAdapter {
         }
     }
 
-    fn clamp_request_amount(
-        &self,
-        state: &LbClmmState,
-        req: &QuoteRequest,
-    ) -> Result<u64, QuoteStatus> {
-        if req.amount == 0 {
-            return Ok(0);
-        }
+    fn clamp_request_amount(&self, state: &LbClmmState, req: &QuoteRequest) -> u64 {
         match state.resolve_reserves(&req.input_mint, &req.output_mint) {
             Some((reserve, _)) => {
-                if reserve == 0 {
-                    return Err(QuoteStatus::InsufficientLiquidity);
-                }
-                let capped = clamp_amount_to_reserve(
-                    req.amount,
-                    reserve,
-                    self.config.max_swap_utilization_bps,
-                );
-                if capped == 0 {
-                    return Err(QuoteStatus::PriceImpactExceeded);
-                }
-                Ok(capped)
+                clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps)
             }
-            None => Ok(req.amount),
+            None => req.amount,
         }
     }
 
-    fn clamp_request_output_amount(
-        &self,
-        state: &LbClmmState,
-        req: &QuoteRequest,
-    ) -> Result<u64, QuoteStatus> {
-        if req.amount == 0 {
-            return Ok(0);
-        }
+    fn clamp_request_output_amount(&self, state: &LbClmmState, req: &QuoteRequest) -> u64 {
         match state.resolve_reserves(&req.input_mint, &req.output_mint) {
             Some((_, reserve)) => {
-                if reserve == 0 {
-                    return Err(QuoteStatus::InsufficientLiquidity);
-                }
-                let capped = clamp_amount_to_reserve(
-                    req.amount,
-                    reserve,
-                    self.config.max_swap_utilization_bps,
-                );
-                if capped == 0 {
-                    return Err(QuoteStatus::PriceImpactExceeded);
-                }
-                Ok(capped)
+                clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps)
             }
-            None => Ok(req.amount),
+            None => req.amount,
         }
     }
 
@@ -1332,7 +406,7 @@ impl LbClmmAdapter {
                 "quote_to_base"
             },
             status = ?status,
-            reason = reason,
+            reason,
             probe_amount,
             missing_bin_id,
             observed_slippage_bps,
@@ -1462,9 +536,6 @@ impl LbClmmAdapter {
                 })
             }
             Err(err) => {
-                if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
-                    self.refresh_window(state, err.missing_bin_id());
-                }
                 let reason = match err {
                     LbClmmSimulationError::MissingState => "missing_state",
                     LbClmmSimulationError::InsufficientLiquidity => "insufficient_liquidity",
@@ -1557,9 +628,6 @@ impl LbClmmAdapter {
                     }
                 }
                 Err(err) => {
-                    if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
-                        self.refresh_window(state, err.missing_bin_id());
-                    }
                     return Err(err);
                 }
             }
@@ -1585,9 +653,6 @@ impl LbClmmAdapter {
             let simulation = match self.simulate_exact_in_with_transfer_fees(state, &scoped_req) {
                 Ok(sim) => sim,
                 Err(err) => {
-                    if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
-                        self.refresh_window(state, err.missing_bin_id());
-                    }
                     return Err(err);
                 }
             };
@@ -1640,29 +705,12 @@ impl ProtocolAdapter for LbClmmAdapter {
     }
 
     fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
-        snapshot.hydration.require(HydrationComponent::Meta);
-        snapshot.hydration.require(HydrationComponent::BinWindow);
         let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
             return;
         };
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
-        if self.meta_ready_within_lag(&state) {
-            snapshot
-                .hydration
-                .mark_ready(HydrationComponent::Meta, state.last_update_slot);
-        } else {
-            self.record_component_lag_event(&state, HydrationComponent::Meta, "snapshot_meta_pending");
-        }
-        if self.window_ready_within_lag(&state) {
-            snapshot
-                .hydration
-                .mark_ready(HydrationComponent::BinWindow, state.last_update_slot);
-        } else {
-            self.record_component_lag_event(&state, HydrationComponent::BinWindow, "snapshot_window_pending");
-            self.refresh_window(&state, state.active_bin_id);
-        }
         let extras = snapshot
             .extensions
             .lb_clmm
@@ -1698,46 +746,6 @@ impl ProtocolAdapter for LbClmmAdapter {
             .get_or_insert_with(|| state.token_y_mint.to_string());
     }
 
-    fn warm_components(&self, snapshot: &PoolSnapshot, components: &[HydrationComponent]) {
-        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
-            return;
-        };
-        if components.contains(&HydrationComponent::Meta) {
-            if let Some(hydrator) = self.hydrator.as_ref() {
-                hydrator.hydrate(pool_pubkey);
-            }
-        }
-        if components.contains(&HydrationComponent::BinWindow) {
-            if let Some(state) = self.get_state(&pool_pubkey) {
-                self.refresh_window(&state, state.active_bin_id);
-            }
-        }
-    }
-
-    fn refresh_templates(&self, epoch: u64) {
-        if self.template_builder.is_none() {
-            return;
-        }
-        let states: Vec<LbClmmState> = self.state.iter().map(|entry| entry.clone()).collect();
-        for state in states {
-            self.ensure_templates_for_epoch(&state, Some(epoch), "cache epoch refresh", false);
-        }
-    }
-
-    fn refresh_pool_templates(&self, pool: Pubkey, epoch: u64) {
-        if self.template_builder.is_none() {
-            return;
-        }
-        if let Some(state) = self.get_state(&pool) {
-            self.ensure_templates_for_epoch(
-                &state,
-                Some(epoch),
-                "template readiness refresh",
-                true,
-            );
-        }
-    }
-
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
@@ -1749,29 +757,19 @@ impl ProtocolAdapter for LbClmmAdapter {
             response.status = QuoteStatus::StaleState;
             return Some(response);
         }
-        if !self.meta_ready_within_lag(&state) {
-            self.record_component_lag_event(&state, HydrationComponent::Meta, "quote_exact_in");
+        if !state.meta_ready_for_slot(state.corecast_slot) {
             return Some(quote_status_response(
                 request.clone(),
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
             ));
         }
-        if !self.window_ready_within_lag(&state) {
-            self.record_component_lag_event(&state, HydrationComponent::BinWindow, "quote_exact_in");
-            self.refresh_window(&state, state.active_bin_id);
+        if !state.bin_window_ready_for_slot(state.corecast_slot) {
             return Some(quote_status_response(
                 request.clone(),
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
             ));
         }
-        let capped = match self.clamp_request_amount(&state, &request) {
-            Ok(value) => value,
-            Err(status) => {
-                let mut response = build_quote_response(request, 0);
-                response.status = status;
-                return Some(response);
-            }
-        };
+        let capped = self.clamp_request_amount(&state, &request);
         if capped == 0 {
             return None;
         }
@@ -1779,9 +777,6 @@ impl ProtocolAdapter for LbClmmAdapter {
         let adjusted = match self.simulate_exact_in_with_transfer_fees(&state, &request) {
             Ok(outcome) => outcome,
             Err(err) => {
-                if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
-                    self.refresh_window(&state, err.missing_bin_id());
-                }
                 let mut response = build_quote_response(request, 0);
                 response.status = err.into();
                 return Some(response);
@@ -1836,29 +831,19 @@ impl ProtocolAdapter for LbClmmAdapter {
             response.status = QuoteStatus::StaleState;
             return Some(response);
         }
-        if !self.meta_ready_within_lag(&state) {
-            self.record_component_lag_event(&state, HydrationComponent::Meta, "quote_exact_out");
+        if !state.meta_ready_for_slot(state.corecast_slot) {
             return Some(quote_status_response(
                 request.clone(),
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
             ));
         }
-        if !self.window_ready_within_lag(&state) {
-            self.record_component_lag_event(&state, HydrationComponent::BinWindow, "quote_exact_out");
-            self.refresh_window(&state, state.active_bin_id);
+        if !state.bin_window_ready_for_slot(state.corecast_slot) {
             return Some(quote_status_response(
                 request.clone(),
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
             ));
         }
-        let capped = match self.clamp_request_output_amount(&state, &request) {
-            Ok(value) => value,
-            Err(status) => {
-                let mut response = build_quote_response(request, 0);
-                response.status = status;
-                return Some(response);
-            }
-        };
+        let capped = self.clamp_request_output_amount(&state, &request);
         if capped == 0 {
             return None;
         }
@@ -1867,9 +852,6 @@ impl ProtocolAdapter for LbClmmAdapter {
             match self.find_input_for_exact_out_with_transfer_fees(&state, &request, capped) {
                 Ok(result) => result,
                 Err(err) => {
-                    if matches!(err, LbClmmSimulationError::InsufficientBins { .. }) {
-                        self.refresh_window(&state, err.missing_bin_id());
-                    }
                     let mut response = build_quote_response(request, 0);
                     response.status = err.into();
                     return Some(response);
@@ -1945,13 +927,12 @@ impl ProtocolAdapter for LbClmmAdapter {
             return None;
         }
 
-        if !self.meta_ready_within_lag(&state) {
-            self.record_component_lag_event(&state, HydrationComponent::Meta, "snapshot_quotes");
+        if !state.meta_ready_for_slot(state.corecast_slot) {
             self.record_snapshot_issue(
                 &state,
                 snapshot.slot,
                 true,
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
                 "meta_pending",
                 None,
                 None,
@@ -1961,7 +942,7 @@ impl ProtocolAdapter for LbClmmAdapter {
                 &state,
                 snapshot.slot,
                 false,
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
                 "meta_pending",
                 None,
                 None,
@@ -1970,14 +951,12 @@ impl ProtocolAdapter for LbClmmAdapter {
             return None;
         }
 
-        if !self.window_ready_within_lag(&state) {
-            self.record_component_lag_event(&state, HydrationComponent::BinWindow, "snapshot_quotes");
-            self.refresh_window(&state, state.active_bin_id);
+        if !state.bin_window_ready_for_slot(state.corecast_slot) {
             self.record_snapshot_issue(
                 &state,
                 snapshot.slot,
                 true,
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
                 "bin_window_pending",
                 None,
                 None,
@@ -1987,7 +966,7 @@ impl ProtocolAdapter for LbClmmAdapter {
                 &state,
                 snapshot.slot,
                 false,
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
                 "bin_window_pending",
                 None,
                 None,
@@ -2142,8 +1121,6 @@ pub struct LbClmmState {
     pub lb_pair: Pubkey,
     pub token_x_mint: Pubkey,
     pub token_y_mint: Pubkey,
-    pub token_x_decimals: Option<u8>,
-    pub token_y_decimals: Option<u8>,
     pub token_x_program: Option<Pubkey>,
     pub token_y_program: Option<Pubkey>,
     pub token_x_transfer_fee: Option<TokenTransferFee>,
@@ -2166,8 +1143,7 @@ pub struct LbClmmState {
     pub corecast_slot: u64,
     pub hydrated_meta_slot: Option<u64>,
     pub hydrated_window_slot: Option<u64>,
-    pub meta_hydrated_at: Option<Instant>,
-    pub window_hydrated_at: Option<Instant>,
+    pub last_hydrated_at: Option<Instant>,
     pub last_update_slot: u64,
     pub last_update_at: Instant,
 }
@@ -2233,27 +1209,6 @@ impl LbClmmState {
         self.meta_ready() && Self::hydration_slot_ready(self.hydrated_meta_slot, slot)
     }
 
-    fn meta_ready_within_lag(
-        &self,
-        slot: u64,
-        slot_lag_tolerance: u64,
-        lag_ms_tolerance: u64,
-    ) -> bool {
-        if !self.meta_ready() {
-            return false;
-        }
-        if Self::hydration_slot_within_tolerance(self.hydrated_meta_slot, slot, slot_lag_tolerance)
-        {
-            return true;
-        }
-        if lag_ms_tolerance == 0 {
-            return false;
-        }
-        self.meta_hydration_age_ms()
-            .map(|age| age <= lag_ms_tolerance)
-            .unwrap_or(false)
-    }
-
     fn bin_window_ready(&self) -> bool {
         let active_bin = match self.active_bin_id {
             Some(bin) => bin,
@@ -2279,60 +1234,6 @@ impl LbClmmState {
 
     fn hydration_slot_ready(slot: Option<u64>, target: u64) -> bool {
         slot.map(|value| value >= target).unwrap_or(false)
-    }
-
-    fn bin_window_ready_within_lag(
-        &self,
-        slot: u64,
-        slot_lag_tolerance: u64,
-        lag_ms_tolerance: u64,
-    ) -> bool {
-        if !self.bin_window_ready() {
-            return false;
-        }
-        if Self::hydration_slot_within_tolerance(
-            self.hydrated_window_slot,
-            slot,
-            slot_lag_tolerance,
-        ) {
-            return true;
-        }
-        if lag_ms_tolerance == 0 {
-            return false;
-        }
-        self.window_hydration_age_ms()
-            .map(|age| age <= lag_ms_tolerance)
-            .unwrap_or(false)
-    }
-
-    fn hydration_slot_within_tolerance(
-        slot: Option<u64>,
-        target: u64,
-        tolerance: u64,
-    ) -> bool {
-        slot
-            .map(|hydrated| hydrated >= target || target.saturating_sub(hydrated) <= tolerance)
-            .unwrap_or(false)
-    }
-
-    fn meta_hydration_age_ms(&self) -> Option<u64> {
-        self.meta_hydrated_at
-            .map(|instant| instant.elapsed().as_millis() as u64)
-    }
-
-    fn window_hydration_age_ms(&self) -> Option<u64> {
-        self.window_hydrated_at
-            .map(|instant| instant.elapsed().as_millis() as u64)
-    }
-
-    fn meta_lag_slots(&self, slot: u64) -> Option<u64> {
-        self.hydrated_meta_slot
-            .map(|hydrated| slot.saturating_sub(hydrated))
-    }
-
-    fn window_lag_slots(&self, slot: u64) -> Option<u64> {
-        self.hydrated_window_slot
-            .map(|hydrated| slot.saturating_sub(hydrated))
     }
 
     fn taker_fee_bps(&self) -> u64 {
@@ -2541,7 +1442,7 @@ impl From<LbClmmSimulationError> for QuoteStatus {
         match value {
             LbClmmSimulationError::MissingState => QuoteStatus::MissingState,
             LbClmmSimulationError::InsufficientLiquidity => QuoteStatus::InsufficientLiquidity,
-            LbClmmSimulationError::InsufficientBins { .. } => QuoteStatus::HydrationPending,
+            LbClmmSimulationError::InsufficientBins { .. } => QuoteStatus::InsufficientBins,
             LbClmmSimulationError::PriceImpactExceeded { .. } => QuoteStatus::PriceImpactExceeded,
         }
     }
@@ -2958,756 +1859,6 @@ fn parse_pubkey(value: &str) -> Option<Pubkey> {
     Pubkey::from_str(value).ok()
 }
 
-#[derive(Clone, Debug)]
-struct HydratedRewardInfo {
-    index: u8,
-    mint: Pubkey,
-    vault: Pubkey,
-    funder: Pubkey,
-}
-
-#[derive(Clone, Debug)]
-struct HydratedPoolMeta {
-    token_x_mint: Pubkey,
-    token_y_mint: Pubkey,
-    reserve_x: Pubkey,
-    reserve_y: Pubkey,
-    oracle: Pubkey,
-    token_x_program: Option<Pubkey>,
-    token_y_program: Option<Pubkey>,
-    bin_step: u16,
-    active_bin_id: i32,
-    bin_arrays: Vec<LbClmmBinArrayExtras>,
-    active_bitmap: LbClmmBitmapExtras,
-    rewards: Vec<HydratedRewardInfo>,
-    hydrated_slot: u64,
-    hydrated_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BinWindow {
-    start_index: i64,
-    end_index: i64,
-    start_bin_id: i32,
-    end_bin_id: i32,
-}
-
-impl BinWindow {
-    fn around(center_bin_id: i32) -> Self {
-        let center_index = array_index_for_bin(center_bin_id);
-        let start_index = center_index.saturating_sub(TARGETED_BIN_ARRAY_RADIUS);
-        let end_index = center_index.saturating_add(TARGETED_BIN_ARRAY_RADIUS);
-        Self::from_indices(start_index, end_index)
-    }
-
-    fn from_arrays(arrays: &[LbClmmBinArrayExtras]) -> Option<Self> {
-        if arrays.is_empty() {
-            return None;
-        }
-        let start_bin = arrays.iter().map(|array| array.start_bin_id).min()?;
-        let end_bin = arrays
-            .iter()
-            .map(|array| array.start_bin_id.saturating_add(MAX_BIN_PER_ARRAY - 1))
-            .max()?;
-        let start_index = array_index_for_bin(start_bin);
-        let end_index = array_index_for_bin(end_bin);
-        Some(Self::from_indices(start_index, end_index))
-    }
-
-    fn from_indices(start_index: i64, end_index: i64) -> Self {
-        let start_bin_id = start_bin_id_from_index(start_index).unwrap_or(i32::MIN);
-        let end_start = start_bin_id_from_index(end_index).unwrap_or(i32::MAX);
-        let end_bin_id = end_start.saturating_add(MAX_BIN_PER_ARRAY - 1);
-        Self {
-            start_index,
-            end_index,
-            start_bin_id,
-            end_bin_id,
-        }
-    }
-
-    fn contains(&self, bin_id: i32) -> bool {
-        bin_id >= self.start_bin_id && bin_id <= self.end_bin_id
-    }
-
-    fn needs_refresh(&self, active_bin_id: i32) -> bool {
-        if !self.contains(active_bin_id) {
-            return true;
-        }
-        let left_margin = active_bin_id.saturating_sub(self.start_bin_id);
-        let right_margin = self.end_bin_id.saturating_sub(active_bin_id);
-        left_margin < BIN_WINDOW_EDGE_BUFFER_BINS || right_margin < BIN_WINDOW_EDGE_BUFFER_BINS
-    }
-
-    fn indices(&self) -> impl Iterator<Item = i64> {
-        self.start_index..=self.end_index
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum BinFetchPlan {
-    Full,
-    Window(BinWindow),
-}
-
-struct LbClmmPoolHydrator {
-    program_id: Pubkey,
-    hydrator: AsyncHydrator<Pubkey, HydratedPoolMeta>,
-    cache: Arc<DashMap<Pubkey, HydratedValue<HydratedPoolMeta>>>,
-    extensions_pending: Arc<DashSet<Pubkey>>,
-    window_cache: Arc<DashMap<Pubkey, BinWindow>>,
-    clients: Arc<Vec<Arc<RpcClient>>>,
-    endpoint_count: usize,
-}
-
-impl LbClmmPoolHydrator {
-    fn new(program_id: Pubkey, config: &LbClmmAdapterConfig) -> Option<Self> {
-        if config.rpc_endpoints.is_empty() {
-            return None;
-        }
-
-        let timeout = Duration::from_millis(config.rpc_timeout_ms.max(100));
-        let clients: Vec<Arc<RpcClient>> = config
-            .rpc_endpoints
-            .iter()
-            .map(|url| Arc::new(RpcClient::new_with_timeout(url.clone(), timeout)))
-            .collect();
-
-        if clients.is_empty() {
-            return None;
-        }
-
-        let endpoint_count = clients.len();
-        let clients = Arc::new(clients);
-        let fetch_clients = clients.clone();
-        let cache = Arc::new(DashMap::new());
-        let cache_for_fetch = cache.clone();
-        let extensions_pending = Arc::new(DashSet::new());
-        let pending_for_fetch = extensions_pending.clone();
-        let window_cache = Arc::new(DashMap::new());
-        let window_cache_for_fetch = window_cache.clone();
-        let hydrator = AsyncHydrator::with_cache(
-            "lb_clmm_pool",
-            endpoint_count,
-            move |pool| {
-                fetch_lb_clmm_meta(
-                    program_id,
-                    fetch_clients.as_ref(),
-                    pool,
-                    cache_for_fetch.clone(),
-                    pending_for_fetch.clone(),
-                    window_cache_for_fetch.clone(),
-                )
-            },
-            cache.clone(),
-        );
-
-        Some(Self {
-            program_id,
-            hydrator,
-            cache,
-            extensions_pending,
-            window_cache,
-            clients,
-            endpoint_count,
-        })
-    }
-
-    fn client_count(&self) -> usize {
-        self.endpoint_count
-    }
-
-    fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        if let Some(entry) = self.hydrator.cached(&pool) {
-            if entry.bin_arrays.is_empty() {
-                self.hydrator.schedule(pool);
-            }
-            return Some(entry);
-        }
-        self.hydrator.get_or_schedule(pool)
-    }
-
-    fn hydrate_blocking(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        if let Some(entry) = self.cache.get(&pool) {
-            return Some(entry.value().value.clone());
-        }
-
-        let clients: &[Arc<RpcClient>] = self.clients.as_ref().as_slice();
-        fetch_lb_clmm_meta(
-            self.program_id,
-            clients,
-            pool,
-            self.cache.clone(),
-            self.extensions_pending.clone(),
-            self.window_cache.clone(),
-        )
-        .map(|entry| entry.value)
-    }
-
-    fn ensure_window(&self, pool: Pubkey, target_bin_id: i32) {
-        if self.extensions_pending.contains(&pool) {
-            return;
-        }
-        let desired = BinWindow::around(target_bin_id);
-        if let Some(existing) = self.window_cache.get(&pool) {
-            let entry = existing.value();
-            if entry.contains(target_bin_id) && !entry.needs_refresh(target_bin_id) {
-                return;
-            }
-        }
-        let clients = self.clients.iter().cloned().collect();
-        stream_lb_clmm_extensions(
-            self.program_id,
-            clients,
-            pool,
-            self.cache.clone(),
-            self.extensions_pending.clone(),
-            self.window_cache.clone(),
-            BinFetchPlan::Window(desired),
-        );
-    }
-}
-
-fn fetch_lb_clmm_meta(
-    program_id: Pubkey,
-    clients: &[Arc<RpcClient>],
-    pool: Pubkey,
-    cache: Arc<DashMap<Pubkey, HydratedValue<HydratedPoolMeta>>>,
-    pending_extensions: Arc<DashSet<Pubkey>>,
-    window_cache: Arc<DashMap<Pubkey, BinWindow>>,
-) -> Option<HydratedValue<HydratedPoolMeta>> {
-    for client in clients {
-        match client.get_account(&pool) {
-            Ok(account) => {
-                if let Some(mut meta) = parse_lb_pair_account(&account.data) {
-                    fill_missing_token_programs(&mut meta, clients, pool);
-                    let hydrated_slot = client.get_slot().unwrap_or_default();
-                    let fetched_at = Instant::now();
-                    meta.hydrated_slot = hydrated_slot;
-                    meta.hydrated_at = fetched_at;
-                    let hydrated =
-                        HydratedValue::with_timestamp(meta, Some(hydrated_slot), fetched_at);
-                    cache.insert(pool, hydrated.clone());
-                    stream_lb_clmm_extensions(
-                        program_id,
-                        clients.iter().cloned().collect(),
-                        pool,
-                        cache.clone(),
-                        pending_extensions.clone(),
-                        window_cache.clone(),
-                        BinFetchPlan::Full,
-                    );
-                    return Some(hydrated);
-                } else {
-                    warn!(
-                        target = "adapter::lb_clmm",
-                        pool = %pool,
-                        "unexpected lb_clmm pool account layout"
-                    );
-                }
-            }
-            Err(error) => {
-                warn!(
-                    target = "adapter::lb_clmm",
-                    pool = %pool,
-                    %error,
-                    "failed to fetch lb_clmm pool account"
-                );
-            }
-        }
-    }
-
-    None
-}
-
-fn fill_missing_token_programs(
-    meta: &mut HydratedPoolMeta,
-    clients: &[Arc<RpcClient>],
-    pool: Pubkey,
-) {
-    if meta.token_x_program.is_none() {
-        meta.token_x_program = fetch_mint_owner(clients, &meta.token_x_mint);
-        if meta.token_x_program.is_none() {
-            warn!(
-                target = "adapter::lb_clmm",
-                mint = %meta.token_x_mint,
-                pool = %pool,
-                "failed to resolve token_x program; swap templates may be unavailable"
-            );
-        }
-    }
-    if meta.token_y_program.is_none() {
-        meta.token_y_program = fetch_mint_owner(clients, &meta.token_y_mint);
-        if meta.token_y_program.is_none() {
-            warn!(
-                target = "adapter::lb_clmm",
-                mint = %meta.token_y_mint,
-                pool = %pool,
-                "failed to resolve token_y program; swap templates may be unavailable"
-            );
-        }
-    }
-}
-
-fn fetch_mint_owner(clients: &[Arc<RpcClient>], mint: &Pubkey) -> Option<Pubkey> {
-    for client in clients {
-        match client.get_account(mint) {
-            Ok(account) => return Some(account.owner),
-            Err(error) => {
-                debug!(target = "adapter::lb_clmm", %mint, %error, "rpc fetch failed for mint owner fallback")
-            }
-        }
-    }
-    None
-}
-
-fn stream_lb_clmm_extensions(
-    program_id: Pubkey,
-    clients: Vec<Arc<RpcClient>>,
-    pool: Pubkey,
-    cache: Arc<DashMap<Pubkey, HydratedValue<HydratedPoolMeta>>>,
-    pending_extensions: Arc<DashSet<Pubkey>>,
-    window_cache: Arc<DashMap<Pubkey, BinWindow>>,
-    plan: BinFetchPlan,
-) {
-    if !pending_extensions.insert(pool) {
-        return;
-    }
-
-    debug!(
-        target = "adapter::lb_clmm",
-        pool = %pool,
-        ?plan,
-        "scheduling async lb_clmm bin hydration"
-    );
-
-    thread::spawn(move || {
-        for client in &clients {
-            let cached_entry = match cache.get(&pool) {
-                Some(entry) => entry.value().clone(),
-                None => continue,
-            };
-            let mut updated = cached_entry.value;
-            let cached_slot = cached_entry.slot;
-            let mut staged = false;
-
-            match plan {
-                BinFetchPlan::Window(window) => {
-                    let arrays = fetch_targeted_bin_window(program_id, client, pool, &window);
-                    if !arrays.is_empty() {
-                        updated.bin_arrays = merge_bin_array_sets(updated.bin_arrays, arrays);
-                        window_cache.insert(pool, window);
-                        staged = true;
-                    }
-                }
-                BinFetchPlan::Full => {
-                    let window = BinWindow::around(updated.active_bin_id);
-                    let targeted = fetch_targeted_bin_window(program_id, client, pool, &window);
-                    if !targeted.is_empty() {
-                        updated.bin_arrays = merge_bin_array_sets(updated.bin_arrays, targeted);
-                        window_cache.insert(pool, window);
-                        let slot = cached_slot.or(Some(updated.hydrated_slot));
-                        let entry =
-                            HydratedValue::with_timestamp(updated.clone(), slot, Instant::now());
-                        cache.insert(pool, entry);
-                        staged = true;
-                    }
-
-                    let bin_arrays = fetch_bin_arrays(program_id, client, pool);
-                    if !bin_arrays.is_empty() {
-                        updated.bin_arrays = merge_bin_array_sets(Vec::new(), bin_arrays);
-                        if let Some(full_window) = BinWindow::from_arrays(&updated.bin_arrays) {
-                            window_cache.insert(pool, full_window);
-                        }
-                        staged = true;
-                    }
-
-                    if let Some(extension) = fetch_bitmap_extension(program_id, client, pool) {
-                        updated.active_bitmap.bitmap.extend(extension.bitmap);
-                        staged = true;
-                    }
-                }
-            }
-
-            if staged {
-                let slot = cached_slot.or(Some(updated.hydrated_slot));
-                let entry = HydratedValue::with_timestamp(updated, slot, Instant::now());
-                cache.insert(pool, entry);
-                break;
-            }
-        }
-        pending_extensions.remove(&pool);
-    });
-}
-
-fn fetch_bin_arrays(
-    program_id: Pubkey,
-    client: &RpcClient,
-    pool: Pubkey,
-) -> Vec<LbClmmBinArrayExtras> {
-    let filters = Some(vec![
-        RpcFilterType::DataSize(BIN_ARRAY_ACCOUNT_LEN as u64),
-        RpcFilterType::Memcmp(Memcmp::new(
-            BIN_ARRAY_LB_PAIR_OFFSET,
-            MemcmpEncodedBytes::Bytes(pool.to_bytes().to_vec()),
-        )),
-    ]);
-    let mut account_config = RpcAccountInfoConfig::default();
-    account_config.encoding = Some(UiAccountEncoding::Base64);
-    let config = RpcProgramAccountsConfig {
-        filters,
-        account_config,
-        with_context: None,
-        sort_results: None,
-    };
-
-    match client.get_program_ui_accounts_with_config(&program_id, config) {
-        Ok(accounts) => accounts
-            .into_iter()
-            .filter_map(|(_, account)| {
-                let data = decode_ui_account_bytes(&account)?;
-                parse_bin_array_account(pool, &data)
-            })
-            .collect(),
-        Err(error) => {
-            warn!(
-                target = "adapter::lb_clmm",
-                pool = %pool,
-                %error,
-                "failed to fetch lb_clmm bin arrays"
-            );
-            Vec::new()
-        }
-    }
-}
-
-fn fetch_targeted_bin_window(
-    program_id: Pubkey,
-    client: &RpcClient,
-    pool: Pubkey,
-    window: &BinWindow,
-) -> Vec<LbClmmBinArrayExtras> {
-    let mut arrays = Vec::new();
-    for index in window.indices() {
-        if let Some(array) = fetch_bin_array_by_index(program_id, client, pool, index) {
-            arrays.push(array);
-        }
-    }
-    arrays
-}
-
-fn fetch_bin_array_by_index(
-    program_id: Pubkey,
-    client: &RpcClient,
-    pool: Pubkey,
-    index: i64,
-) -> Option<LbClmmBinArrayExtras> {
-    let mut account_config = RpcAccountInfoConfig::default();
-    account_config.encoding = Some(UiAccountEncoding::Base64);
-    let filters = Some(vec![
-        RpcFilterType::DataSize(BIN_ARRAY_ACCOUNT_LEN as u64),
-        RpcFilterType::Memcmp(Memcmp::new(
-            BIN_ARRAY_INDEX_OFFSET,
-            MemcmpEncodedBytes::Bytes(index.to_le_bytes().to_vec()),
-        )),
-        RpcFilterType::Memcmp(Memcmp::new(
-            BIN_ARRAY_LB_PAIR_OFFSET,
-            MemcmpEncodedBytes::Bytes(pool.to_bytes().to_vec()),
-        )),
-    ]);
-    let config = RpcProgramAccountsConfig {
-        filters,
-        account_config,
-        with_context: None,
-        sort_results: None,
-    };
-
-    match client.get_program_ui_accounts_with_config(&program_id, config) {
-        Ok(mut accounts) => accounts.drain(..).find_map(|(_, account)| {
-            let data = decode_ui_account_bytes(&account)?;
-            parse_bin_array_account(pool, &data)
-        }),
-        Err(error) => {
-            warn!(
-                target = "adapter::lb_clmm",
-                pool = %pool,
-                index,
-                %error,
-                "failed to fetch targeted lb_clmm bin array"
-            );
-            None
-        }
-    }
-}
-
-fn merge_bin_array_sets(
-    current: Vec<LbClmmBinArrayExtras>,
-    additions: Vec<LbClmmBinArrayExtras>,
-) -> Vec<LbClmmBinArrayExtras> {
-    if additions.is_empty() {
-        return current;
-    }
-    if current.is_empty() {
-        let mut arrays = additions;
-        arrays.sort_by_key(|array| array.start_bin_id);
-        return arrays;
-    }
-    let mut merged = BTreeMap::new();
-    for array in current.into_iter().chain(additions.into_iter()) {
-        merged.insert(array.start_bin_id, array);
-    }
-    merged.into_values().collect()
-}
-
-fn fetch_bitmap_extension(
-    program_id: Pubkey,
-    client: &RpcClient,
-    pool: Pubkey,
-) -> Option<LbClmmBitmapExtras> {
-    let filters = Some(vec![
-        RpcFilterType::DataSize(BITMAP_EXTENSION_ACCOUNT_LEN as u64),
-        RpcFilterType::Memcmp(Memcmp::new(
-            0,
-            MemcmpEncodedBytes::Bytes(pool.to_bytes().to_vec()),
-        )),
-    ]);
-    let mut account_config = RpcAccountInfoConfig::default();
-    account_config.encoding = Some(UiAccountEncoding::Base64);
-    let config = RpcProgramAccountsConfig {
-        filters,
-        account_config,
-        with_context: None,
-        sort_results: None,
-    };
-
-    match client.get_program_ui_accounts_with_config(&program_id, config) {
-        Ok(mut accounts) => accounts.drain(..).find_map(|(_, account)| {
-            let data = decode_ui_account_bytes(&account)?;
-            parse_bitmap_extension_account(pool, &data)
-        }),
-        Err(error) => {
-            warn!(
-                target = "adapter::lb_clmm",
-                pool = %pool,
-                %error,
-                "failed to fetch lb_clmm bitmap extension"
-            );
-            None
-        }
-    }
-}
-
-fn decode_ui_account_bytes(account: &UiAccount) -> Option<Vec<u8>> {
-    match &account.data {
-        UiAccountData::Binary(data, UiAccountEncoding::Base64)
-        | UiAccountData::LegacyBinary(data) => BASE64_STANDARD.decode(data).ok(),
-        _ => None,
-    }
-}
-
-const STATIC_PARAMETERS_LEN: usize = 32;
-const VARIABLE_PARAMETERS_LEN: usize = 32;
-const PROTOCOL_FEE_LEN: usize = 16;
-const REWARD_INFO_LEN: usize = 144;
-const REWARD_INFO_COUNT: usize = 2;
-const BIN_ARRAY_BITMAP_BYTES: usize = 16 * 8;
-const PUBKEY_BYTES: usize = 32;
-const LB_PAIR_ACCOUNT_TAIL_LEN: usize = PUBKEY_BYTES
-    + BIN_ARRAY_BITMAP_BYTES
-    + 8 // last_updated_at
-    + 32 // _padding_2
-    + PUBKEY_BYTES // pre_activation_swap_address
-    + PUBKEY_BYTES // base_key
-    + 8 // activation_point
-    + 8 // pre_activation_duration
-    + 8 // _padding_3
-    + 8 // _padding_4
-    + PUBKEY_BYTES // creator
-    + 1 // token_mint_x_program_flag
-    + 1 // token_mint_y_program_flag
-    + 22; // _reserved
-const LB_PAIR_ACCOUNT_MIN_LEN: usize = STATIC_PARAMETERS_LEN
-        + VARIABLE_PARAMETERS_LEN
-        + 1 // bump_seed
-        + 2 // bin_step_seed
-        + 1 // pair_type
-        + 4 // active_id
-        + 2 // bin_step
-        + 1 // status
-        + 1 // require_base_factor_seed
-        + 2 // base_factor_seed
-        + 1 // activation_type
-        + 1 // creator_pool_on_off_control
-        + PUBKEY_BYTES * 4 // token mints + reserves
-        + PROTOCOL_FEE_LEN
-        + 32 // _padding_1
-        + REWARD_INFO_LEN * REWARD_INFO_COUNT
-        + PUBKEY_BYTES // oracle
-        + BIN_ARRAY_BITMAP_BYTES
-        + 8 // last_updated_at
-        + 32 // _padding_2
-        + PUBKEY_BYTES // pre_activation_swap_address
-        + PUBKEY_BYTES // base_key
-        + 8 // activation_point
-        + 8 // pre_activation_duration
-        + 8 // _padding_3
-        + 8 // _padding_4
-        + PUBKEY_BYTES // creator
-        + 1 // token_mint_x_program_flag
-        + 1 // token_mint_y_program_flag
-        + 22; // _reserved
-
-fn parse_lb_pair_account(data: &[u8]) -> Option<HydratedPoolMeta> {
-    if data.len() < LB_PAIR_ACCOUNT_MIN_LEN {
-        return None;
-    }
-
-    let mut cursor = STATIC_PARAMETERS_LEN + VARIABLE_PARAMETERS_LEN;
-    skip_bytes(data, &mut cursor, 1)?; // bump_seed
-    skip_bytes(data, &mut cursor, 2)?; // bin_step_seed
-    skip_bytes(data, &mut cursor, 1)?; // pair_type
-    let active_bin_id = read_i32(data, &mut cursor)?;
-    let bin_step = read_u16(data, &mut cursor)?;
-    skip_bytes(data, &mut cursor, 1)?; // status
-    skip_bytes(data, &mut cursor, 1)?; // require_base_factor_seed
-    skip_bytes(data, &mut cursor, 2)?; // base_factor_seed
-    skip_bytes(data, &mut cursor, 1)?; // activation_type
-    skip_bytes(data, &mut cursor, 1)?; // creator_pool_on_off_control
-
-    let token_x_mint = read_pubkey_bytes(data, &mut cursor)?;
-    let token_y_mint = read_pubkey_bytes(data, &mut cursor)?;
-    let reserve_x = read_pubkey_bytes(data, &mut cursor)?;
-    let reserve_y = read_pubkey_bytes(data, &mut cursor)?;
-
-    skip_bytes(data, &mut cursor, PROTOCOL_FEE_LEN)?;
-    skip_bytes(data, &mut cursor, 32)?; // _padding_1
-    let rewards = parse_reward_infos(data, &mut cursor)?;
-    let oracle = read_pubkey_bytes(data, &mut cursor)?;
-    let inline_bitmap = read_bytes(data, &mut cursor, BIN_ARRAY_BITMAP_BYTES)?;
-    skip_bytes(data, &mut cursor, 8)?; // last_updated_at
-    skip_bytes(data, &mut cursor, 32)?; // _padding_2
-    skip_bytes(data, &mut cursor, PUBKEY_BYTES)?; // pre_activation_swap_address
-    skip_bytes(data, &mut cursor, PUBKEY_BYTES)?; // base_key
-    skip_bytes(data, &mut cursor, 8)?; // activation_point
-    skip_bytes(data, &mut cursor, 8)?; // pre_activation_duration
-    skip_bytes(data, &mut cursor, 8)?; // _padding_3
-    skip_bytes(data, &mut cursor, 8)?; // _padding_4
-    skip_bytes(data, &mut cursor, PUBKEY_BYTES)?; // creator
-    let token_x_flag = read_u8(data, &mut cursor)?;
-    let token_y_flag = read_u8(data, &mut cursor)?;
-    skip_bytes(data, &mut cursor, 22)?; // _reserved
-
-    Some(HydratedPoolMeta {
-        token_x_mint,
-        token_y_mint,
-        reserve_x,
-        reserve_y,
-        oracle,
-        token_x_program: map_token_program_flag(token_x_flag),
-        token_y_program: map_token_program_flag(token_y_flag),
-        bin_step,
-        active_bin_id,
-        bin_arrays: Vec::new(),
-        active_bitmap: LbClmmBitmapExtras {
-            anchor_bin_id: 0,
-            bitmap: inline_bitmap,
-        },
-        rewards,
-        hydrated_slot: 0,
-        hydrated_at: Instant::now(),
-    })
-}
-
-fn parse_reward_infos(data: &[u8], cursor: &mut usize) -> Option<Vec<HydratedRewardInfo>> {
-    if *cursor > data.len() {
-        return None;
-    }
-    let reward_section_end = data.len().checked_sub(LB_PAIR_ACCOUNT_TAIL_LEN)?;
-    if reward_section_end < *cursor {
-        return None;
-    }
-
-    let mut rewards = Vec::new();
-    let mut index: u16 = 0;
-    while (*cursor).saturating_add(REWARD_INFO_LEN) <= reward_section_end {
-        let mint = read_pubkey_bytes(data, cursor)?;
-        let vault = read_pubkey_bytes(data, cursor)?;
-        let funder = read_pubkey_bytes(data, cursor)?;
-        let remaining_len = REWARD_INFO_LEN.saturating_sub(PUBKEY_BYTES * 3);
-        skip_bytes(data, cursor, remaining_len)?;
-        if mint != Pubkey::default() && vault != Pubkey::default() {
-            if let Ok(idx) = u8::try_from(index) {
-                rewards.push(HydratedRewardInfo {
-                    index: idx,
-                    mint,
-                    vault,
-                    funder,
-                });
-            }
-        }
-        index = index.saturating_add(1);
-    }
-
-    *cursor = reward_section_end;
-    Some(rewards)
-}
-
-fn parse_bin_array_account(pool: Pubkey, data: &[u8]) -> Option<LbClmmBinArrayExtras> {
-    if data.len() < BIN_ARRAY_ACCOUNT_LEN {
-        return None;
-    }
-
-    let mut cursor = 0usize;
-    let index = read_i64(data, &mut cursor)?;
-    let _version = read_u8(data, &mut cursor)?;
-    skip_bytes(data, &mut cursor, 7)?;
-    let owner = read_pubkey_bytes(data, &mut cursor)?;
-    if owner != pool {
-        return None;
-    }
-
-    let start_bin_id = start_bin_id_from_index(index)?;
-    let mut bins = Vec::new();
-    for offset in 0..(MAX_BIN_PER_ARRAY as usize) {
-        let amount_x = read_u64(data, &mut cursor)? as u128;
-        let amount_y = read_u64(data, &mut cursor)? as u128;
-        skip_bytes(data, &mut cursor, BIN_STRUCT_LEN - 16)?;
-        if amount_x == 0 && amount_y == 0 {
-            continue;
-        }
-        let bin_id = start_bin_id.saturating_add(offset as i32);
-        bins.push(LbClmmBinLiquidityExtras {
-            bin_id,
-            liquidity_x: amount_x,
-            liquidity_y: amount_y,
-        });
-    }
-
-    if bins.is_empty() {
-        return None;
-    }
-
-    Some(LbClmmBinArrayExtras { start_bin_id, bins })
-}
-
-fn parse_bitmap_extension_account(pool: Pubkey, data: &[u8]) -> Option<LbClmmBitmapExtras> {
-    if data.len() < BITMAP_EXTENSION_ACCOUNT_LEN {
-        return None;
-    }
-
-    let mut cursor = 0usize;
-    let owner = read_pubkey_bytes(data, &mut cursor)?;
-    if owner != pool {
-        return None;
-    }
-    let remaining = data.len().checked_sub(cursor)?;
-    let bitmap = read_bytes(data, &mut cursor, remaining)?;
-    Some(LbClmmBitmapExtras {
-        anchor_bin_id: 0,
-        bitmap,
-    })
-}
-
 fn start_bin_id_from_index(index: i64) -> Option<i32> {
     let base = index.checked_mul(i64::from(MAX_BIN_PER_ARRAY))?;
     i32::try_from(base).ok()
@@ -3723,64 +1874,6 @@ fn array_index_for_bin(bin_id: i32) -> i64 {
     index
 }
 
-fn read_u16(data: &[u8], cursor: &mut usize) -> Option<u16> {
-    let end = (*cursor).checked_add(2)?;
-    let bytes = data.get(*cursor..end)?;
-    *cursor = end;
-    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
-fn read_i32(data: &[u8], cursor: &mut usize) -> Option<i32> {
-    let end = (*cursor).checked_add(4)?;
-    let bytes = data.get(*cursor..end)?;
-    *cursor = end;
-    Some(i32::from_le_bytes(bytes.try_into().ok()?))
-}
-
-fn read_i64(data: &[u8], cursor: &mut usize) -> Option<i64> {
-    let end = (*cursor).checked_add(8)?;
-    let bytes = data.get(*cursor..end)?;
-    *cursor = end;
-    Some(i64::from_le_bytes(bytes.try_into().ok()?))
-}
-
-fn read_u64(data: &[u8], cursor: &mut usize) -> Option<u64> {
-    let end = (*cursor).checked_add(8)?;
-    let bytes = data.get(*cursor..end)?;
-    *cursor = end;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
-}
-
-fn read_bytes(data: &[u8], cursor: &mut usize, len: usize) -> Option<Vec<u8>> {
-    let end = (*cursor).checked_add(len)?;
-    let bytes = data.get(*cursor..end)?;
-    *cursor = end;
-    Some(bytes.to_vec())
-}
-
-fn read_u8(data: &[u8], cursor: &mut usize) -> Option<u8> {
-    let value = *data.get(*cursor)?;
-    *cursor = (*cursor).checked_add(1)?;
-    Some(value)
-}
-
-fn skip_bytes(data: &[u8], cursor: &mut usize, len: usize) -> Option<()> {
-    let end = (*cursor).checked_add(len)?;
-    if end > data.len() {
-        return None;
-    }
-    *cursor = end;
-    Some(())
-}
-
-fn read_pubkey_bytes(data: &[u8], cursor: &mut usize) -> Option<Pubkey> {
-    let end = (*cursor).checked_add(PUBKEY_BYTES)?;
-    let slice = data.get(*cursor..end)?;
-    let mut bytes = [0u8; PUBKEY_BYTES];
-    bytes.copy_from_slice(slice);
-    *cursor = end;
-    Some(Pubkey::new_from_array(bytes))
-}
 
 fn step_bin_id(current: i32, swap_x_to_y: bool) -> Option<i32> {
     if swap_x_to_y {
@@ -3790,25 +1883,21 @@ fn step_bin_id(current: i32, swap_x_to_y: bool) -> Option<i32> {
     }
 }
 
-fn map_token_program_flag(flag: u8) -> Option<Pubkey> {
-    match flag {
-        0 => Some(*SPL_TOKEN_PROGRAM_PUBKEY),
-        1 => Some(*SPL_TOKEN_2022_PROGRAM_PUBKEY),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, HashSet};
     use std::time::Instant;
 
-    use crate::hydration::types::{PoolUpdateExtensions, SnapshotFreshness};
+    use crate::watch::types::{PoolUpdateExtensions, SnapshotFreshness};
 
     #[test]
     fn reward_hook_contexts_fallback_to_vault() {
-        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let adapter = LbClmmAdapter::new(
+            LbClmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let reward = LbClmmRewardInfo {
             index: 0,
             mint: Pubkey::new_unique(),
@@ -3826,7 +1915,11 @@ mod tests {
 
     #[test]
     fn reward_contexts_populate_without_resolver() {
-        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let adapter = LbClmmAdapter::new(
+            LbClmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let reward = LbClmmRewardInfo {
             index: 3,
             mint: Pubkey::new_unique(),
@@ -3838,7 +1931,7 @@ mod tests {
         let owner = Pubkey::new_unique();
         context.payer = Some(owner);
 
-        adapter.attach_reward_transfer_hook_accounts(None, None, &state, &mut context);
+        adapter.attach_reward_transfer_hook_accounts(None, &state, &mut context);
 
         assert_eq!(context.lb_clmm_reward_accounts.len(), 1);
         let entry = &context.lb_clmm_reward_accounts[0];
@@ -3857,7 +1950,11 @@ mod tests {
 
     #[test]
     fn reward_contexts_deduplicate_when_reused() {
-        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let adapter = LbClmmAdapter::new(
+            LbClmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let reward = LbClmmRewardInfo {
             index: 5,
             mint: Pubkey::new_unique(),
@@ -3867,8 +1964,8 @@ mod tests {
         let state = dummy_state_with_reward(reward.clone());
         let mut context = TemplateContext::default();
 
-        adapter.attach_reward_transfer_hook_accounts(None, None, &state, &mut context);
-        adapter.attach_reward_transfer_hook_accounts(None, None, &state, &mut context);
+        adapter.attach_reward_transfer_hook_accounts(None, &state, &mut context);
+        adapter.attach_reward_transfer_hook_accounts(None, &state, &mut context);
 
         assert_eq!(context.lb_clmm_reward_accounts.len(), 1);
         let entry = &context.lb_clmm_reward_accounts[0];
@@ -3878,7 +1975,11 @@ mod tests {
 
     #[test]
     fn reward_contexts_skip_user_account_without_owner() {
-        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let adapter = LbClmmAdapter::new(
+            LbClmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let reward = LbClmmRewardInfo {
             index: 7,
             mint: Pubkey::new_unique(),
@@ -3888,7 +1989,7 @@ mod tests {
         let state = dummy_state_with_reward(reward.clone());
         let mut context = TemplateContext::default();
 
-        adapter.attach_reward_transfer_hook_accounts(None, None, &state, &mut context);
+        adapter.attach_reward_transfer_hook_accounts(None, &state, &mut context);
 
         assert_eq!(context.lb_clmm_reward_accounts.len(), 1);
         let entry = &context.lb_clmm_reward_accounts[0];
@@ -3902,8 +2003,6 @@ mod tests {
             lb_pair: Pubkey::new_unique(),
             token_x_mint: Pubkey::new_unique(),
             token_y_mint: Pubkey::new_unique(),
-            token_x_decimals: None,
-            token_y_decimals: None,
             token_x_program: Some(*SPL_TOKEN_PROGRAM_PUBKEY),
             token_y_program: Some(*SPL_TOKEN_PROGRAM_PUBKEY),
             token_x_transfer_fee: None,
@@ -3926,8 +2025,7 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            meta_hydrated_at: Some(now),
-            window_hydrated_at: Some(now),
+            last_hydrated_at: Some(now),
             last_update_slot: 0,
             last_update_at: now,
         }
@@ -4039,8 +2137,6 @@ mod tests {
             lb_pair: pool,
             token_x_mint: token_x,
             token_y_mint: token_y,
-            token_x_decimals: None,
-            token_y_decimals: None,
             token_x_program: None,
             token_y_program: None,
             token_x_transfer_fee: None,
@@ -4063,8 +2159,7 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            meta_hydrated_at: Some(Instant::now()),
-            window_hydrated_at: Some(Instant::now()),
+            last_hydrated_at: Some(Instant::now()),
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -4113,8 +2208,6 @@ mod tests {
             lb_pair: pool,
             token_x_mint: token_x,
             token_y_mint: token_y,
-            token_x_decimals: None,
-            token_y_decimals: None,
             token_x_program: None,
             token_y_program: None,
             token_x_transfer_fee: None,
@@ -4137,8 +2230,7 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            meta_hydrated_at: Some(Instant::now()),
-            window_hydrated_at: Some(Instant::now()),
+            last_hydrated_at: Some(Instant::now()),
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -4156,8 +2248,6 @@ mod tests {
             lb_pair: Pubkey::new_unique(),
             token_x_mint: Pubkey::new_unique(),
             token_y_mint: Pubkey::new_unique(),
-            token_x_decimals: None,
-            token_y_decimals: None,
             token_x_program: None,
             token_y_program: None,
             token_x_transfer_fee: None,
@@ -4180,8 +2270,7 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            meta_hydrated_at: Some(Instant::now()),
-            window_hydrated_at: Some(Instant::now()),
+            last_hydrated_at: Some(Instant::now()),
             last_update_slot: 0,
             last_update_at: Instant::now(),
         };
@@ -4268,7 +2357,11 @@ mod tests {
 
     #[test]
     fn decorate_swap_context_sets_token_programs_without_builder() {
-        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let adapter = LbClmmAdapter::new(
+            LbClmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let state = default_state();
         let mut context = TemplateContext::default();
         adapter.decorate_swap_context(&state, &mut context, state.token_x_mint, state.token_y_mint);
@@ -4280,7 +2373,11 @@ mod tests {
 
     #[test]
     fn decorate_swap_context_sets_transfer_fee_hints() {
-        let adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let adapter = LbClmmAdapter::new(
+            LbClmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let mut state = default_state();
         state.token_x_transfer_fee = Some(TokenTransferFee::new(TransferFee {
             epoch: 1.into(),
@@ -4299,7 +2396,11 @@ mod tests {
 
     #[test]
     fn quote_exact_out_accounts_for_transfer_fees() {
-        let mut adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let mut adapter = LbClmmAdapter::new(
+            LbClmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let mut state = swap_ready_state();
         let pool = state.lb_pair;
         let input_fee = TokenTransferFee::new(TransferFee {
@@ -4351,7 +2452,7 @@ mod tests {
         let mut config = LbClmmAdapterConfig::default();
         config.stale_after_ms = 1;
         config.stale_slot_threshold = 1;
-        let mut adapter = LbClmmAdapter::new(config, None);
+        let mut adapter = LbClmmAdapter::new(config, None, Arc::new(StaticPoolRegistry::new()));
         let mut state = swap_ready_state();
         state.last_update_slot = 0;
         state.last_update_at = Instant::now() - Duration::from_secs(60);
@@ -4379,7 +2480,7 @@ mod tests {
         let mut config = LbClmmAdapterConfig::default();
         config.stale_after_ms = 1;
         config.stale_slot_threshold = 1;
-        let mut adapter = LbClmmAdapter::new(config, None);
+        let mut adapter = LbClmmAdapter::new(config, None, Arc::new(StaticPoolRegistry::new()));
         let mut state = swap_ready_state();
         state.last_update_slot = 0;
         state.last_update_at = Instant::now() - Duration::from_secs(60);
@@ -4404,7 +2505,11 @@ mod tests {
 
     #[test]
     fn bidirectional_quotes_skip_stale_state() {
-        let mut adapter = LbClmmAdapter::new(LbClmmAdapterConfig::default(), None);
+        let mut adapter = LbClmmAdapter::new(
+            LbClmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let mut state = swap_ready_state();
         state.last_update_slot = 0;
         state.last_update_at = Instant::now() - Duration::from_secs(60);
@@ -4424,7 +2529,6 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
-            hydration: HydrationStatus::new(10_000),
             extensions: PoolUpdateExtensions::default(),
         };
 
@@ -4438,20 +2542,14 @@ mod tests {
         state.reserve_x_balance = Some(1_000_000);
         state.reserve_y_balance = Some(1_000_000);
         let mut liquidity = BTreeMap::new();
-        for bin_id in [
-            -BIN_WINDOW_EDGE_BUFFER_BINS,
+        liquidity.insert(
             0,
-            BIN_WINDOW_EDGE_BUFFER_BINS,
-        ] {
-            liquidity.insert(
-                bin_id,
-                LbClmmBinSnapshot {
-                    bin_id,
-                    liquidity_x: 5_000_000,
-                    liquidity_y: 5_000_000,
-                },
-            );
-        }
+            LbClmmBinSnapshot {
+                bin_id: 0,
+                liquidity_x: 5_000_000,
+                liquidity_y: 5_000_000,
+            },
+        );
         state.bin_liquidity = liquidity;
         state
     }
@@ -4462,8 +2560,6 @@ mod tests {
             lb_pair: Pubkey::new_unique(),
             token_x_mint: Pubkey::new_unique(),
             token_y_mint: Pubkey::new_unique(),
-            token_x_decimals: None,
-            token_y_decimals: None,
             token_x_program: Some(*SPL_TOKEN_PROGRAM_PUBKEY),
             token_y_program: Some(*SPL_TOKEN_2022_PROGRAM_PUBKEY),
             token_x_transfer_fee: None,
@@ -4486,8 +2582,7 @@ mod tests {
             corecast_slot: 0,
             hydrated_meta_slot: Some(0),
             hydrated_window_slot: Some(0),
-            meta_hydrated_at: Some(now),
-            window_hydrated_at: Some(now),
+            last_hydrated_at: Some(now),
             last_update_slot: 0,
             last_update_at: now,
         }

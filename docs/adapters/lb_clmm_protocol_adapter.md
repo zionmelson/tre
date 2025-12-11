@@ -31,17 +31,17 @@ Any upstream change across those modules should be mirrored here and in the hydr
 | Vault balances, bin liquidity deltas, active bin id                     | CoreCast `PoolLiquidityChangeStreamMessage` extras                                 | Ingested via `extensions.lb_clmm` payload, hydrated into `BinSnapshotRing`.                         |
 | `LbPair` parameters (fees, volatility refs, bin step, activation flags) | Cached on-chain account fetched lazily, schema from `idls/pools/lb_clmm.json`      | Provide base/variable fee math mirroring `LbPairExtension`.                                         |
 | `BinArray`/`BinArrayBitmapExtension` PDAs                               | Derived using `extensions/bin_array.rs` + `bin_array_bitmap.rs` helpers            | Needed for swaps that span multiple bin arrays or require bitmap extension (pool width > 512 bins). |
-| Oracle window                                                           | CoreCast extras, fallback to `Oracle` account via RPC                              | Drives volatility accumulator + guardrails for stale data.                                          |
+| Oracle window                                                           | CoreCast extras, fallback to `Oracle` account via RPC                              | Drives volatility accumulator + guardrails for out-of-date data.                                    |
 | Token program flags + host fee ATA                                      | Stored in `LbClmmState.pool_meta` (mint + program IDs + optional host fee account) | Uses `TokenProgramFlagWrapper` conversions to decide SPL vs Token-2022.                             |
 
-`LbClmmState` keeps a snapshot of those items plus timestamps (`last_update_slot`, `last_oracle_slot`). TTL and freshness thresholds come from `LbClmmAdapterConfig` (e.g., `max_state_age_slots`, `max_oracle_lag_slots`, `max_bin_walk`, `price_impact_floor_bps`).
+`LbClmmState` keeps a snapshot of those items plus timestamps (`last_update_slot`, `last_oracle_slot`). Freshness is no longer governed by a slot TTL; caches stay live once populated and inherit readiness between snapshots. Operators now lean on the standard `stale_slot_threshold`/`stale_after_ms` guards in `LbClmmAdapterConfig` plus explicit invalidations (structural changes, corrupt RPC reads, or manual resets), while `max_bin_walk` and `max_price_impact_bps` still enforce execution hygiene.
 
 ## Core On-Chain Extensions
 
 - `LbPairExtension` (`extensions/lb_pair.rs`) exposes fee math (`compute_fee`, `compute_protocol_fee`, `compute_variable_fee`), volatility updates (`update_references`, `update_volatility_accumulator`), bitmap navigation (`next_bin_array_index_with_liquidity_internal`), and token-program decoding. The adapter mirrors these methods to avoid drift; any future change in that trait must be ported.
 - `BinExtension` (`extensions/bin.rs`) encapsulates per-bin swap math, including host-fee splitting and safe mul/div operations. Our simulator must call the same flow: cache bin price via `get_or_store_bin_price`, respect `max_amount_out`, then call `Bin::swap` with host-fee basis points pulled from state.
 - `BinArrayExtension` and `BinArrayBitmapExtExtension` provide PDA derivations plus bitmap scans; we rely on them when building template remaining accounts or when the cached ring buffer misses a bin that the swap path requires.
-- `PositionExtension` is primarily used during hydration to backfill bin arrays for new pools or after TTL expiry; it informs how many arrays to fetch given a `(lower_bin_id, upper_bin_id)` range.
+- `PositionExtension` is primarily used during hydration to backfill bin arrays for new pools or after we invalidate old snapshots; it informs how many arrays to fetch given a `(lower_bin_id, upper_bin_id)` range.
 
 ## Math Building Blocks (commons/src/math)
 
@@ -90,9 +90,9 @@ If both mint legs are SPL Token (non-2022), the resolver returns `None` and the 
 
 - `PairStatus` / `PairType` / `ActivationType` conversions: reuse the logic in `commons/src/conversions` to decide whether a pool is tradable (`PairStatus::Enabled`) and whether activation is slot- or timestamp-gated. Quotes for disabled or pre-activation pools should immediately return `QuoteStatus::PreActivation`.
 - `TokenProgramFlags` inform whether memo + remaining accounts are required for transfer fees; missing hooks should return `QuoteStatus::MissingAccounts` to avoid on-chain failures.
-- Staleness: mark `QuoteStatus::StaleState` when either `slot - last_update_slot > config.max_state_age_slots` or `slot - last_oracle_slot > max_oracle_lag_slots`.
+- Structural invalidation: quotes remain available on the latest known-good snapshot until hydration explicitly invalidates the pool (new vaults/bin arrays, corrupt data, or operator reset). Slot drift alone no longer marks pools as stale; readiness tiers stay latched once achieved.
 - Bin coverage: when bin traversal hits an uncached segment or `BinArrayBitmapExtExtension::next_bin_array_index_with_liquidity` returns `(idx, false)`, emit `HydrationPending` and trigger a hydration refresh.
-- Telemetry fields: `pool`, `slot`, `swap_mode`, `bin_walk`, `dynamic_fee_bps`, `host_fee_applied`, `bitmap_extension_used`, plus rejection counters grouped by on-chain error (6003 missing accounts, 6042 insufficient liquidity, 6077 stale state).
+- Telemetry fields: `pool`, `slot`, `swap_mode`, `bin_walk`, `dynamic_fee_bps`, `host_fee_applied`, `bitmap_extension_used`, plus rejection counters grouped by on-chain error (6003 missing accounts, 6042 insufficient liquidity, 6077 state_too_old).
 
 ## Integration / Testing Checklist
 

@@ -46,7 +46,7 @@ Together these changes replicate the upstream SDK behavior end-to-end: we pull t
 - **Whirlpool IDL** – `idls/pools/whirlpool.json` is treated as the single source for account layouts and instruction schemas; codegen (via `anchor-client` or `idl-codegen`) should be refreshed whenever the upstream npm tag changes.
 - **Orca program sources** – `swap_math.rs`, `swap_manager.rs`, and the v2 instruction modules govern math correctness and account ordering; the adapter must cite these for parity tests.
 - **Internal swap guide** – `docs/swaps/whirlpool-swaps.md` documents runner expectations (ATA ownership, CPI stack, compute budgeting) and remains the consumer-facing contract for template outputs.
-- **Config overrides** – `config.json` supplies mint decimal overrides, tick-array prefetch counts, rate-limit knobs (e.g., `pool_failure_backoff_ms`, `tick_array_backoff_ms`, `max_pool_failures`, `max_tick_array_failures`, `oracle_hydration_enabled`, `hydration_slot_lag_tolerance`, `hydration_lag_ms_tolerance` under `protocols.whirlpool`), or pool-specific toggles (such as ignoring Token-2022 pools on early rollouts). Setting `oracle_hydration_enabled` to `false` skips fetching Whirlpool oracle PDAs via RPC, silencing the corresponding log spam when those accounts are known to be absent and deferring to the TWAP fallback, while the hydration lag knobs relax or tighten the slot/ms windows before templates are considered ready.
+- **Config overrides** – `config.json` supplies mint decimal overrides, tick-array prefetch counts, and the knobs exposed by `WhirlpoolAdapterConfig` (`stale_slot_threshold`, `stale_after_ms`, `rpc_timeout_ms`, `max_swap_utilization_bps`, `prefer_exact_out_quotes`, `twap_history_horizon_secs`, `twap_lookback_secs`, `oracle_hydration_enabled`). Setting `oracle_hydration_enabled` to `false` skips fetching Whirlpool oracle PDAs via RPC, silencing the corresponding log spam when those accounts are known to be absent and deferring to the TWAP fallback.
 
 ## API Shape
 
@@ -88,14 +88,14 @@ pub struct DynamicPoolState {
 }
 ```
 
-`WhirlpoolAdapterConfig` captures TTLs, tick-array fetch budgets, adaptive-fee grace periods, rate-limit backoffs, and whether Token-2022 or transfer-hook pools are allowed.
+`WhirlpoolAdapterConfig` bundles eviction thresholds (`stale_slot_threshold`, `stale_after_ms`), RPC settings, retry/backoff limits, quote preferences, TWAP horizons, and whether oracles require hydration (`oracle_hydration_enabled`). Slot drift no longer drives eviction; caches stay resident until hydration explicitly invalidates them.
 
 ## State & Cache Management
 
 - **Immutable vs mutable layers** – Static metadata is fetched once (or when IDL hash changes) while dynamic state is refreshed per CoreCast message. This separation keeps quote hot-paths free of lock contention on large account blobs.
 - **Tick-array cache** – Represented as `TickArrayCache { start_tick: i32, slot: u64, account: Arc<[u8; TICK_ARRAY_SIZE]> }`. A `BTreeMap` keyed by range enables O(log n) lookups for contiguous arrays and quick detection of gaps relative to the requested sqrt price span.
 - **Prefetch policy** – On ingestion, proactively fetch ±N arrays around `tick_current_index / TICK_SPACING` so the fast lane rarely blocks on RPC. Arrays older than `config.tick_array_stale_slots` are re-queued for refresh.
-- **Oracle readiness** – The IDL exposes `oracle` as writable when adaptive fee state needs updates. Track the latest oracle timestamp; degrade quotes to `StaleState` when `slot_now - oracle_slot > config.oracle_max_lag`.
+- **Oracle readiness** – The IDL exposes `oracle` as writable when adaptive fee state needs updates. Track the latest oracle timestamp, inherit readiness across snapshots, and alert (rather than auto-demote) when `slot_now - oracle_slot` exceeds `config.oracle_max_lag`; explicit invalidations and trade-enable gating still block pools when the oracle stays frozen.
 - **Concurrency** – Use sharded locks or `RwLock` per pool to avoid blocking unrelated quotes. Tick-array updates should swap in immutable `Arc` blobs to keep readers wait-free.
 
 ## Pricing & Simulation
@@ -148,11 +148,11 @@ The adapter must match `swap_manager::swap` semantics exactly:
 
 - Quote status taxonomy:
   - `Ok`
-  - `StaleState` – `slot_now - last_update_slot > config.state_stale_slots`.
   - `HydrationPending` – Cache lacks any of the three arrays in the trade path or arrays are older than `tick_array_stale_slots`.
   - `InsufficientLiquidity` – Simulation hit zero liquidity or min/max sqrt price before satisfying the request.
-  - `RateLimited` – Prior submissions returned Orca errors (`6011`, `6035`, `6034`, `6064`); adapter backs off for `config.rate_limit_cooldown_slots`.
+  - `TradingDisabled` – Adaptive fee/activation gates or operator toggles have paused swaps for the pool.
   - `MissingAccounts` – Token owner ATA, transfer-hook extra accounts, or oracle is absent.
+  - `RateLimited` – Prior submissions returned Orca errors (`6011`, `6035`, `6034`, `6064`); adapter backs off for `config.rate_limit_cooldown_slots`.
 - Metrics to emit per quote: `quote_latency_ms`, `tick_arrays_read`, `rpc_fallback_count`, `adaptive_fee_applied_bps`, `oracle_lag_slots`.
 - Telemetry spans should include `pool`, `tick_current_index`, `sqrt_price_x64`, `liquidity`, and `tick_coverage` to accelerate debugging.
 

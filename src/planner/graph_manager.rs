@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 const NEGATIVE_CYCLE_EPSILON: f64 = 1e-12;
 
-use crate::hydration::types::{PoolQuoteDirection, PoolSnapshot};
+use crate::watch::types::{PoolQuoteDirection, PoolSnapshot};
 use crate::planner::types::RoutePlan;
 use crate::token_pair::TokenPair;
 
@@ -753,7 +753,7 @@ struct WeightedEdgeCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::{HydrationStatus, PoolUpdateExtensions, SnapshotFreshness};
+    use crate::watch::types::{PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness};
     use std::time::Instant;
 
     fn snapshot(
@@ -788,7 +788,6 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
-            hydration: HydrationStatus::new(0),
             extensions: PoolUpdateExtensions::default(),
         }
     }

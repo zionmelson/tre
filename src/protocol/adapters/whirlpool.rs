@@ -15,25 +15,26 @@ use uint::construct_uint;
 
 use super::hydration::{AsyncHydrator, HydratedValue};
 
-use crate::builder::{BuilderHandle, WhirlpoolPoolAccounts, WhirlpoolPoolMeta};
-use crate::hydration::mint_metadata::{MintMetadata, MintMetadataHydrator};
-use crate::hydration::token_fees::{
+use crate::bootstrap::{whirlpool::HydratedTickArray as SnapshotTickArray, MintAccountMeta, StaticPoolRegistry};
+use crate::protocol::mint_metadata::{MintMetadata, MintMetadataHydrator};
+use crate::protocol::token_fees::{
     apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
 };
-use crate::hydration::transfer_hooks::{TransferHookAccountContext, TransferHookAccountsResolver};
-use crate::hydration::types::{
-    HydrationComponent, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
+use crate::protocol::transfer_hooks::{
+    TransferHookAccountContext,
+    TransferHookAccountsResolver,
+};
+use crate::watch::types::{
+    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
     WhirlpoolAdaptiveFeeConstants, WhirlpoolAdaptiveFeeInfo, WhirlpoolAdaptiveFeeVariables,
     WhirlpoolPoolExtras, WHIRLPOOL_INPUT_UTILIZATION_BPS,
 };
-use crate::telemetry;
 use crate::template::{
     TemplateContext, WhirlpoolRemainingAccountsSlice, WhirlpoolRemainingAccountsType,
 };
 
 use super::{
-    build_quote_response, AdapterReadiness, ProtocolAdapter, QuoteRequest, QuoteResponse,
-    QuoteStatus, ReadinessBlocker, ReadinessBlockerKind, SwapDirection,
+    build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, SwapDirection,
 };
 
 const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
@@ -64,14 +65,10 @@ pub use u256::U256;
 mod twap;
 use self::twap::WhirlpoolTwapCache;
 
-const DEFAULT_WHIRLPOOL_HYDRATION_RETRY_MS: u64 = 60_000;
 const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
 const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
 const DEFAULT_WHIRLPOOL_TWAP_HISTORY_SECS: u64 = 900;
 const DEFAULT_WHIRLPOOL_TWAP_LOOKBACK_SECS: u64 = 60;
-const DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE: u64 = 3_000;
-const DEFAULT_HYDRATION_LAG_MS_TOLERANCE: u64 = 30_000;
-const HYDRATION_LAG_LOG_INTERVAL_MS: u64 = 15_000;
 
 #[derive(Clone)]
 struct SnapshotStatusLogEntry {
@@ -85,9 +82,6 @@ pub struct WhirlpoolAdapterConfig {
     pub stale_after_ms: u64,
     pub rpc_endpoints: Vec<String>,
     pub rpc_timeout_ms: u64,
-    pub hydration_retry_ms: u64,
-    pub hydration_slot_lag_tolerance: u64,
-    pub hydration_lag_ms_tolerance: u64,
     pub max_swap_utilization_bps: u64,
     pub pool_failure_backoff_ms: u64,
     pub tick_array_backoff_ms: u64,
@@ -106,9 +100,6 @@ impl Default for WhirlpoolAdapterConfig {
             stale_after_ms: 2_000,
             rpc_endpoints: Vec::new(),
             rpc_timeout_ms: 15_000,
-            hydration_retry_ms: DEFAULT_WHIRLPOOL_HYDRATION_RETRY_MS,
-            hydration_slot_lag_tolerance: DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE,
-            hydration_lag_ms_tolerance: DEFAULT_HYDRATION_LAG_MS_TOLERANCE,
             max_swap_utilization_bps: WHIRLPOOL_INPUT_UTILIZATION_BPS,
             pool_failure_backoff_ms: DEFAULT_WHIRLPOOL_POOL_BACKOFF_MS,
             tick_array_backoff_ms: DEFAULT_WHIRLPOOL_TICK_BACKOFF_MS,
@@ -132,34 +123,35 @@ pub struct WhirlpoolAdapter {
     twap_lookback: Duration,
     transfer_fee_cache: Option<TokenTransferFeeHydrator>,
     transfer_hook_resolver: Option<TransferHookAccountsResolver>,
-    template_builder: Option<BuilderHandle>,
-    registered_templates: DashMap<Pubkey, WhirlpoolRegistration>,
+    registry: Arc<StaticPoolRegistry>,
     snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
     missing_state_log: DashMap<Pubkey, Instant>,
-    lag_log: DashMap<(Pubkey, u8), Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
-struct WhirlpoolRegistration {
-    alt_accounts: Vec<Pubkey>,
-    last_hydrated_slot: Option<u64>,
-    epoch: u64,
+struct WhirlpoolSnapshotBootstrap {
+    token_a_meta: Option<MintAccountMeta>,
+    token_b_meta: Option<MintAccountMeta>,
+    token_a_transfer_hook_program: Option<Pubkey>,
+    token_b_transfer_hook_program: Option<Pubkey>,
+    tick_arrays: Vec<SnapshotTickArray>,
 }
 
 impl WhirlpoolAdapter {
-    pub fn new(config: WhirlpoolAdapterConfig, template_builder: Option<BuilderHandle>) -> Self {
+    pub fn new(
+        config: WhirlpoolAdapterConfig,
+        registry: Arc<StaticPoolRegistry>,
+    ) -> Self {
         let program_id = Pubkey::from_str(WHIRLPOOL_PROGRAM_ID)
             .expect("static Whirlpool program id should be valid");
         let hydrator = WhirlpoolPoolHydrator::new(&config, program_id);
         let mint_metadata_cache = MintMetadataHydrator::new(
             &config.rpc_endpoints,
             config.rpc_timeout_ms,
-            config.hydration_retry_ms,
         );
         let transfer_fee_cache = TokenTransferFeeHydrator::new(
             &config.rpc_endpoints,
             config.rpc_timeout_ms,
-            config.hydration_retry_ms,
         );
         let transfer_hook_resolver =
             TransferHookAccountsResolver::new(&config.rpc_endpoints, config.rpc_timeout_ms);
@@ -198,11 +190,9 @@ impl WhirlpoolAdapter {
             twap_lookback,
             transfer_fee_cache,
             transfer_hook_resolver,
-            template_builder,
-            registered_templates: DashMap::new(),
+            registry,
             snapshot_failure_log: DashMap::new(),
             missing_state_log: DashMap::new(),
-            lag_log: DashMap::new(),
         }
     }
 
@@ -228,7 +218,7 @@ impl WhirlpoolAdapter {
         });
     }
 
-    fn upsert_state(&self, update: &PoolUpdate, extras: WhirlpoolPoolExtras) {
+    fn upsert_state(&self, update: &PoolUpdate, mut extras: WhirlpoolPoolExtras) {
         let Some(pool_pubkey) = parse_pubkey(&update.pool_id) else {
             warn!(
                 target = "adapter::whirlpool",
@@ -239,6 +229,7 @@ impl WhirlpoolAdapter {
         };
 
         let previous_state = self.state.get(&pool_pubkey);
+        let snapshot_bootstrap = self.bootstrap_from_snapshot(pool_pubkey, &mut extras);
         let extras = self.enrich_extras(pool_pubkey, extras);
 
         let Some(token_mint_a) = extras
@@ -272,9 +263,11 @@ impl WhirlpoolAdapter {
             ),
             _ => (None, None),
         };
-        let mut hydrated_meta_slot = extras
-            .hydrated_slot
-            .or_else(|| previous_state.as_ref().and_then(|existing| existing.hydrated_meta_slot));
+        let mut hydrated_meta_slot = extras.hydrated_slot.or_else(|| {
+            previous_state
+                .as_ref()
+                .and_then(|existing| existing.hydrated_meta_slot)
+        });
         if hydrated_meta_slot
             .map(|slot| slot < update.slot)
             .unwrap_or(true)
@@ -373,10 +366,16 @@ impl WhirlpoolAdapter {
             last_update_at: Instant::now(),
         };
 
+        if let Some(bootstrap) = snapshot_bootstrap.as_ref() {
+            self.apply_snapshot_bootstrap(&mut state, bootstrap);
+        }
         self.attach_mint_metadata(&mut state);
         self.ensure_token_programs(&mut state);
         self.attach_transfer_metadata(&mut state);
-        if !self.meta_ready_within_lag(&state) {
+        if let Some(bootstrap) = snapshot_bootstrap.as_ref() {
+            self.warm_snapshot_artifacts(&state, bootstrap);
+        }
+        if !self.meta_ready(&state) {
             self.request_meta_refresh(state.whirlpool);
         }
 
@@ -390,9 +389,7 @@ impl WhirlpoolAdapter {
         );
 
         self.prefetch_tick_array_hints(&state);
-        self.register_templates_with_builder(&state);
-        self.record_hydration_metrics(&state);
-        self.record_twap_observation(&state, update.slot, update.block_time_unix);
+        self.record_twap_observation(&state, update.block_time_unix);
         drop(previous_state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
@@ -438,366 +435,165 @@ impl WhirlpoolAdapter {
             extras.hydrated_slot = Some(meta.hydrated_slot);
             extras.hydrated_at = Some(meta.hydrated_at);
 
-            self.register_hydrated_meta(pool, &meta);
         }
 
         extras
     }
 
-    fn register_templates_with_builder(&self, state: &WhirlpoolState) {
-        let Some(builder) = self.template_builder.as_ref() else {
-            return;
-        };
-        let Some(raw_fee) = state.fee_rate else {
-            return;
-        };
-
-        if !self.meta_ready_within_lag(state) {
-            trace!(
-                target = "adapter::whirlpool",
-                pool = %state.whirlpool,
-                slot = state.corecast_slot,
-                "deferring template registration until meta hydration completes"
-            );
-            self.record_component_lag_event(state, HydrationComponent::Meta, "adapter state update");
-            return;
-        }
-
-        let alt_accounts = Self::static_alt_accounts(state);
-        if alt_accounts.is_empty() {
-            return;
-        }
-
-        let fee_bps = fee_bps_from_hundredth_bip(raw_fee);
-        let fee_tier_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
-        let pool_accounts = WhirlpoolPoolAccounts {
-            whirlpool: state.whirlpool,
-            token_mint_a: state.token_mint_a,
-            token_mint_b: state.token_mint_b,
-            token_vault_a: state.token_vault_a,
-            token_vault_b: state.token_vault_b,
-            token_program_a: state.token_program_a,
-            token_program_b: state.token_program_b,
-            oracle: state.oracle,
-        };
-
-        self.register_pool_templates(
-            builder,
-            state.whirlpool,
-            fee_tier_bps,
-            alt_accounts,
-            pool_accounts,
-            state.hydrated_meta_slot,
-            Some(state.corecast_slot),
-            "adapter state update",
-            None,
-            false,
-        );
+    fn meta_ready(&self, state: &WhirlpoolState) -> bool {
+        state.meta_ready_for_slot(state.corecast_slot)
     }
 
-    fn register_hydrated_meta(&self, pool: Pubkey, meta: &HydratedPoolMeta) {
-        let Some(builder) = self.template_builder.as_ref() else {
-            return;
-        };
-
-        let alt_accounts = Self::collect_alt_accounts(
-            pool,
-            meta.token_mint_a,
-            meta.token_mint_b,
-            Some(meta.token_vault_a),
-            Some(meta.token_vault_b),
-            Some(meta.token_program_a),
-            Some(meta.token_program_b),
-            Some(meta.oracle),
-        );
-        if alt_accounts.is_empty() {
-            return;
-        }
-
-        let fee_bps = fee_bps_from_hundredth_bip(meta.fee_rate);
-        let fee_tier_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
-        let pool_accounts = WhirlpoolPoolAccounts {
-            whirlpool: pool,
-            token_mint_a: meta.token_mint_a,
-            token_mint_b: meta.token_mint_b,
-            token_vault_a: Some(meta.token_vault_a),
-            token_vault_b: Some(meta.token_vault_b),
-            token_program_a: Some(meta.token_program_a),
-            token_program_b: Some(meta.token_program_b),
-            oracle: Some(meta.oracle),
-        };
-
-        self.register_pool_templates(
-            builder,
-            pool,
-            fee_tier_bps,
-            alt_accounts,
-            pool_accounts,
-            Some(meta.hydrated_slot),
-            Some(meta.hydrated_slot),
-            "hydrator meta refresh",
-            None,
-            false,
-        );
+    fn tick_arrays_ready(&self, state: &WhirlpoolState) -> bool {
+        state.tick_arrays_ready_for_slot(state.corecast_slot)
     }
 
-    fn register_pool_templates(
-        &self,
-        builder: &BuilderHandle,
-        pool: Pubkey,
-        fee_tier_bps: u16,
-        alt_accounts: Vec<Pubkey>,
-        pool_accounts: WhirlpoolPoolAccounts,
-        hydrated_slot: Option<u64>,
-        ingest_slot: Option<u64>,
-        reason: &'static str,
-        epoch_override: Option<u64>,
-        force_refresh: bool,
-    ) {
-        let epoch = epoch_override.unwrap_or_else(|| builder.template_cache().epoch());
-        let (should_refresh, slot_stale, accounts_changed, epoch_changed, previous_count) = self
-            .registration_refresh_state(pool, &alt_accounts, hydrated_slot, epoch, force_refresh);
-
-        if !should_refresh {
-            debug!(
-                target = "adapter::whirlpool",
-                pool = %pool,
-                ingest_slot,
-                hydrated_slot,
-                epoch,
-                reason = reason,
-                force_refresh,
-                slot_stale,
-                accounts_changed,
-                epoch_changed,
-                "skipping whirlpool template registration; no changes detected"
-            );
-            return;
-        }
-
-        debug!(
-            target = "adapter::whirlpool",
-            pool = %pool,
-            ingest_slot,
-            hydrated_slot,
-            epoch,
-            reason = reason,
-            force_refresh,
-            "registering whirlpool instruction templates"
-        );
-
-        if let Some(old_accounts) = previous_count {
-            debug!(
-                target = "adapter::whirlpool",
-                pool = %pool,
-                slot_stale,
-                accounts_changed,
-                epoch_changed,
-                old_accounts,
-                new_accounts = alt_accounts.len(),
-                reason = reason,
-                "refreshing whirlpool instruction templates"
-            );
-        }
-
-        builder.register_whirlpool_pool(WhirlpoolPoolMeta {
-            pool_id: pool,
-            fee_tier_bps,
-            alt_accounts: alt_accounts.clone(),
-            alt_handle: None,
-            accounts: pool_accounts,
-        });
-
-        self.registered_templates.insert(
-            pool,
-            WhirlpoolRegistration {
-                alt_accounts,
-                last_hydrated_slot: hydrated_slot,
-                epoch,
-            },
-        );
-    }
-
-    fn registration_refresh_state(
+    fn bootstrap_from_snapshot(
         &self,
         pool: Pubkey,
-        alt_accounts: &[Pubkey],
-        hydrated_slot: Option<u64>,
-        epoch: u64,
-        force_refresh: bool,
-    ) -> (bool, bool, bool, bool, Option<usize>) {
-        if let Some(existing) = self.registered_templates.get(&pool) {
-            if force_refresh {
-                return (
-                    true,
-                    false,
-                    false,
-                    existing.epoch != epoch,
-                    Some(existing.alt_accounts.len()),
-                );
+        extras: &mut WhirlpoolPoolExtras,
+    ) -> Option<WhirlpoolSnapshotBootstrap> {
+        let snapshot = self.registry.whirlpool_snapshot(&pool)?;
+        if snapshot.program_id != self.program_id {
+            return None;
+        }
+
+        let meta = &snapshot.meta;
+        Self::assign_pubkey_field(&mut extras.token_mint_a, meta.token_mint_a);
+        Self::assign_pubkey_field(&mut extras.token_mint_b, meta.token_mint_b);
+        Self::assign_pubkey_field(&mut extras.token_vault_a, meta.token_vault_a);
+        Self::assign_pubkey_field(&mut extras.token_vault_b, meta.token_vault_b);
+        Self::assign_pubkey_field(&mut extras.token_program_a, meta.token_program_a);
+        Self::assign_pubkey_field(&mut extras.token_program_b, meta.token_program_b);
+        extras.tick_spacing = extras.tick_spacing.or(Some(meta.tick_spacing));
+        extras.liquidity = extras.liquidity.or(Some(meta.liquidity));
+        extras.sqrt_price_x64 = extras.sqrt_price_x64.or(Some(meta.sqrt_price_x64));
+        extras.tick_current_index = extras.tick_current_index.or(Some(meta.tick_current_index));
+        extras.fee_rate = extras.fee_rate.or(Some(meta.fee_rate));
+        extras.protocol_fee_rate = extras.protocol_fee_rate.or(Some(meta.protocol_fee_rate));
+        Self::assign_pubkey_field(&mut extras.oracle, meta.oracle);
+        extras.trade_enable_timestamp = extras
+            .trade_enable_timestamp
+            .or(meta.trade_enable_timestamp);
+        if extras.adaptive_fee.is_none() {
+            extras.adaptive_fee = meta.adaptive_fee;
+        }
+        extras.hydrated_slot = extras.hydrated_slot.or(Some(meta.hydrated_slot));
+        extras.hydrated_at = extras.hydrated_at.or(Some(meta.hydrated_at));
+
+        for (slot, array) in [
+            &mut extras.tick_array0,
+            &mut extras.tick_array1,
+            &mut extras.tick_array2,
+        ]
+        .into_iter()
+        .zip(snapshot.tick_arrays.iter())
+        {
+            if slot.is_none() {
+                *slot = Some(array.address.to_string());
             }
-            let slot_stale = match (hydrated_slot, existing.last_hydrated_slot) {
-                (Some(new_slot), Some(prev_slot)) => new_slot > prev_slot,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            let accounts_changed = existing.alt_accounts != alt_accounts;
-            let epoch_changed = existing.epoch != epoch;
-            let should_refresh = accounts_changed || slot_stale || epoch_changed;
-            return (
-                should_refresh,
-                slot_stale,
-                accounts_changed,
-                epoch_changed,
-                Some(existing.alt_accounts.len()),
-            );
         }
 
-        (true, false, true, true, None)
+        Some(WhirlpoolSnapshotBootstrap {
+            token_a_meta: snapshot.token_a_mint_meta,
+            token_b_meta: snapshot.token_b_mint_meta,
+            token_a_transfer_hook_program: snapshot.token_a_transfer_hook_program,
+            token_b_transfer_hook_program: snapshot.token_b_transfer_hook_program,
+            tick_arrays: snapshot.tick_arrays.clone(),
+        })
     }
 
-    fn meta_ready_within_lag(&self, state: &WhirlpoolState) -> bool {
-        state.meta_ready_within_lag(
-            state.corecast_slot,
-            self.config.hydration_slot_lag_tolerance,
-            self.config.hydration_lag_ms_tolerance,
-        )
+    fn assign_pubkey_field(target: &mut Option<String>, value: Pubkey) {
+        if target.is_none() {
+            *target = Some(value.to_string());
+        }
     }
 
-    fn tick_arrays_ready_within_lag(&self, state: &WhirlpoolState) -> bool {
-        state.tick_arrays_ready_within_lag(state.corecast_slot, self.config.hydration_slot_lag_tolerance, self.config.hydration_lag_ms_tolerance)
+    fn apply_snapshot_bootstrap(
+        &self,
+        state: &mut WhirlpoolState,
+        bootstrap: &WhirlpoolSnapshotBootstrap,
+    ) {
+        if let Some(meta) = bootstrap.token_a_meta {
+            if let Some(decimals) = meta.decimals {
+                if state.token_a_decimals.is_none() {
+                    state.token_a_decimals = Some(decimals);
+                }
+            }
+            if state
+                .token_program_a
+                .map(|program| program != meta.program)
+                .unwrap_or(true)
+            {
+                state.token_program_a = Some(meta.program);
+            }
+            if state.token_a_transfer_fee.is_none() {
+                if let Some(summary) = meta.transfer_fee_config {
+                    state.token_a_transfer_fee = Some(TokenTransferFee::from(summary));
+                }
+            }
+        }
+        if let Some(meta) = bootstrap.token_b_meta {
+            if let Some(decimals) = meta.decimals {
+                if state.token_b_decimals.is_none() {
+                    state.token_b_decimals = Some(decimals);
+                }
+            }
+            if state
+                .token_program_b
+                .map(|program| program != meta.program)
+                .unwrap_or(true)
+            {
+                state.token_program_b = Some(meta.program);
+            }
+            if state.token_b_transfer_fee.is_none() {
+                if let Some(summary) = meta.transfer_fee_config {
+                    state.token_b_transfer_fee = Some(TokenTransferFee::from(summary));
+                }
+            }
+        }
+        if state.transfer_hook_program_a.is_none() {
+            state.transfer_hook_program_a = bootstrap.token_a_transfer_hook_program;
+        }
+        if state.transfer_hook_program_b.is_none() {
+            state.transfer_hook_program_b = bootstrap.token_b_transfer_hook_program;
+        }
     }
 
-    fn component_lag(
+    fn warm_snapshot_artifacts(
         &self,
         state: &WhirlpoolState,
-        component: HydrationComponent,
-    ) -> (Option<u64>, Option<u64>) {
-        let lag_slots = match component {
-            HydrationComponent::Meta => state.meta_lag_slots(state.corecast_slot),
-            HydrationComponent::TickArrays => {
-                state.tick_array_lag_slots(state.corecast_slot)
-            }
-            _ => None,
-        };
-        (lag_slots, state.hydration_age_ms())
-    }
-
-    fn should_log_component_lag(
-        &self,
-        pool: Pubkey,
-        component: HydrationComponent,
-        lag_slots: Option<u64>,
-        lag_ms: Option<u64>,
-    ) -> bool {
-        let slot_over = lag_slots
-            .map(|slots| slots > self.config.hydration_slot_lag_tolerance)
-            .unwrap_or(false);
-        let time_over = lag_ms
-            .map(|ms| ms > self.config.hydration_lag_ms_tolerance)
-            .unwrap_or(false);
-        if !(slot_over || time_over) {
-            return false;
-        }
-        let key = (pool, component.index() as u8);
-        if let Some(entry) = self.lag_log.get(&key) {
-            if entry.value().elapsed().as_millis() as u64 <= HYDRATION_LAG_LOG_INTERVAL_MS {
-                return false;
-            }
-        }
-        self.lag_log.insert(key, Instant::now());
-        true
-    }
-
-    fn record_component_lag_event(
-        &self,
-        state: &WhirlpoolState,
-        component: HydrationComponent,
-        context: &'static str,
+        bootstrap: &WhirlpoolSnapshotBootstrap,
     ) {
-        let (lag_slots, lag_ms) = self.component_lag(state, component);
-        telemetry::record_hydration_component_pending(
-            self.name(),
-            component.as_str(),
-            lag_ms,
-            lag_slots,
-        );
-        if self.should_log_component_lag(state.whirlpool, component, lag_slots, lag_ms) {
-            let hydrated_slot = match component {
-                HydrationComponent::Meta => state.hydrated_meta_slot,
-                HydrationComponent::TickArrays => state.hydrated_tick_arrays_slot,
-                _ => None,
-            };
-            warn!(
-                target = "adapter::whirlpool",
-                pool = %state.whirlpool,
-                component = component.as_str(),
-                context,
-                corecast_slot = state.corecast_slot,
-                hydrated_slot,
-                lag_slots,
-                lag_ms,
-                "whirlpool hydration lag exceeds tolerance"
-            );
+        if let Some(hydrator) = self.hydrator.as_ref() {
+            if !bootstrap.tick_arrays.is_empty() {
+                hydrator.prime_tick_arrays_from_snapshot(state.whirlpool, &bootstrap.tick_arrays);
+            }
+        }
+
+        if let Some(resolver) = self.transfer_hook_resolver.as_ref() {
+            if let Some(program) = state.token_program_a {
+                resolver.prime_mint_program(state.token_mint_a, program);
+            }
+            if let Some(program) = state.token_program_b {
+                resolver.prime_mint_program(state.token_mint_b, program);
+            }
         }
     }
 
-    fn record_hydration_metrics(&self, state: &WhirlpoolState) {
-        let adapter = self.name();
-        let meta_slot = state.hydrated_meta_slot.unwrap_or(0);
-        let tick_slot = state.hydrated_tick_arrays_slot.unwrap_or(0);
-        let meta_delta = state.corecast_slot.saturating_sub(meta_slot);
-        let tick_delta = state.corecast_slot.saturating_sub(tick_slot);
-        telemetry::record_hydration_component_slot_delta(
-            adapter,
-            HydrationComponent::Meta.as_str(),
-            meta_delta,
-        );
-        telemetry::record_hydration_component_slot_delta(
-            adapter,
-            HydrationComponent::TickArrays.as_str(),
-            tick_delta,
-        );
-
-        let meta_ready = self.meta_ready_within_lag(state);
-        let tick_ready = self.tick_arrays_ready_within_lag(state);
-        let stage = if !meta_ready {
-            0
-        } else if !tick_ready {
-            1
-        } else {
-            2
-        };
-        telemetry::record_hydration_stage(adapter, &state.whirlpool.to_string(), stage);
-        if !meta_ready {
-            self.record_component_lag_event(state, HydrationComponent::Meta, "metrics_meta_pending");
-        } else if !tick_ready {
-            self.record_component_lag_event(state, HydrationComponent::TickArrays, "metrics_tick_pending");
-        }
-    }
-
-    fn record_twap_observation(&self, state: &WhirlpoolState, slot: u64, block_time: Option<i64>) {
+    fn record_twap_observation(&self, state: &WhirlpoolState, block_time: Option<i64>) {
         let Some(tick) = state.tick_current_index else {
             return;
         };
         let Some(liquidity) = state.liquidity else {
             return;
         };
-        let Some(sqrt_price_x64) = state.sqrt_price_x64 else {
-            return;
-        };
         let Some(timestamp) = normalize_block_time(block_time).or_else(current_unix_timestamp)
         else {
             return;
         };
-        self.twap_cache.observe(
-            state.whirlpool,
-            slot,
-            timestamp,
-            tick,
-            sqrt_price_x64,
-            liquidity,
-        );
+        self.twap_cache
+            .observe(state.whirlpool, timestamp, tick, liquidity);
     }
 
     fn attach_transfer_metadata(&self, state: &mut WhirlpoolState) {
@@ -937,12 +733,6 @@ impl WhirlpoolAdapter {
         } else if context.whirlpool_tick_arrays.is_empty() && !preferred_arrays.is_empty() {
             context.whirlpool_tick_arrays = preferred_arrays.into_iter().take(3).collect();
         }
-        self.attach_owner_accounts(
-            state,
-            &mut context,
-            response.request.input_mint,
-            response.request.output_mint,
-        );
         self.attach_transfer_hook_accounts(state, &mut context, &response.request);
         let supplemental_arrays: Vec<Pubkey> = preferred_arrays_full.into_iter().skip(3).collect();
         self.attach_supplemental_tick_arrays(&mut context, &supplemental_arrays);
@@ -1127,46 +917,6 @@ impl WhirlpoolAdapter {
         }
     }
 
-    fn attach_owner_accounts(
-        &self,
-        state: &WhirlpoolState,
-        context: &mut TemplateContext,
-        input_mint: Pubkey,
-        output_mint: Pubkey,
-    ) {
-        let Some(builder) = self.template_builder.as_ref() else {
-            return;
-        };
-        if context.payer.is_none() {
-            context.payer = Some(builder.payer_pubkey());
-        }
-
-        if context.input_token_account.is_none() {
-            if let Some(ata) = builder.token_account_for_mint(&input_mint) {
-                context.input_token_account = Some(ata);
-            } else {
-                warn!(
-                    target = "adapter::whirlpool",
-                    pool = %state.whirlpool,
-                    mint = %input_mint,
-                    "missing configured input token ATA"
-                );
-            }
-        }
-        if context.output_token_account.is_none() {
-            if let Some(ata) = builder.token_account_for_mint(&output_mint) {
-                context.output_token_account = Some(ata);
-            } else {
-                warn!(
-                    target = "adapter::whirlpool",
-                    pool = %state.whirlpool,
-                    mint = %output_mint,
-                    "missing configured output token ATA"
-                );
-            }
-        }
-    }
-
     fn attach_supplemental_tick_arrays(
         &self,
         context: &mut TemplateContext,
@@ -1282,9 +1032,7 @@ impl WhirlpoolAdapter {
 
     fn eager_hydration(&self, pool: Pubkey) {
         if let Some(hydrator) = self.hydrator.as_ref() {
-            if let Some(meta) = hydrator.hydrate(pool) {
-                self.register_hydrated_meta(pool, &meta);
-            }
+            let _ = hydrator.hydrate(pool);
         }
         if let Some(state) = self.get_state(&pool) {
             self.prefetch_tick_array_hints(&state);
@@ -1622,14 +1370,13 @@ impl WhirlpoolAdapter {
             return None;
         }
 
-        if !self.meta_ready_within_lag(state) {
+        if !self.meta_ready(state) {
             self.request_meta_refresh(state.whirlpool);
-            self.record_component_lag_event(state, HydrationComponent::Meta, "snapshot_side");
             self.record_snapshot_issue(
                 state,
                 slot,
                 base_to_quote,
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
                 "meta_pending",
                 Some(probe_amount),
                 Some(amount_specified_is_input),
@@ -1638,18 +1385,13 @@ impl WhirlpoolAdapter {
             return None;
         }
 
-        if !self.tick_arrays_ready_within_lag(state) {
+        if !self.tick_arrays_ready(state) {
             self.request_tick_array_refresh(state);
-            self.record_component_lag_event(
-                state,
-                HydrationComponent::TickArrays,
-                "snapshot_side",
-            );
             self.record_snapshot_issue(
                 state,
                 slot,
                 base_to_quote,
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
                 "tick_arrays_pending",
                 Some(probe_amount),
                 Some(amount_specified_is_input),
@@ -1773,7 +1515,6 @@ impl WhirlpoolAdapter {
         } else if let Some(arrays) = self.tick_arrays_for_direction(state, direction) {
             context.whirlpool_tick_arrays = arrays;
         }
-        self.attach_owner_accounts(state, &mut context, input_mint, output_mint);
 
         self.record_snapshot_issue(
             state,
@@ -1845,31 +1586,17 @@ impl ProtocolAdapter for WhirlpoolAdapter {
     }
 
     fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
-        snapshot.hydration.require(HydrationComponent::Meta);
-        snapshot.hydration.require(HydrationComponent::TickArrays);
         let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
             return;
         };
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
-        if self.meta_ready_within_lag(&state) {
-            if let Some(slot) = state.hydrated_meta_slot {
-                snapshot
-                    .hydration
-                    .mark_ready(HydrationComponent::Meta, slot);
-            }
-        } else {
-            self.record_component_lag_event(&state, HydrationComponent::Meta, "snapshot_meta_pending");
+        if !self.meta_ready(&state) {
+            self.request_meta_refresh(state.whirlpool);
         }
-        if self.tick_arrays_ready_within_lag(&state) {
-            if let Some(slot) = state.hydrated_tick_arrays_slot {
-                snapshot
-                    .hydration
-                    .mark_ready(HydrationComponent::TickArrays, slot);
-            }
-        } else {
-            self.record_component_lag_event(&state, HydrationComponent::TickArrays, "snapshot_tick_pending");
+        if !self.tick_arrays_ready(&state) {
+            self.request_tick_array_refresh(&state);
         }
         let extras = snapshot
             .extensions
@@ -1911,150 +1638,33 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         }
     }
 
-    fn warm_components(&self, snapshot: &PoolSnapshot, components: &[HydrationComponent]) {
-        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
-            return;
-        };
-        if components.contains(&HydrationComponent::Meta) {
-            if let Some(hydrator) = self.hydrator.as_ref() {
-                if let Some(meta) = hydrator.hydrate(pool_pubkey) {
-                    self.register_hydrated_meta(pool_pubkey, &meta);
-                }
-            }
-        }
-        if components.contains(&HydrationComponent::TickArrays) {
-            if let Some(state) = self.get_state(&pool_pubkey) {
-                self.prefetch_tick_array_hints(&state);
-                self.schedule_tick_array_windows(&state);
-            }
-        }
-    }
-
-    fn refresh_templates(&self, epoch: u64) {
-        let Some(builder) = self.template_builder.as_ref() else {
-            return;
-        };
-        let states: Vec<WhirlpoolState> = self.state.iter().map(|entry| entry.clone()).collect();
-        for state in states {
-            if !self.meta_ready_within_lag(&state) {
-                self.record_component_lag_event(&state, HydrationComponent::Meta, "cache epoch refresh");
-                continue;
-            }
-            let Some(raw_fee) = state.fee_rate else {
-                continue;
-            };
-            let alt_accounts = Self::static_alt_accounts(&state);
-            if alt_accounts.is_empty() {
-                continue;
-            }
-            let fee_bps = fee_bps_from_hundredth_bip(raw_fee);
-            let fee_tier_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
-            let pool_accounts = WhirlpoolPoolAccounts {
-                whirlpool: state.whirlpool,
-                token_mint_a: state.token_mint_a,
-                token_mint_b: state.token_mint_b,
-                token_vault_a: state.token_vault_a,
-                token_vault_b: state.token_vault_b,
-                token_program_a: state.token_program_a,
-                token_program_b: state.token_program_b,
-                oracle: state.oracle,
-            };
-
-            self.register_pool_templates(
-                builder,
-                state.whirlpool,
-                fee_tier_bps,
-                alt_accounts,
-                pool_accounts,
-                state.hydrated_meta_slot,
-                Some(state.corecast_slot),
-                "cache epoch refresh",
-                Some(epoch),
-                false,
-            );
-        }
-    }
-
-    fn refresh_pool_templates(&self, pool: Pubkey, epoch: u64) {
-        let Some(builder) = self.template_builder.as_ref() else {
-            return;
-        };
-        if let Some(state) = self.get_state(&pool) {
-            if !self.meta_ready_within_lag(&state) {
-                self.record_component_lag_event(&state, HydrationComponent::Meta, "template readiness refresh");
-                return;
-            }
-            let Some(raw_fee) = state.fee_rate else {
-                return;
-            };
-            let alt_accounts = Self::static_alt_accounts(&state);
-            if alt_accounts.is_empty() {
-                return;
-            }
-            let fee_bps = fee_bps_from_hundredth_bip(raw_fee);
-            let fee_tier_bps = fee_bps.min(u64::from(u16::MAX)) as u16;
-            let pool_accounts = WhirlpoolPoolAccounts {
-                whirlpool: state.whirlpool,
-                token_mint_a: state.token_mint_a,
-                token_mint_b: state.token_mint_b,
-                token_vault_a: state.token_vault_a,
-                token_vault_b: state.token_vault_b,
-                token_program_a: state.token_program_a,
-                token_program_b: state.token_program_b,
-                oracle: state.oracle,
-            };
-
-            self.register_pool_templates(
-                builder,
-                state.whirlpool,
-                fee_tier_bps,
-                alt_accounts,
-                pool_accounts,
-                state.hydrated_meta_slot,
-                Some(state.corecast_slot),
-                "template readiness refresh",
-                Some(epoch),
-                true,
-            );
-        }
-    }
-
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
         }
         let state = self.get_state(&req.pool_id)?;
         let mut request = req;
-        let capped_amount = match self.clamp_amount_for_mint(
-            &state,
-            request.input_mint,
-            request.amount,
-        ) {
-            Ok(value) => value,
-            Err(status) => {
-                let mut response = build_quote_response(request, 0);
-                response.status = status;
-                self.decorate_template_context(&mut response, &state);
-                return Some(response);
-            }
-        };
+        let capped_amount =
+            match self.clamp_amount_for_mint(&state, request.input_mint, request.amount) {
+                Ok(value) => value,
+                Err(status) => {
+                    let mut response = build_quote_response(request, 0);
+                    response.status = status;
+                    self.decorate_template_context(&mut response, &state);
+                    return Some(response);
+                }
+            };
         if capped_amount == 0 {
             return None;
         }
         request.amount = capped_amount;
 
-        if !self.meta_ready_within_lag(&state) {
+        if !self.meta_ready(&state) {
             self.request_meta_refresh(state.whirlpool);
-            self.record_component_lag_event(&state, HydrationComponent::Meta, "quote_exact_in");
             return Some(hydration_pending_response(request));
         }
-        if !self.tick_arrays_ready_within_lag(&state) {
+        if !self.tick_arrays_ready(&state) {
             self.request_tick_array_refresh(&state);
-            self.record_component_lag_event(
-                &state,
-                HydrationComponent::TickArrays,
-                "quote_exact_in",
-            );
             return Some(hydration_pending_response(request));
         }
 
@@ -2075,27 +1685,22 @@ impl ProtocolAdapter for WhirlpoolAdapter {
             return None;
         }
 
-        let simulation = match simulate_best_exact_in(
-            self.hydrator.as_ref(),
-            &state,
-            &request,
-            net_budget,
-        ) {
-            Ok(simulation) => simulation,
-            Err(err) => {
-                let status: QuoteStatus = err.into();
-                let mut response = build_quote_response(request, 0);
-                response.status = status;
-                self.decorate_template_context(&mut response, &state);
-                return Some(response);
-            }
-        };
+        let simulation =
+            match simulate_best_exact_in(self.hydrator.as_ref(), &state, &request, net_budget) {
+                Ok(simulation) => simulation,
+                Err(err) => {
+                    let status: QuoteStatus = err.into();
+                    let mut response = build_quote_response(request, 0);
+                    response.status = status;
+                    self.decorate_template_context(&mut response, &state);
+                    return Some(response);
+                }
+            };
 
         let (net_output_amount, _) = apply_post_fee_amount(simulation.amount_out, output_fee)
             .unwrap_or((simulation.amount_out, 0));
-        let (executed_input_amount, _) =
-            apply_pre_fee_amount(simulation.consumed_input, input_fee)
-                .unwrap_or((simulation.consumed_input, 0));
+        let (executed_input_amount, _) = apply_pre_fee_amount(simulation.consumed_input, input_fee)
+            .unwrap_or((simulation.consumed_input, 0));
         let mut response = build_quote_response(request, net_output_amount);
         response.amount_in = executed_input_amount;
         response.edge_bps = simulation.edge_bps;
@@ -2115,19 +1720,16 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         }
         let state = self.get_state(&req.pool_id)?;
         let mut request = req;
-        let capped_amount = match self.clamp_amount_for_mint(
-            &state,
-            request.output_mint,
-            request.amount,
-        ) {
-            Ok(value) => value,
-            Err(status) => {
-                let mut response = build_quote_response(request, 0);
-                response.status = status;
-                self.decorate_template_context(&mut response, &state);
-                return Some(response);
-            }
-        };
+        let capped_amount =
+            match self.clamp_amount_for_mint(&state, request.output_mint, request.amount) {
+                Ok(value) => value,
+                Err(status) => {
+                    let mut response = build_quote_response(request, 0);
+                    response.status = status;
+                    self.decorate_template_context(&mut response, &state);
+                    return Some(response);
+                }
+            };
         if capped_amount == 0 {
             return None;
         }
@@ -2136,18 +1738,12 @@ impl ProtocolAdapter for WhirlpoolAdapter {
             return None;
         }
 
-        if !self.meta_ready_within_lag(&state) {
+        if !self.meta_ready(&state) {
             self.request_meta_refresh(state.whirlpool);
-            self.record_component_lag_event(&state, HydrationComponent::Meta, "quote_exact_out");
             return Some(hydration_pending_response(request));
         }
-        if !self.tick_arrays_ready_within_lag(&state) {
+        if !self.tick_arrays_ready(&state) {
             self.request_tick_array_refresh(&state);
-            self.record_component_lag_event(
-                &state,
-                HydrationComponent::TickArrays,
-                "quote_exact_out",
-            );
             return Some(hydration_pending_response(request));
         }
 
@@ -2229,7 +1825,7 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                 &state,
                 snapshot.slot,
                 true,
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
                 reason,
                 None,
                 None,
@@ -2239,7 +1835,7 @@ impl ProtocolAdapter for WhirlpoolAdapter {
                 &state,
                 snapshot.slot,
                 false,
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
                 reason,
                 None,
                 None,
@@ -2247,20 +1843,14 @@ impl ProtocolAdapter for WhirlpoolAdapter {
             );
         };
 
-        if !self.meta_ready_within_lag(&state) {
+        if !self.meta_ready(&state) {
             self.request_meta_refresh(state.whirlpool);
-            self.record_component_lag_event(&state, HydrationComponent::Meta, "snapshot_quotes");
             log_component_issue("meta_pending");
             return None;
         }
 
-        if !self.tick_arrays_ready_within_lag(&state) {
+        if !self.tick_arrays_ready(&state) {
             self.request_tick_array_refresh(&state);
-            self.record_component_lag_event(
-                &state,
-                HydrationComponent::TickArrays,
-                "snapshot_quotes",
-            );
             log_component_issue("tick_arrays_pending");
             return None;
         }
@@ -2384,15 +1974,6 @@ impl ProtocolAdapter for WhirlpoolAdapter {
         })
     }
 
-    fn readiness_blockers(&self) -> AdapterReadiness {
-        if let Some(hydrator) = self.hydrator.as_ref() {
-            AdapterReadiness {
-                blockers: hydrator.readiness_blockers(),
-            }
-        } else {
-            AdapterReadiness::default()
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2514,7 +2095,6 @@ struct WhirlpoolPoolHydrator {
     tick_array_cache: DashMap<(Pubkey, i32), HydratedTickArray>,
     clients: Arc<Vec<Arc<RpcClient>>>,
     endpoint_count: usize,
-    pool_failures: DashMap<Pubkey, FailureWindow>,
     tick_failures: DashMap<(Pubkey, i32), FailureWindow>,
     tick_backoff: Duration,
     max_tick_failures: u32,
@@ -2544,9 +2124,8 @@ impl WhirlpoolPoolHydrator {
         let tick_backoff = Duration::from_millis(config.tick_array_backoff_ms.max(1));
         let max_pool_failures = config.max_pool_failures.max(1);
         let max_tick_failures = config.max_tick_array_failures.max(1);
-        let pool_failures: DashMap<Pubkey, FailureWindow> = DashMap::new();
+        let hydrator_failures: DashMap<Pubkey, FailureWindow> = DashMap::new();
         let tick_failures: DashMap<(Pubkey, i32), FailureWindow> = DashMap::new();
-        let hydrator_failures = pool_failures.clone();
         let oracle_hydration_enabled = config.oracle_hydration_enabled;
         let hydrator = AsyncHydrator::new("whirlpool_pool", endpoint_count, move |pool| {
             let now = Instant::now();
@@ -2592,7 +2171,6 @@ impl WhirlpoolPoolHydrator {
             tick_array_cache: DashMap::new(),
             clients,
             endpoint_count,
-            pool_failures,
             tick_failures,
             tick_backoff,
             max_tick_failures,
@@ -2601,6 +2179,30 @@ impl WhirlpoolPoolHydrator {
 
     fn client_count(&self) -> usize {
         self.endpoint_count
+    }
+
+    fn prime_tick_arrays_from_snapshot(&self, pool: Pubkey, arrays: &[SnapshotTickArray]) {
+        if arrays.is_empty() {
+            return;
+        }
+        for snapshot in arrays {
+            let ticks: Vec<TickEntry> = snapshot
+                .ticks
+                .iter()
+                .map(|tick| TickEntry {
+                    initialized: tick.initialized,
+                    liquidity_net: tick.liquidity_net,
+                    liquidity_gross: tick.liquidity_gross,
+                })
+                .collect();
+            let entry = HydratedTickArray {
+                address: snapshot.address,
+                start_tick_index: snapshot.start_tick_index,
+                ticks,
+            };
+            self.tick_array_cache
+                .insert((pool, entry.start_tick_index), entry);
+        }
     }
 
     fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
@@ -2639,38 +2241,6 @@ impl WhirlpoolPoolHydrator {
 
     fn clear_tick_failure(&self, pool: Pubkey, start_tick_index: i32) {
         failure_clear(&self.tick_failures, &(pool, start_tick_index));
-    }
-
-    fn readiness_blockers(&self) -> Vec<ReadinessBlocker> {
-        let now = Instant::now();
-        let mut blockers = Vec::new();
-        for entry in self.pool_failures.iter() {
-            let status = entry.value();
-            if let Some(delay) = status.next_retry_at.checked_duration_since(now) {
-                blockers.push(ReadinessBlocker {
-                    adapter: "whirlpool",
-                    pool: *entry.key(),
-                    kind: ReadinessBlockerKind::PoolMeta,
-                    tick_start: None,
-                    failures: status.failures,
-                    retry_in: delay,
-                });
-            }
-        }
-        for entry in self.tick_failures.iter() {
-            let status = entry.value();
-            if let Some(delay) = status.next_retry_at.checked_duration_since(now) {
-                blockers.push(ReadinessBlocker {
-                    adapter: "whirlpool",
-                    pool: entry.key().0,
-                    kind: ReadinessBlockerKind::TickArray,
-                    tick_start: Some(entry.key().1),
-                    failures: status.failures,
-                    retry_in: delay,
-                });
-            }
-        }
-        blockers
     }
 
     fn hydrate_tick_array_window(
@@ -3725,79 +3295,15 @@ impl WhirlpoolState {
         self.meta_ready() && Self::hydration_slot_ready(self.hydrated_meta_slot, slot)
     }
 
-    fn tick_arrays_ready_within_lag(
-        &self,
-        slot: u64,
-        slot_lag_tolerance: u64,
-        lag_ms_tolerance: u64,
-    ) -> bool {
-        if !self.tick_arrays_ready() {
-            return false;
-        }
-        if Self::hydration_slot_within_tolerance(
-            self.hydrated_tick_arrays_slot,
-            slot,
-            slot_lag_tolerance,
-        ) {
-            return true;
-        }
-        if lag_ms_tolerance == 0 {
-            return false;
-        }
-        self.hydration_age_ms()
-            .map(|age| age <= lag_ms_tolerance)
-            .unwrap_or(false)
+    fn tick_arrays_ready_for_slot(&self, slot: u64) -> bool {
+        self.tick_arrays_ready()
+            && Self::hydration_slot_ready(self.hydrated_tick_arrays_slot, slot)
     }
 
     fn hydration_slot_ready(slot: Option<u64>, target: u64) -> bool {
         slot.map(|value| value >= target).unwrap_or(false)
     }
 
-    fn meta_ready_within_lag(
-        &self,
-        slot: u64,
-        slot_lag_tolerance: u64,
-        lag_ms_tolerance: u64,
-    ) -> bool {
-        if !self.meta_ready() {
-            return false;
-        }
-        if Self::hydration_slot_within_tolerance(self.hydrated_meta_slot, slot, slot_lag_tolerance)
-        {
-            return true;
-        }
-        if lag_ms_tolerance == 0 {
-            return false;
-        }
-        self.hydration_age_ms()
-            .map(|age| age <= lag_ms_tolerance)
-            .unwrap_or(false)
-    }
-
-    fn hydration_slot_within_tolerance(
-        slot: Option<u64>,
-        target: u64,
-        tolerance: u64,
-    ) -> bool {
-        slot
-            .map(|hydrated| hydrated >= target || target.saturating_sub(hydrated) <= tolerance)
-            .unwrap_or(false)
-    }
-
-    fn hydration_age_ms(&self) -> Option<u64> {
-        self.last_hydrated_at
-            .map(|instant| instant.elapsed().as_millis() as u64)
-    }
-
-    fn meta_lag_slots(&self, slot: u64) -> Option<u64> {
-        self.hydrated_meta_slot
-            .map(|hydrated| slot.saturating_sub(hydrated))
-    }
-
-    fn tick_array_lag_slots(&self, slot: u64) -> Option<u64> {
-        self.hydrated_tick_arrays_slot
-            .map(|hydrated| slot.saturating_sub(hydrated))
-    }
 }
 
 fn parse_pubkey(value: &str) -> Option<Pubkey> {
@@ -3821,7 +3327,7 @@ impl From<SimulationError> for QuoteStatus {
     fn from(value: SimulationError) -> Self {
         match value {
             SimulationError::MissingState => QuoteStatus::MissingState,
-            SimulationError::MissingTickArrays => QuoteStatus::HydrationPending,
+            SimulationError::MissingTickArrays => QuoteStatus::MissingState,
             SimulationError::InsufficientLiquidity => QuoteStatus::InsufficientLiquidity,
         }
     }
@@ -4144,7 +3650,7 @@ fn find_input_for_exact_out(
 
 fn hydration_pending_response(req: QuoteRequest) -> QuoteResponse {
     let mut response = build_quote_response(req, 0);
-    response.status = QuoteStatus::HydrationPending;
+    response.status = QuoteStatus::MissingState;
     response
 }
 
@@ -4491,10 +3997,8 @@ mod math {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::adapters::{QuoteRequest, SwapDirection};
-    use crate::hydration::types::{
-        HydrationStatus, PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness,
-    };
+    use crate::protocol::adapters::hydration::{QuoteRequest, SwapDirection};
+    use crate::watch::types::{PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness};
     use dashmap::DashMap;
 
     fn test_adapter_with_config(config: WhirlpoolAdapterConfig) -> WhirlpoolAdapter {
@@ -4508,11 +4012,9 @@ mod tests {
             twap_lookback: Duration::from_secs(30),
             transfer_fee_cache: None,
             transfer_hook_resolver: None,
-            template_builder: None,
-            registered_templates: DashMap::new(),
             snapshot_failure_log: DashMap::new(),
             missing_state_log: DashMap::new(),
-            lag_log: DashMap::new(),
+            registry: Arc::new(StaticPoolRegistry::new()),
         }
     }
 
@@ -4641,7 +4143,6 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
-            hydration: HydrationStatus::new(1),
             extensions: PoolUpdateExtensions::default(),
         };
 
@@ -4715,7 +4216,6 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
-            hydration: HydrationStatus::new(5),
             extensions: PoolUpdateExtensions::default(),
         };
 
@@ -4838,7 +4338,11 @@ mod tests {
 
     #[test]
     fn attaches_supplemental_tick_arrays_in_chunks() {
-        let adapter = WhirlpoolAdapter::new(WhirlpoolAdapterConfig::default(), None);
+        let adapter = WhirlpoolAdapter::new(
+            WhirlpoolAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let base_arrays = vec![
             Pubkey::new_unique(),
             Pubkey::new_unique(),
@@ -5163,11 +4667,9 @@ mod tests {
             twap_lookback: Duration::from_secs(30),
             transfer_fee_cache: None,
             transfer_hook_resolver: None,
-            template_builder: None,
-            registered_templates: DashMap::new(),
+            registry: Arc::new(StaticPoolRegistry::new()),
             snapshot_failure_log: DashMap::new(),
             missing_state_log: DashMap::new(),
-            lag_log: DashMap::new(),
         };
 
         let pool = Pubkey::new_unique();
@@ -5230,7 +4732,6 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
-            hydration: HydrationStatus::new(1),
             extensions: PoolUpdateExtensions::default(),
         };
 
@@ -5266,11 +4767,9 @@ mod tests {
             twap_lookback: Duration::from_secs(30),
             transfer_fee_cache: Some(fee_cache),
             transfer_hook_resolver: None,
-            template_builder: None,
-            registered_templates: DashMap::new(),
             snapshot_failure_log: DashMap::new(),
             missing_state_log: DashMap::new(),
-            lag_log: DashMap::new(),
+            registry: Arc::new(StaticPoolRegistry::new()),
         };
         let state = WhirlpoolState {
             whirlpool: Pubkey::new_unique(),
@@ -5327,11 +4826,9 @@ mod tests {
             twap_lookback: Duration::from_secs(30),
             transfer_fee_cache: None,
             transfer_hook_resolver: None,
-            template_builder: None,
-            registered_templates: DashMap::new(),
             snapshot_failure_log: DashMap::new(),
             missing_state_log: DashMap::new(),
-            lag_log: DashMap::new(),
+            registry: Arc::new(StaticPoolRegistry::new()),
         };
 
         let pool = Pubkey::new_unique();
@@ -5410,22 +4907,7 @@ mod tests {
     fn snapshot_bidirectional_quotes_honor_exact_out_preference() {
         let mut config = WhirlpoolAdapterConfig::default();
         config.prefer_exact_out_quotes = true;
-        let adapter = WhirlpoolAdapter {
-            program_id: Pubkey::from_str(WHIRLPOOL_PROGRAM_ID).unwrap(),
-            state: DashMap::new(),
-            config,
-            hydrator: None,
-            mint_metadata_cache: None,
-            twap_cache: WhirlpoolTwapCache::new(Duration::from_secs(60)),
-            twap_lookback: Duration::from_secs(30),
-            transfer_fee_cache: None,
-            transfer_hook_resolver: None,
-            template_builder: None,
-            registered_templates: DashMap::new(),
-            snapshot_failure_log: DashMap::new(),
-            missing_state_log: DashMap::new(),
-            lag_log: DashMap::new(),
-        };
+        let adapter = WhirlpoolAdapter::new(config, Arc::new(StaticPoolRegistry::new()));
 
         let pool = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
@@ -5487,7 +4969,6 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
-            hydration: HydrationStatus::new(1),
             extensions: PoolUpdateExtensions::default(),
         };
 
@@ -5503,22 +4984,10 @@ mod tests {
 
     #[test]
     fn snapshot_quotes_skip_before_trade_enable_timestamp() {
-        let adapter = WhirlpoolAdapter {
-            program_id: Pubkey::from_str(WHIRLPOOL_PROGRAM_ID).unwrap(),
-            state: DashMap::new(),
-            config: WhirlpoolAdapterConfig::default(),
-            hydrator: None,
-            mint_metadata_cache: None,
-            twap_cache: WhirlpoolTwapCache::new(Duration::from_secs(60)),
-            twap_lookback: Duration::from_secs(30),
-            transfer_fee_cache: None,
-            transfer_hook_resolver: None,
-            template_builder: None,
-            registered_templates: DashMap::new(),
-            snapshot_failure_log: DashMap::new(),
-            missing_state_log: DashMap::new(),
-            lag_log: DashMap::new(),
-        };
+        let adapter = WhirlpoolAdapter::new(
+            WhirlpoolAdapterConfig::default(),
+            Arc::new(StaticPoolRegistry::new()),
+        );
 
         let pool = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
@@ -5575,7 +5044,6 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
-            hydration: HydrationStatus::new(1),
             extensions: PoolUpdateExtensions::default(),
         };
 

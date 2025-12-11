@@ -1,34 +1,35 @@
 use std::{
     str::FromStr,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use uint::construct_uint;
 
-use super::hydration::{AsyncHydrator, HydratedValue};
-use crate::builder::{BuilderHandle, CpAmmPoolAccounts, CpAmmPoolMeta};
-use crate::hydration::mint_metadata::{MintMetadata, MintMetadataHydrator};
-use crate::hydration::token_fees::{
-    apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee, TokenTransferFeeHydrator,
-};
-use crate::hydration::types::{
+use crate::protocol::token_fees::{apply_post_fee_amount, apply_pre_fee_amount, TokenTransferFee};
+use crate::watch::types::{
     CpAmmBaseFeeExtras, CpAmmDynamicFeeExtras, CpAmmPoolExtras, CpAmmPoolFeesExtras,
-    HydrationComponent, PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
-    CP_AMM_INPUT_UTILIZATION_BPS,
+    PoolBidirectionalQuotes, PoolQuoteSide, PoolSnapshot, PoolUpdate,
+    CP_AMM_INPUT_UTILIZATION_BPS, CP_AMM_PROGRAM_ID,
 };
-use crate::telemetry;
+use crate::bootstrap::{MintAccountMeta, StaticPoolRegistry};
 use crate::template::TemplateContext;
 
 use super::{
     build_quote_response, ProtocolAdapter, QuoteRequest, QuoteResponse, QuoteStatus, SwapDirection,
 };
 
+const CP_AMM_DEFAULT_CU_LIMIT: u32 = 400_000;
+const CP_AMM_DEFAULT_CU_PRICE: u64 = 5_000;
+const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
+const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
+const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
+const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
+const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const BPS_DENOMINATOR: u64 = 10_000;
 const FEE_DENOMINATOR: u64 = 1_000_000_000;
 const MAX_FEE_NUMERATOR_V0: u64 = 500_000_000;
@@ -37,23 +38,22 @@ const MAX_FEE_BPS_V0: u64 = 5_000;
 const MAX_FEE_BPS_V1: u64 = 9_900;
 const MIN_FEE_NUMERATOR: u64 = 100_000;
 const CURRENT_POOL_VERSION: u8 = 0;
-const CP_AMM_DEFAULT_CU_LIMIT: u32 = 400_000;
-const CP_AMM_DEFAULT_CU_PRICE: u64 = 5_000;
-
-const CP_AMM_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const SPL_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-const SNAPSHOT_PROBE_DIVISOR: u128 = 5_000;
-const SNAPSHOT_MIN_PROBE_INPUT: u128 = 1_000;
-const SNAPSHOT_MAX_PROBE_INPUT: u128 = u64::MAX as u128;
 const Q64_FACTOR: f64 = 18_446_744_073_709_551_616.0;
 
-const DEFAULT_CP_AMM_HYDRATION_RETRY_MS: u64 = 60_000;
-const SNAPSHOT_FAILURE_LOG_INTERVAL_MS: u64 = 15_000;
-const STATE_MISS_LOG_INTERVAL_MS: u64 = 15_000;
-const META_LAG_LOG_INTERVAL_MS: u64 = 15_000;
-const DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE: u64 = 3_000;
-const DEFAULT_HYDRATION_LAG_MS_TOLERANCE: u64 = 30_000;
+static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
+    Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program should be valid")
+});
+
+#[allow(clippy::assign_op_pattern, clippy::manual_div_ceil)]
+mod u256 {
+    use super::construct_uint;
+
+    construct_uint! {
+        pub struct U256(4);
+    }
+}
+pub use u256::U256;
 
 #[derive(Clone)]
 struct SnapshotStatusLogEntry {
@@ -61,28 +61,10 @@ struct SnapshotStatusLogEntry {
     logged_at: Instant,
 }
 
-static SPL_TOKEN_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static spl token program should be valid")
-});
-static SPL_TOKEN_2022_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
-    Pubkey::from_str(SPL_TOKEN_2022_PROGRAM_ID)
-        .expect("static spl token 2022 program should be valid")
-});
-
-construct_uint! {
-    pub struct U256(4);
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct CpAmmAdapterConfig {
     pub stale_slot_threshold: u64,
     pub stale_after_ms: u64,
-    pub rpc_endpoints: Vec<String>,
-    pub rpc_timeout_ms: u64,
-    pub hydration_retry_ms: u64,
-    pub hydration_meta_ttl_ms: u64,
-    pub hydration_slot_lag_tolerance: u64,
-    pub hydration_lag_ms_tolerance: u64,
     pub max_swap_utilization_bps: u64,
     pub required_partner: Option<Pubkey>,
 }
@@ -92,13 +74,6 @@ impl Default for CpAmmAdapterConfig {
         Self {
             stale_slot_threshold: 400,
             stale_after_ms: 2_000,
-            rpc_endpoints: Vec::new(),
-            // initial hydration hits several large accounts; allow generous timeout
-            rpc_timeout_ms: 15_000,
-            hydration_retry_ms: DEFAULT_CP_AMM_HYDRATION_RETRY_MS,
-            hydration_meta_ttl_ms: 600_000,
-            hydration_slot_lag_tolerance: DEFAULT_HYDRATION_SLOT_LAG_TOLERANCE,
-            hydration_lag_ms_tolerance: DEFAULT_HYDRATION_LAG_MS_TOLERANCE,
             max_swap_utilization_bps: CP_AMM_INPUT_UTILIZATION_BPS,
             required_partner: None,
         }
@@ -109,63 +84,28 @@ pub struct CpAmmAdapter {
     program_id: Pubkey,
     state: DashMap<Pubkey, CpAmmState>,
     config: CpAmmAdapterConfig,
-    hydrator: Option<CpAmmPoolHydrator>,
-    transfer_fee_cache: Option<TokenTransferFeeHydrator>,
-    mint_metadata_cache: Option<MintMetadataHydrator>,
-    template_builder: Option<BuilderHandle>,
-    registered_templates: DashMap<Pubkey, RegisteredTemplateSignature>,
+    registry: Arc<StaticPoolRegistry>,
     snapshot_failure_log: DashMap<(Pubkey, bool), SnapshotStatusLogEntry>,
     missing_state_log: DashMap<Pubkey, Instant>,
-    meta_lag_log: DashMap<Pubkey, Instant>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RegisteredTemplateSignature {
-    alt_accounts: Vec<Pubkey>,
-    pool_accounts: CpAmmPoolAccounts,
-    fee_tier_bps: u16,
-    epoch: u64,
+#[derive(Clone, Debug)]
+struct SnapshotBootstrap {
+    token_a_meta: Option<MintAccountMeta>,
+    token_b_meta: Option<MintAccountMeta>,
 }
 
 impl CpAmmAdapter {
-    pub fn new(config: CpAmmAdapterConfig, template_builder: Option<BuilderHandle>) -> Self {
+    pub fn new(config: CpAmmAdapterConfig, registry: Arc<StaticPoolRegistry>) -> Self {
         let program_id =
             Pubkey::from_str(CP_AMM_PROGRAM_ID).expect("static cp_amm program id should be valid");
-        let hydrator = CpAmmPoolHydrator::new(&config);
-        let transfer_fee_cache = TokenTransferFeeHydrator::new(
-            &config.rpc_endpoints,
-            config.rpc_timeout_ms,
-            config.hydration_retry_ms,
-        );
-        let mint_metadata_cache = MintMetadataHydrator::new(
-            &config.rpc_endpoints,
-            config.rpc_timeout_ms,
-            config.hydration_retry_ms,
-        );
-        if let Some(hydrator) = hydrator.as_ref() {
-            info!(
-                target = "adapter::cp_amm",
-                endpoints = hydrator.client_count(),
-                "cp_amm pool hydrator online"
-            );
-        } else {
-            debug!(
-                target = "adapter::cp_amm",
-                "cp_amm pool hydrator disabled (no rpc endpoints)"
-            );
-        }
         Self {
             program_id,
             state: DashMap::new(),
             config,
-            hydrator,
-            transfer_fee_cache,
-            mint_metadata_cache,
-            template_builder,
-            registered_templates: DashMap::new(),
+            registry,
             snapshot_failure_log: DashMap::new(),
             missing_state_log: DashMap::new(),
-            meta_lag_log: DashMap::new(),
         }
     }
 
@@ -191,7 +131,7 @@ impl CpAmmAdapter {
         });
     }
 
-    fn upsert_state(&self, update: &PoolUpdate, extras: CpAmmPoolExtras) {
+    fn upsert_state(&self, update: &PoolUpdate, mut extras: CpAmmPoolExtras) {
         let Some(pool_pubkey) = parse_pubkey(&update.pool_id) else {
             warn!(
                 target = "adapter::cp_amm",
@@ -201,8 +141,8 @@ impl CpAmmAdapter {
             return;
         };
 
-        let previous_state = self.state.get(&pool_pubkey);
-        let extras = self.enrich_extras(pool_pubkey, extras, previous_state.as_deref());
+        let previous_state = self.state.get(&pool_pubkey).map(|entry| entry.clone());
+        let snapshot_bootstrap = self.bootstrap_from_snapshot(pool_pubkey, &mut extras);
 
         let Some(base_mint) = extras
             .token_a_mint
@@ -224,90 +164,114 @@ impl CpAmmAdapter {
             return;
         };
 
-        let slot_lag_tolerance = self.config.hydration_slot_lag_tolerance;
-        let lag_ms_tolerance = self.config.hydration_lag_ms_tolerance;
+        let previous_ref = previous_state.as_ref();
 
         let hydrated_meta_slot = extras
             .hydrated_slot
-            .or_else(|| previous_state.as_ref().and_then(|existing| existing.hydrated_meta_slot));
-        let mut last_hydrated_at = extras
+            .filter(|slot| *slot >= update.slot)
+            .or_else(|| previous_ref.and_then(|existing| existing.hydrated_meta_slot));
+
+        let last_hydrated_at = extras
             .hydrated_at
-            .or_else(|| previous_state.as_ref().and_then(|existing| existing.last_hydrated_at));
-        if last_hydrated_at.is_none() && hydrated_meta_slot.is_some() {
-            last_hydrated_at = Some(Instant::now());
-        }
-
-        let slot_within_window = hydrated_meta_slot
-            .map(|slot| CpAmmState::slot_within_tolerance(slot, update.slot, slot_lag_tolerance))
-            .unwrap_or(false);
-        let hydration_age_ms = last_hydrated_at.map(|instant| instant.elapsed().as_millis() as u64);
-        let time_within_window = lag_ms_tolerance > 0
-            && hydration_age_ms
-                .map(|age| age <= lag_ms_tolerance)
-                .unwrap_or(false);
-
-        if hydrated_meta_slot.is_none() || (!slot_within_window && !time_within_window) {
-            if let Some(hydrator) = self.hydrator.as_ref() {
-                hydrator.refresh(pool_pubkey);
-            }
-        }
+            .or_else(|| previous_ref.and_then(|existing| existing.last_hydrated_at));
 
         let mut state = CpAmmState {
             pool: pool_pubkey,
+            pool_authority: Self::parse_pubkey_or_fallback(
+                &extras.pool_authority,
+                previous_ref.and_then(|existing| existing.pool_authority),
+            ),
+            token_a_vault: Self::parse_pubkey_or_fallback(
+                &extras.token_a_vault,
+                previous_ref.and_then(|existing| existing.token_a_vault),
+            ),
+            token_b_vault: Self::parse_pubkey_or_fallback(
+                &extras.token_b_vault,
+                previous_ref.and_then(|existing| existing.token_b_vault),
+            ),
+            whitelisted_vault: Self::parse_pubkey_or_fallback(
+                &extras.whitelisted_vault,
+                previous_ref.and_then(|existing| existing.whitelisted_vault),
+            ),
+            partner: Self::parse_pubkey_or_fallback(
+                &extras.partner,
+                previous_ref.and_then(|existing| existing.partner),
+            ),
             token_a_mint: base_mint,
             token_b_mint: quote_mint,
-            token_a_vault: extras
-                .token_a_vault
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            token_b_vault: extras
-                .token_b_vault
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            whitelisted_vault: extras
-                .whitelisted_vault
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            partner: extras
-                .partner
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            pool_authority: extras
-                .pool_authority
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            token_a_program: extras
-                .token_a_program
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            token_b_program: extras
-                .token_b_program
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            token_a_decimals: None,
-            token_b_decimals: None,
-            amp: extras.amp,
-            lp_fee_bps: extras.lp_fee_bps,
-            protocol_fee_bps: extras.protocol_fee_bps,
-            referral_bps: extras.referral_bps,
-            referral_token_account: extras
-                .referral_token_account
-                .as_ref()
-                .and_then(|value| parse_pubkey(value)),
-            collect_fee_mode: extras.collect_fee_mode,
-            activation_point: extras.activation_point,
-            activation_type: extras.activation_type,
-            pool_status: extras.pool_status,
-            pool_type: extras.pool_type,
-            pool_version: extras.pool_version,
-            token_a_flag: extras.token_a_flag,
-            token_b_flag: extras.token_b_flag,
-            permanent_lock_liquidity: extras.permanent_lock_liquidity,
-            pool_fees: extras.pool_fees.clone(),
-            sqrt_price_x64: extras.sqrt_price_x64,
-            liquidity: extras.liquidity,
-            sqrt_min_price_x64: extras.sqrt_min_price_x64,
-            sqrt_max_price_x64: extras.sqrt_max_price_x64,
+            token_a_program: Self::parse_pubkey_or_fallback(
+                &extras.token_a_program,
+                previous_ref.and_then(|existing| existing.token_a_program),
+            ),
+            token_b_program: Self::parse_pubkey_or_fallback(
+                &extras.token_b_program,
+                previous_ref.and_then(|existing| existing.token_b_program),
+            ),
+            token_a_decimals: previous_ref.and_then(|existing| existing.token_a_decimals),
+            token_b_decimals: previous_ref.and_then(|existing| existing.token_b_decimals),
+            token_a_transfer_fee: previous_ref
+                .and_then(|existing| existing.token_a_transfer_fee.clone()),
+            token_b_transfer_fee: previous_ref
+                .and_then(|existing| existing.token_b_transfer_fee.clone()),
+            amp: extras
+                .amp
+                .or_else(|| previous_ref.and_then(|existing| existing.amp)),
+            lp_fee_bps: extras
+                .lp_fee_bps
+                .or_else(|| previous_ref.and_then(|existing| existing.lp_fee_bps)),
+            protocol_fee_bps: extras
+                .protocol_fee_bps
+                .or_else(|| previous_ref.and_then(|existing| existing.protocol_fee_bps)),
+            referral_bps: extras
+                .referral_bps
+                .or_else(|| previous_ref.and_then(|existing| existing.referral_bps)),
+            referral_token_account: Self::parse_pubkey_or_fallback(
+                &extras.referral_token_account,
+                previous_ref.and_then(|existing| existing.referral_token_account),
+            ),
+            collect_fee_mode: extras
+                .collect_fee_mode
+                .or_else(|| previous_ref.and_then(|existing| existing.collect_fee_mode)),
+            activation_point: extras
+                .activation_point
+                .or_else(|| previous_ref.and_then(|existing| existing.activation_point)),
+            activation_type: extras
+                .activation_type
+                .or_else(|| previous_ref.and_then(|existing| existing.activation_type)),
+            pool_status: extras
+                .pool_status
+                .or_else(|| previous_ref.and_then(|existing| existing.pool_status)),
+            pool_type: extras
+                .pool_type
+                .or_else(|| previous_ref.and_then(|existing| existing.pool_type)),
+            pool_version: extras
+                .pool_version
+                .or_else(|| previous_ref.and_then(|existing| existing.pool_version)),
+            token_a_flag: extras
+                .token_a_flag
+                .or_else(|| previous_ref.and_then(|existing| existing.token_a_flag)),
+            token_b_flag: extras
+                .token_b_flag
+                .or_else(|| previous_ref.and_then(|existing| existing.token_b_flag)),
+            permanent_lock_liquidity: extras
+                .permanent_lock_liquidity
+                .or_else(|| previous_ref.and_then(|existing| existing.permanent_lock_liquidity)),
+            pool_fees: extras
+                .pool_fees
+                .clone()
+                .or_else(|| previous_ref.and_then(|existing| existing.pool_fees.clone())),
+            sqrt_price_x64: extras
+                .sqrt_price_x64
+                .or_else(|| previous_ref.and_then(|existing| existing.sqrt_price_x64)),
+            liquidity: extras
+                .liquidity
+                .or_else(|| previous_ref.and_then(|existing| existing.liquidity)),
+            sqrt_min_price_x64: extras
+                .sqrt_min_price_x64
+                .or_else(|| previous_ref.and_then(|existing| existing.sqrt_min_price_x64)),
+            sqrt_max_price_x64: extras
+                .sqrt_max_price_x64
+                .or_else(|| previous_ref.and_then(|existing| existing.sqrt_max_price_x64)),
             vault_a_balance: update.base_post_amount,
             vault_b_balance: update.quote_post_amount,
             corecast_slot: update.slot,
@@ -315,14 +279,13 @@ impl CpAmmAdapter {
             last_update_at: Instant::now(),
             last_hydrated_at,
             hydrated_meta_slot,
-            token_a_transfer_fee: None,
-            token_b_transfer_fee: None,
             last_block_time_unix: normalize_block_time(update.block_time_unix),
         };
 
-        self.attach_mint_metadata(&mut state);
-        self.ensure_token_programs(&mut state);
-        self.attach_transfer_fees(&mut state);
+        if let Some(bootstrap) = snapshot_bootstrap {
+            self.apply_snapshot_bootstrap(&mut state, &bootstrap);
+        }
+        self.finalize_token_details(&mut state, previous_state.as_ref());
 
         trace!(
             target = "adapter::cp_amm",
@@ -333,257 +296,146 @@ impl CpAmmAdapter {
             "upserting cp_amm pool state"
         );
 
-        self.register_templates_with_builder(&state);
-        self.record_hydration_metrics(&state);
-        drop(previous_state);
         self.state.insert(pool_pubkey, state);
         self.evict_stale(update.slot);
     }
 
-    fn enrich_extras(
+    fn bootstrap_from_snapshot(
         &self,
         pool: Pubkey,
-        mut extras: CpAmmPoolExtras,
-        previous_state: Option<&CpAmmState>,
-    ) -> CpAmmPoolExtras {
-        let hydration_missing = extras.hydrated_slot.is_none()
-            && previous_state
-                .map(|existing| existing.hydrated_meta_slot.is_none())
-                .unwrap_or(true);
-        let force_refresh = hydration_missing
-            || hydration_meta_expired(&extras, self.config.hydration_meta_ttl_ms);
-        if !needs_hydration(&extras) && !force_refresh {
-            return extras;
+        extras: &mut CpAmmPoolExtras,
+    ) -> Option<SnapshotBootstrap> {
+        let snapshot = self.registry.cp_amm_snapshot(&pool)?;
+        if snapshot.program_id != self.program_id {
+            return None;
         }
 
-        let Some(hydrator) = self.hydrator.as_ref() else {
-            return extras;
-        };
+        let meta = &snapshot.meta;
+        Self::assign_pubkey_field(&mut extras.token_a_mint, meta.token_a_mint);
+        Self::assign_pubkey_field(&mut extras.token_b_mint, meta.token_b_mint);
+        Self::assign_pubkey_field(&mut extras.token_a_vault, meta.token_a_vault);
+        Self::assign_pubkey_field(&mut extras.token_b_vault, meta.token_b_vault);
+        Self::assign_pubkey_field(&mut extras.whitelisted_vault, meta.whitelisted_vault);
+        Self::assign_pubkey_field(&mut extras.partner, meta.partner);
 
-        if let Some(meta) = hydrator.hydrate(pool) {
-            apply_hydrated_meta(&mut extras, &meta, force_refresh);
+        extras.sqrt_price_x64 = extras.sqrt_price_x64.or(Some(meta.sqrt_price_x64));
+        extras.liquidity = extras.liquidity.or(Some(meta.liquidity));
+        extras.sqrt_min_price_x64 = extras.sqrt_min_price_x64.or(Some(meta.sqrt_min_price_x64));
+        extras.sqrt_max_price_x64 = extras.sqrt_max_price_x64.or(Some(meta.sqrt_max_price_x64));
+        extras.permanent_lock_liquidity = extras
+            .permanent_lock_liquidity
+            .or(Some(meta.permanent_lock_liquidity));
+        extras.collect_fee_mode = extras.collect_fee_mode.or(Some(meta.collect_fee_mode));
+        extras.activation_point = extras.activation_point.or(Some(meta.activation_point));
+        extras.activation_type = extras.activation_type.or(Some(meta.activation_type));
+        extras.pool_status = extras.pool_status.or(Some(meta.pool_status));
+        extras.pool_type = extras.pool_type.or(Some(meta.pool_type));
+        extras.pool_version = extras.pool_version.or(Some(meta.pool_version));
+        extras.token_a_flag = extras.token_a_flag.or(Some(meta.token_a_flag));
+        extras.token_b_flag = extras.token_b_flag.or(Some(meta.token_b_flag));
+        if extras.pool_fees.is_none() {
+            extras.pool_fees = Some(meta.pool_fees.clone());
         }
+        extras.hydrated_slot = extras.hydrated_slot.or(Some(meta.hydrated_slot));
+        extras.hydrated_at = extras.hydrated_at.or(Some(meta.hydrated_at));
 
-        extras
-    }
-
-    fn register_templates_with_builder(&self, state: &CpAmmState) {
-        self.ensure_templates_for_epoch(state, None, "adapter state update", false);
-    }
-
-    fn ensure_templates_for_epoch(
-        &self,
-        state: &CpAmmState,
-        epoch_override: Option<u64>,
-        reason: &'static str,
-        force_refresh: bool,
-    ) {
-        let Some(builder) = self.template_builder.as_ref() else {
-            return;
-        };
-
-        if !self.meta_ready_within_lag(state) {
-            trace!(
-                target = "adapter::cp_amm",
-                pool = %state.pool,
-                slot = state.corecast_slot,
-                reason = reason,
-                "deferring template registration until meta hydration completes"
-            );
-            self.record_meta_lag_event(state, reason);
-            return;
+        if extras.token_a_program.is_none() {
+            if let Some(base_meta) = snapshot.base_mint_meta {
+                extras.token_a_program = Some(base_meta.program.to_string());
+            }
         }
-
-        let mut alt_accounts = Vec::with_capacity(10);
-        alt_accounts.push(state.pool);
-        alt_accounts.push(state.token_a_mint);
-        alt_accounts.push(state.token_b_mint);
-        if let Some(pk) = state.pool_authority {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.token_a_vault {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.token_b_vault {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.token_a_program {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.token_b_program {
-            alt_accounts.push(pk);
-        }
-        if let Some(pk) = state.referral_token_account {
-            alt_accounts.push(pk);
-        }
-
-        let token_a_program = state.token_a_program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY);
-        let token_b_program = state.token_b_program.unwrap_or(*SPL_TOKEN_PROGRAM_PUBKEY);
-        let fee_tier_bps = state.total_fee_bps().min(u64::from(u16::MAX)) as u16;
-        let pool_accounts = CpAmmPoolAccounts {
-            token_a_mint: state.token_a_mint,
-            token_b_mint: state.token_b_mint,
-            token_a_vault: state.token_a_vault,
-            token_b_vault: state.token_b_vault,
-            token_a_program: Some(token_a_program),
-            token_b_program: Some(token_b_program),
-            referral_token_account: state.referral_token_account,
-        };
-        if !pool_accounts.is_populated() {
-            debug!(
-                target = "adapter::cp_amm",
-                pool = %state.pool,
-                reason = reason,
-                "cp_amm pool metadata incomplete; deferring template registration"
-            );
-            return;
-        }
-
-        let epoch = epoch_override.unwrap_or_else(|| builder.template_cache().epoch());
-        let signature = RegisteredTemplateSignature {
-            alt_accounts: alt_accounts.clone(),
-            pool_accounts: pool_accounts.clone(),
-            fee_tier_bps,
-            epoch,
-        };
-
-        if !force_refresh {
-            if let Some(existing) = self.registered_templates.get(&state.pool) {
-                if *existing == signature {
-                    return;
-                }
+        if extras.token_b_program.is_none() {
+            if let Some(quote_meta) = snapshot.quote_mint_meta {
+                extras.token_b_program = Some(quote_meta.program.to_string());
             }
         }
 
-        debug!(
-            target = "adapter::cp_amm",
-            pool = %state.pool,
-            epoch,
-            reason = reason,
-            "registering cp_amm instruction templates"
-        );
-
-        builder.register_cp_amm_pool(CpAmmPoolMeta {
-            pool_id: state.pool,
-            fee_tier_bps,
-            alt_accounts: alt_accounts.clone(),
-            alt_handle: None,
-            accounts: pool_accounts.clone(),
-        });
-
-        self.registered_templates.insert(state.pool, signature);
+        Some(SnapshotBootstrap {
+            token_a_meta: snapshot.base_mint_meta,
+            token_b_meta: snapshot.quote_mint_meta,
+        })
     }
 
-    fn record_hydration_metrics(&self, state: &CpAmmState) {
-        let adapter = self.name();
-        let meta_slot = state.hydrated_meta_slot.unwrap_or(0);
-        let delta = state.corecast_slot.saturating_sub(meta_slot);
-        let (lag_slots, lag_ms) = self.meta_lag(state);
-        telemetry::record_hydration_component_slot_delta(
-            adapter,
-            HydrationComponent::Meta.as_str(),
-            delta,
-        );
-
-        let meta_ready = self.meta_ready_within_lag(state);
-        if !meta_ready {
-            self.log_meta_lag_if_needed(state, "metrics_meta_pending", lag_slots, lag_ms);
-            telemetry::record_hydration_component_pending(
-                adapter,
-                HydrationComponent::Meta.as_str(),
-                lag_ms,
-                lag_slots,
-            );
-        }
-        let ready = meta_ready && !state.hydration_stale(self.config.hydration_meta_ttl_ms);
-        let stage = if ready { 1 } else { 0 };
-        telemetry::record_hydration_stage(adapter, &state.pool.to_string(), stage);
-    }
-
-    fn attach_transfer_fees(&self, state: &mut CpAmmState) {
-        state.token_a_transfer_fee =
-            self.resolve_transfer_fee(state.token_a_mint, state.token_a_program);
-        state.token_b_transfer_fee =
-            self.resolve_transfer_fee(state.token_b_mint, state.token_b_program);
-    }
-
-    fn attach_mint_metadata(&self, state: &mut CpAmmState) {
-        if let Some(meta) = self.mint_metadata(state.token_a_mint) {
-            let MintMetadata {
-                decimals,
-                program_id,
-                ..
-            } = meta;
+    fn apply_snapshot_bootstrap(&self, state: &mut CpAmmState, bootstrap: &SnapshotBootstrap) {
+        if let Some(meta) = bootstrap.token_a_meta {
             if state.token_a_decimals.is_none() {
-                if let Some(value) = decimals {
-                    state.token_a_decimals = Some(value);
+                state.token_a_decimals = meta.decimals;
+            }
+            if state
+                .token_a_program
+                .map(|program| program != meta.program)
+                .unwrap_or(true)
+            {
+                state.token_a_program = Some(meta.program);
+            }
+            if state.token_a_transfer_fee.is_none() {
+                if let Some(summary) = meta.transfer_fee_config {
+                    state.token_a_transfer_fee = Some(TokenTransferFee::from(summary));
                 }
+            }
+        }
+        if let Some(meta) = bootstrap.token_b_meta {
+            if state.token_b_decimals.is_none() {
+                state.token_b_decimals = meta.decimals;
+            }
+            if state
+                .token_b_program
+                .map(|program| program != meta.program)
+                .unwrap_or(true)
+            {
+                state.token_b_program = Some(meta.program);
+            }
+            if state.token_b_transfer_fee.is_none() {
+                if let Some(summary) = meta.transfer_fee_config {
+                    state.token_b_transfer_fee = Some(TokenTransferFee::from(summary));
+                }
+            }
+        }
+    }
+
+    fn parse_pubkey_or_fallback(
+        value: &Option<String>,
+        fallback: Option<Pubkey>,
+    ) -> Option<Pubkey> {
+        value
+            .as_ref()
+            .and_then(|field| parse_pubkey(field))
+            .or(fallback)
+    }
+
+    fn finalize_token_details(&self, state: &mut CpAmmState, previous_state: Option<&CpAmmState>) {
+        if let Some(prev) = previous_state {
+            if state.token_a_decimals.is_none() {
+                state.token_a_decimals = prev.token_a_decimals;
+            }
+            if state.token_b_decimals.is_none() {
+                state.token_b_decimals = prev.token_b_decimals;
             }
             if state.token_a_program.is_none() {
-                state.token_a_program = Some(program_id);
-            }
-        }
-        if let Some(meta) = self.mint_metadata(state.token_b_mint) {
-            let MintMetadata {
-                decimals,
-                program_id,
-                ..
-            } = meta;
-            if state.token_b_decimals.is_none() {
-                if let Some(value) = decimals {
-                    state.token_b_decimals = Some(value);
-                }
+                state.token_a_program = prev.token_a_program;
             }
             if state.token_b_program.is_none() {
-                state.token_b_program = Some(program_id);
+                state.token_b_program = prev.token_b_program;
+            }
+            if state.token_a_transfer_fee.is_none() {
+                state.token_a_transfer_fee = prev.token_a_transfer_fee;
+            }
+            if state.token_b_transfer_fee.is_none() {
+                state.token_b_transfer_fee = prev.token_b_transfer_fee;
             }
         }
-    }
-
-    fn ensure_token_programs(&self, state: &mut CpAmmState) {
         if state.token_a_program.is_none() {
-            state.token_a_program = self.resolve_token_program(state.token_a_mint);
+            state.token_a_program = Some(*SPL_TOKEN_PROGRAM_PUBKEY);
         }
         if state.token_b_program.is_none() {
-            state.token_b_program = self.resolve_token_program(state.token_b_mint);
+            state.token_b_program = Some(*SPL_TOKEN_PROGRAM_PUBKEY);
         }
     }
 
-    fn mint_metadata(&self, mint: Pubkey) -> Option<MintMetadata> {
-        let cache = self.mint_metadata_cache.as_ref()?;
-        cache.hydrate(mint)
-    }
-
-    fn resolve_transfer_fee(
-        &self,
-        mint: Pubkey,
-        program: Option<Pubkey>,
-    ) -> Option<TokenTransferFee> {
-        let Some(cache) = self.transfer_fee_cache.as_ref() else {
-            return None;
-        };
-        let program_id = match program {
-            Some(program_id) => program_id,
-            None => cache.mint_program(mint)?,
-        };
-        if program_id != *SPL_TOKEN_2022_PROGRAM_PUBKEY {
-            return None;
+    fn assign_pubkey_field(target: &mut Option<String>, value: Pubkey) {
+        if target.is_none() && value != Pubkey::default() {
+            *target = Some(value.to_string());
         }
-        cache.hydrate(mint)
-    }
-
-    fn resolve_token_program(&self, mint: Pubkey) -> Option<Pubkey> {
-        if let Some(cache) = self.mint_metadata_cache.as_ref() {
-            if let Some(meta) = cache.hydrate(mint) {
-                return Some(meta.program_id);
-            }
-        }
-        if let Some(cache) = self.transfer_fee_cache.as_ref() {
-            if let Some(program) = cache.mint_program(mint) {
-                return Some(program);
-            }
-        }
-        None
     }
 
     fn decorate_template_context(
@@ -598,38 +450,6 @@ impl CpAmmAdapter {
         }
         if context.output_token_program.is_none() {
             context.output_token_program = Some(token_program_for_mint(state, &output_mint));
-        }
-
-        let Some(builder) = self.template_builder.as_ref() else {
-            return;
-        };
-        if context.payer.is_none() {
-            context.payer = Some(builder.payer_pubkey());
-        }
-        if context.input_token_account.is_none() {
-            if let Some(ata) = builder.token_account_for_mint(&input_mint) {
-                context.input_token_account = Some(ata);
-            } else {
-                warn!(
-                    target = "adapter::cp_amm",
-                    pool = %state.pool,
-                    mint = %input_mint,
-                    "missing configured input token ATA"
-                );
-            }
-        }
-
-        if context.output_token_account.is_none() {
-            if let Some(ata) = builder.token_account_for_mint(&output_mint) {
-                context.output_token_account = Some(ata);
-            } else {
-                warn!(
-                    target = "adapter::cp_amm",
-                    pool = %state.pool,
-                    mint = %output_mint,
-                    "missing configured output token ATA"
-                );
-            }
         }
     }
 
@@ -651,7 +471,8 @@ impl CpAmmAdapter {
         if reserve == 0 {
             return Err(QuoteStatus::InsufficientLiquidity);
         }
-        let capped = clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps);
+        let capped =
+            clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps);
         if capped == 0 {
             return Err(QuoteStatus::PriceImpactExceeded);
         }
@@ -676,7 +497,8 @@ impl CpAmmAdapter {
         if reserve == 0 {
             return Err(QuoteStatus::InsufficientLiquidity);
         }
-        let capped = clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps);
+        let capped =
+            clamp_amount_to_reserve(req.amount, reserve, self.config.max_swap_utilization_bps);
         if capped == 0 {
             return Err(QuoteStatus::PriceImpactExceeded);
         }
@@ -707,8 +529,7 @@ impl CpAmmAdapter {
             target = "adapter::cp_amm",
             pool = %pool,
             slot,
-            hydrator_online = self.hydrator.is_some(),
-            "cp_amm strict price snapshot requested before hydration"
+            "cp_amm strict price snapshot requested before state ready"
         );
     }
 
@@ -753,15 +574,7 @@ impl CpAmmAdapter {
             },
         );
 
-        let hydration_age_ms = state
-            .last_hydrated_at
-            .map(|instant| instant.elapsed().as_millis() as u64);
         let cache_age_ms = state.last_update_at.elapsed().as_millis() as u64;
-        let hydrator_clients = self
-            .hydrator
-            .as_ref()
-            .map(|hydrator| hydrator.client_count())
-            .unwrap_or(0);
 
         warn!(
             target = "adapter::cp_amm",
@@ -777,14 +590,12 @@ impl CpAmmAdapter {
             probe_amount,
             last_update_slot = state.last_update_slot,
             cache_age_ms,
-            hydration_age_ms,
             vault_a = %state.vault_a_balance,
             vault_b = %state.vault_b_balance,
             has_price = state.sqrt_price_x64.is_some(),
             has_liquidity = state.liquidity.is_some(),
             partner = ?state.partner,
             referral = ?state.referral_token_account,
-            hydrator_clients,
             "cp_amm strict price quote unavailable"
         );
     }
@@ -796,77 +607,6 @@ impl CpAmmAdapter {
         let time_stale = self.config.stale_after_ms > 0
             && state.last_update_at.elapsed().as_millis() as u64 > self.config.stale_after_ms;
         slot_stale || time_stale
-    }
-
-    fn meta_ready_within_lag(&self, state: &CpAmmState) -> bool {
-        state.meta_ready_for_slot(
-            state.corecast_slot,
-            self.config.hydration_slot_lag_tolerance,
-            self.config.hydration_lag_ms_tolerance,
-        )
-    }
-
-    fn meta_lag(&self, state: &CpAmmState) -> (Option<u64>, Option<u64>) {
-        (
-            state.hydration_lag_slots(state.corecast_slot),
-            state.hydration_lag_ms(),
-        )
-    }
-
-    fn should_log_meta_lag(
-        &self,
-        pool: Pubkey,
-        lag_slots: Option<u64>,
-        lag_ms: Option<u64>,
-    ) -> bool {
-        let slot_over = lag_slots
-            .map(|slots| slots > self.config.hydration_slot_lag_tolerance)
-            .unwrap_or(false);
-        let time_over = lag_ms
-            .map(|ms| ms > self.config.hydration_lag_ms_tolerance)
-            .unwrap_or(false);
-        if !(slot_over || time_over) {
-            return false;
-        }
-        if let Some(entry) = self.meta_lag_log.get(&pool) {
-            if entry.value().elapsed().as_millis() as u64 <= META_LAG_LOG_INTERVAL_MS {
-                return false;
-            }
-        }
-        self.meta_lag_log.insert(pool, Instant::now());
-        true
-    }
-
-    fn log_meta_lag_if_needed(
-        &self,
-        state: &CpAmmState,
-        context: &'static str,
-        lag_slots: Option<u64>,
-        lag_ms: Option<u64>,
-    ) {
-        if self.should_log_meta_lag(state.pool, lag_slots, lag_ms) {
-            warn!(
-                target = "adapter::cp_amm",
-                pool = %state.pool,
-                context,
-                corecast_slot = state.corecast_slot,
-                hydrated_slot = ?state.hydrated_meta_slot,
-                lag_slots,
-                lag_ms,
-                "cp_amm hydration lag exceeds tolerance"
-            );
-        }
-    }
-
-    fn record_meta_lag_event(&self, state: &CpAmmState, context: &'static str) {
-        let (lag_slots, lag_ms) = self.meta_lag(state);
-        telemetry::record_hydration_component_pending(
-            self.name(),
-            HydrationComponent::Meta.as_str(),
-            lag_ms,
-            lag_slots,
-        );
-        self.log_meta_lag_if_needed(state, context, lag_slots, lag_ms);
     }
 
     fn build_snapshot_side(
@@ -889,26 +629,13 @@ impl CpAmmAdapter {
             );
             return None;
         }
-        if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
+        if !state.meta_ready() {
             self.record_snapshot_issue(
                 state,
                 slot,
                 base_to_quote,
-                QuoteStatus::StaleState,
-                "hydration_stale",
-                Some(probe_amount),
-            );
-            return None;
-        }
-        if !self.meta_ready_within_lag(state) {
-            self.request_meta_refresh(state.pool);
-            self.record_meta_lag_event(state, "snapshot_meta_pending");
-            self.record_snapshot_issue(
-                state,
-                slot,
-                base_to_quote,
-                QuoteStatus::HydrationPending,
-                "meta_pending",
+                QuoteStatus::MissingState,
+                "meta_missing",
                 Some(probe_amount),
             );
             return None;
@@ -930,7 +657,7 @@ impl CpAmmAdapter {
                 state,
                 slot,
                 base_to_quote,
-                QuoteStatus::HydrationPending,
+                QuoteStatus::MissingState,
                 "partner_mismatch",
                 Some(probe_amount),
             );
@@ -1025,40 +752,6 @@ impl CpAmmAdapter {
             cache_slot: Some(slot),
         })
     }
-
-    fn request_meta_refresh(&self, pool: Pubkey) {
-        if let Some(hydrator) = self.hydrator.as_ref() {
-            hydrator.refresh(pool);
-        }
-    }
-
-    fn eager_hydration(&self, pool: Pubkey, base_hint: Option<Pubkey>, quote_hint: Option<Pubkey>) {
-        if let Some(hydrator) = self.hydrator.as_ref() {
-            hydrator.warm(pool);
-        }
-
-        if let Some(state) = self.get_state(&pool) {
-            self.warm_mint_artifacts(state.token_a_mint);
-            self.warm_mint_artifacts(state.token_b_mint);
-            return;
-        }
-
-        if let Some(mint) = base_hint {
-            self.warm_mint_artifacts(mint);
-        }
-        if let Some(mint) = quote_hint {
-            self.warm_mint_artifacts(mint);
-        }
-    }
-
-    fn warm_mint_artifacts(&self, mint: Pubkey) {
-        if let Some(cache) = self.mint_metadata_cache.as_ref() {
-            cache.hydrate(mint);
-        }
-        if let Some(cache) = self.transfer_fee_cache.as_ref() {
-            cache.hydrate(mint);
-        }
-    }
 }
 
 impl ProtocolAdapter for CpAmmAdapter {
@@ -1083,34 +776,18 @@ impl ProtocolAdapter for CpAmmAdapter {
             return;
         }
 
-        let pool_pubkey = parse_pubkey(&update.pool_id);
-        let base_mint = parse_pubkey(&update.base_mint);
-        let quote_mint = parse_pubkey(&update.quote_mint);
+        let _pool_pubkey = parse_pubkey(&update.pool_id);
         let extras = update.extensions.cp_amm.clone().unwrap_or_default();
         self.upsert_state(update, extras);
-        if let Some(pool) = pool_pubkey {
-            self.eager_hydration(pool, base_mint, quote_mint);
-        }
     }
 
     fn enrich_snapshot(&self, snapshot: &mut PoolSnapshot) {
-        snapshot.hydration.require(HydrationComponent::Meta);
         let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
             return;
         };
         let Some(state) = self.get_state(&pool_pubkey) else {
             return;
         };
-        if !state.hydration_stale(self.config.hydration_meta_ttl_ms)
-            && self.meta_ready_within_lag(&state)
-        {
-            snapshot
-                .hydration
-                .mark_ready(HydrationComponent::Meta, state.last_update_slot);
-        } else {
-            self.record_meta_lag_event(&state, "snapshot_enrich_meta_pending");
-            self.request_meta_refresh(pool_pubkey);
-        }
         let extras = snapshot
             .extensions
             .cp_amm
@@ -1142,42 +819,6 @@ impl ProtocolAdapter for CpAmmAdapter {
             .get_or_insert_with(|| state.token_b_mint.to_string());
     }
 
-    fn warm_components(&self, snapshot: &PoolSnapshot, components: &[HydrationComponent]) {
-        if !components.contains(&HydrationComponent::Meta) {
-            return;
-        }
-        let Some(pool_pubkey) = parse_pubkey(&snapshot.pool_id) else {
-            return;
-        };
-        if let Some(hydrator) = self.hydrator.as_ref() {
-            hydrator.warm(pool_pubkey);
-        }
-    }
-
-    fn refresh_templates(&self, epoch: u64) {
-        if self.template_builder.is_none() {
-            return;
-        }
-        let states: Vec<CpAmmState> = self.state.iter().map(|entry| entry.clone()).collect();
-        for state in states {
-            self.ensure_templates_for_epoch(&state, Some(epoch), "cache epoch refresh", false);
-        }
-    }
-
-    fn refresh_pool_templates(&self, pool: Pubkey, epoch: u64) {
-        if self.template_builder.is_none() {
-            return;
-        }
-        if let Some(state) = self.get_state(&pool) {
-            self.ensure_templates_for_epoch(
-                &state,
-                Some(epoch),
-                "template readiness refresh",
-                true,
-            );
-        }
-    }
-
     fn quote_exact_in(&self, req: QuoteRequest) -> Option<QuoteResponse> {
         if req.direction != SwapDirection::ExactIn {
             return None;
@@ -1186,13 +827,8 @@ impl ProtocolAdapter for CpAmmAdapter {
         if self.cache_stale(&state, req.slot) {
             return Some(quote_status_response(req, QuoteStatus::StaleState));
         }
-        if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
-            return Some(quote_status_response(req, QuoteStatus::StaleState));
-        }
-        if !self.meta_ready_within_lag(&state) {
-            self.request_meta_refresh(state.pool);
-            self.record_meta_lag_event(&state, "quote_exact_in_meta_pending");
-            return Some(quote_status_response(req, QuoteStatus::HydrationPending));
+        if !state.meta_ready() {
+            return Some(quote_status_response(req, QuoteStatus::MissingState));
         }
         if !state.swap_enabled(req.slot, req.block_time_u64()) {
             return Some(quote_status_response(req, QuoteStatus::TradingDisabled));
@@ -1206,11 +842,11 @@ impl ProtocolAdapter for CpAmmAdapter {
             return None;
         }
         request.amount = capped;
-            if referral_missing(&state) || self.partner_mismatch(&state) {
-                let mut missing = build_quote_response(request, 0);
-                missing.status = QuoteStatus::HydrationPending;
-                return Some(missing);
-            }
+        if referral_missing(&state) || self.partner_mismatch(&state) {
+            let mut missing = build_quote_response(request, 0);
+            missing.status = QuoteStatus::MissingState;
+            return Some(missing);
+        }
         let simulation = simulate_cp_amm_exact_in(&state, &request, false)?;
         let mut response = build_quote_response(request, simulation.output_amount);
         response.amount_in = simulation.executed_input_amount;
@@ -1240,13 +876,8 @@ impl ProtocolAdapter for CpAmmAdapter {
         if self.cache_stale(&state, req.slot) {
             return Some(quote_status_response(req, QuoteStatus::StaleState));
         }
-        if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
-            return Some(quote_status_response(req, QuoteStatus::StaleState));
-        }
-        if !self.meta_ready_within_lag(&state) {
-            self.request_meta_refresh(state.pool);
-            self.record_meta_lag_event(&state, "quote_exact_out_meta_pending");
-            return Some(quote_status_response(req, QuoteStatus::HydrationPending));
+        if !state.meta_ready() {
+            return Some(quote_status_response(req, QuoteStatus::MissingState));
         }
         if !state.swap_enabled(req.slot, req.block_time_u64()) {
             return Some(quote_status_response(req, QuoteStatus::TradingDisabled));
@@ -1260,11 +891,11 @@ impl ProtocolAdapter for CpAmmAdapter {
             return None;
         }
         request.amount = capped;
-            if referral_missing(&state) || self.partner_mismatch(&state) {
-                let mut missing = build_quote_response(request, 0);
-                missing.status = QuoteStatus::HydrationPending;
-                return Some(missing);
-            }
+        if referral_missing(&state) || self.partner_mismatch(&state) {
+            let mut missing = build_quote_response(request, 0);
+            missing.status = QuoteStatus::MissingState;
+            return Some(missing);
+        }
         let simulation = simulate_cp_amm_exact_out(&state, &request)?;
         let mut response = QuoteResponse {
             amount_in: simulation.executed_input_amount,
@@ -1300,25 +931,6 @@ impl ProtocolAdapter for CpAmmAdapter {
                 return None;
             }
         };
-        if state.hydration_stale(self.config.hydration_meta_ttl_ms) {
-            self.record_snapshot_issue(
-                &state,
-                snapshot.slot,
-                true,
-                QuoteStatus::StaleState,
-                "hydration_stale",
-                None,
-            );
-            self.record_snapshot_issue(
-                &state,
-                snapshot.slot,
-                false,
-                QuoteStatus::StaleState,
-                "hydration_stale",
-                None,
-            );
-            return None;
-        }
         if self.cache_stale(&state, snapshot.slot) {
             self.record_snapshot_issue(
                 &state,
@@ -1358,23 +970,21 @@ impl ProtocolAdapter for CpAmmAdapter {
             );
             return None;
         }
-        if !self.meta_ready_within_lag(&state) {
-            self.request_meta_refresh(state.pool);
-            self.record_meta_lag_event(&state, "bidirectional_meta_pending");
+        if !state.meta_ready() {
             self.record_snapshot_issue(
                 &state,
                 snapshot.slot,
                 true,
-                QuoteStatus::HydrationPending,
-                "meta_pending",
+                QuoteStatus::MissingState,
+                "meta_missing",
                 None,
             );
             self.record_snapshot_issue(
                 &state,
                 snapshot.slot,
                 false,
-                QuoteStatus::HydrationPending,
-                "meta_pending",
+                QuoteStatus::MissingState,
+                "meta_missing",
                 None,
             );
             return None;
@@ -2119,415 +1729,6 @@ fn normalize_block_time(timestamp: Option<i64>) -> Option<u64> {
     timestamp.and_then(|value| if value >= 0 { Some(value as u64) } else { None })
 }
 
-fn needs_hydration(extras: &CpAmmPoolExtras) -> bool {
-    extras.token_a_mint.is_none()
-        || extras.token_b_mint.is_none()
-        || extras.token_a_vault.is_none()
-        || extras.token_b_vault.is_none()
-        || extras.sqrt_price_x64.is_none()
-        || extras.liquidity.is_none()
-        || extras.sqrt_min_price_x64.is_none()
-        || extras.sqrt_max_price_x64.is_none()
-        || extras.collect_fee_mode.is_none()
-        || extras.activation_point.is_none()
-        || extras.activation_type.is_none()
-        || extras.pool_status.is_none()
-        || extras.pool_fees.is_none()
-}
-
-fn hydration_meta_expired(extras: &CpAmmPoolExtras, ttl_ms: u64) -> bool {
-    if ttl_ms == 0 {
-        return false;
-    }
-    match extras.hydrated_at {
-        Some(instant) => instant.elapsed().as_millis() as u64 >= ttl_ms,
-        None => true,
-    }
-}
-
-fn apply_hydrated_meta(extras: &mut CpAmmPoolExtras, meta: &HydratedPoolMeta, force_refresh: bool) {
-    if force_refresh || extras.token_a_mint.is_none() {
-        extras.token_a_mint = Some(meta.token_a_mint.to_string());
-    }
-    if force_refresh || extras.token_b_mint.is_none() {
-        extras.token_b_mint = Some(meta.token_b_mint.to_string());
-    }
-    if force_refresh || extras.token_a_vault.is_none() {
-        extras.token_a_vault = Some(meta.token_a_vault.to_string());
-    }
-    if force_refresh || extras.token_b_vault.is_none() {
-        extras.token_b_vault = Some(meta.token_b_vault.to_string());
-    }
-    if force_refresh || extras.whitelisted_vault.is_none() {
-        extras.whitelisted_vault = optional_pubkey_string(meta.whitelisted_vault);
-    }
-    if force_refresh || extras.partner.is_none() {
-        extras.partner = optional_pubkey_string(meta.partner);
-    }
-    if force_refresh || extras.sqrt_price_x64.is_none() {
-        extras.sqrt_price_x64 = Some(meta.sqrt_price_x64);
-    }
-    if force_refresh || extras.liquidity.is_none() {
-        extras.liquidity = Some(meta.liquidity);
-    }
-    if force_refresh || extras.sqrt_min_price_x64.is_none() {
-        extras.sqrt_min_price_x64 = Some(meta.sqrt_min_price_x64);
-    }
-    if force_refresh || extras.sqrt_max_price_x64.is_none() {
-        extras.sqrt_max_price_x64 = Some(meta.sqrt_max_price_x64);
-    }
-    if force_refresh || extras.permanent_lock_liquidity.is_none() {
-        extras.permanent_lock_liquidity = Some(meta.permanent_lock_liquidity);
-    }
-    if force_refresh || extras.collect_fee_mode.is_none() {
-        extras.collect_fee_mode = Some(meta.collect_fee_mode);
-    }
-    if force_refresh || extras.activation_point.is_none() {
-        extras.activation_point = Some(meta.activation_point);
-    }
-    if force_refresh || extras.activation_type.is_none() {
-        extras.activation_type = Some(meta.activation_type);
-    }
-    if force_refresh || extras.pool_status.is_none() {
-        extras.pool_status = Some(meta.pool_status);
-    }
-    if force_refresh || extras.pool_type.is_none() {
-        extras.pool_type = Some(meta.pool_type);
-    }
-    if force_refresh || extras.pool_version.is_none() {
-        extras.pool_version = Some(meta.pool_version);
-    }
-    if force_refresh || extras.token_a_flag.is_none() {
-        extras.token_a_flag = Some(meta.token_a_flag);
-    }
-    if force_refresh || extras.token_b_flag.is_none() {
-        extras.token_b_flag = Some(meta.token_b_flag);
-    }
-    if force_refresh || extras.pool_fees.is_none() {
-        extras.pool_fees = Some(meta.pool_fees.clone());
-    }
-    extras.hydrated_at = Some(meta.hydrated_at);
-    extras.hydrated_slot = Some(meta.hydrated_slot);
-}
-
-#[derive(Clone, Debug)]
-struct HydratedPoolMeta {
-    token_a_mint: Pubkey,
-    token_b_mint: Pubkey,
-    token_a_vault: Pubkey,
-    token_b_vault: Pubkey,
-    whitelisted_vault: Pubkey,
-    partner: Pubkey,
-    sqrt_price_x64: u128,
-    liquidity: u128,
-    sqrt_min_price_x64: u128,
-    sqrt_max_price_x64: u128,
-    permanent_lock_liquidity: u128,
-    collect_fee_mode: u8,
-    activation_point: u64,
-    activation_type: u8,
-    pool_status: u8,
-    pool_type: u8,
-    pool_version: u8,
-    token_a_flag: u8,
-    token_b_flag: u8,
-    pool_fees: CpAmmPoolFeesExtras,
-    hydrated_at: Instant,
-    hydrated_slot: u64,
-}
-
-struct CpAmmPoolHydrator {
-    hydrator: AsyncHydrator<Pubkey, HydratedPoolMeta>,
-    endpoint_count: usize,
-    retry_backoff: Duration,
-    last_attempts: DashMap<Pubkey, Instant>,
-}
-
-impl CpAmmPoolHydrator {
-    fn new(config: &CpAmmAdapterConfig) -> Option<Self> {
-        if config.rpc_endpoints.is_empty() {
-            return None;
-        }
-
-        let timeout = Duration::from_millis(config.rpc_timeout_ms.max(100));
-        let client_list: Vec<Arc<RpcClient>> = config
-            .rpc_endpoints
-            .iter()
-            .map(|url| Arc::new(RpcClient::new_with_timeout(url.clone(), timeout)))
-            .collect();
-
-        if client_list.is_empty() {
-            return None;
-        }
-
-        let endpoint_count = client_list.len();
-        let clients = Arc::new(client_list);
-        let fetch_clients = clients.clone();
-        let hydrator = AsyncHydrator::new("cp_amm_pool", endpoint_count, move |pool| {
-            fetch_cp_amm_meta(fetch_clients.as_ref(), pool).map(|meta| {
-                let slot = Some(meta.hydrated_slot);
-                let fetched_at = meta.hydrated_at;
-                HydratedValue::with_timestamp(meta, slot, fetched_at)
-            })
-        });
-
-        Some(Self {
-            hydrator,
-            endpoint_count,
-            retry_backoff: Duration::from_millis(config.hydration_retry_ms.max(1)),
-            last_attempts: DashMap::new(),
-        })
-    }
-
-    fn client_count(&self) -> usize {
-        self.endpoint_count
-    }
-
-    fn hydrate(&self, pool: Pubkey) -> Option<HydratedPoolMeta> {
-        if let Some(meta) = self.hydrator.cached(&pool) {
-            if meta.hydrated_at.elapsed() >= self.retry_backoff {
-                if self.should_schedule(pool) {
-                    self.hydrator.schedule(pool);
-                }
-            }
-            return Some(meta);
-        }
-        if self.should_schedule(pool) {
-            self.hydrator.schedule(pool);
-        }
-        None
-    }
-
-    fn warm(&self, pool: Pubkey) {
-        if self.should_schedule(pool) {
-            self.hydrator.schedule(pool);
-        }
-    }
-
-    fn refresh(&self, pool: Pubkey) {
-        self.hydrator.refresh(pool);
-    }
-
-    fn should_schedule(&self, pool: Pubkey) -> bool {
-        let now = Instant::now();
-        if let Some(last) = self.last_attempts.get(&pool) {
-            if now.duration_since(*last.value()) < self.retry_backoff {
-                return false;
-            }
-        }
-        self.last_attempts.insert(pool, now);
-        true
-    }
-}
-
-fn fetch_cp_amm_meta(clients: &[Arc<RpcClient>], pool: Pubkey) -> Option<HydratedPoolMeta> {
-    for client in clients {
-        match client.get_account(&pool) {
-            Ok(account) => {
-                if let Some(mut meta) = parse_pool_account(&account.data) {
-                    meta.hydrated_slot = client.get_slot().unwrap_or_default();
-                    meta.hydrated_at = Instant::now();
-                    return Some(meta);
-                } else {
-                    warn!(
-                        target = "adapter::cp_amm",
-                        pool = %pool,
-                        "unexpected cp_amm pool account layout"
-                    );
-                }
-            }
-            Err(error) => {
-                warn!(
-                    target = "adapter::cp_amm",
-                    pool = %pool,
-                    %error,
-                    "failed to fetch cp_amm pool account"
-                );
-            }
-        }
-    }
-
-    None
-}
-
-const POOL_FEES_STRUCT_LEN: usize = 160;
-const PUBKEY_BYTES: usize = 32;
-const U64_BYTES: usize = 8;
-const U128_BYTES: usize = 16;
-const CP_AMM_POOL_ACCOUNT_HEADER_LEN: usize = 8 + POOL_FEES_STRUCT_LEN;
-const CP_AMM_POOL_ACCOUNT_MIN_LEN: usize = CP_AMM_POOL_ACCOUNT_HEADER_LEN
-    + (PUBKEY_BYTES * 6)
-    + (U128_BYTES * 6)
-    + (U64_BYTES * 5)
-    + 8
-    + (32 * 2);
-
-fn parse_pool_account(data: &[u8]) -> Option<HydratedPoolMeta> {
-    if data.len() < CP_AMM_POOL_ACCOUNT_MIN_LEN {
-        return None;
-    }
-
-    let mut cursor = 8; // anchor account discriminator
-    let pool_fees = read_pool_fees_struct(data, &mut cursor)?;
-    let token_a_mint = read_pubkey_from_slice(data, &mut cursor)?;
-    let token_b_mint = read_pubkey_from_slice(data, &mut cursor)?;
-    let token_a_vault = read_pubkey_from_slice(data, &mut cursor)?;
-    let token_b_vault = read_pubkey_from_slice(data, &mut cursor)?;
-    let whitelisted_vault = read_pubkey_from_slice(data, &mut cursor)?;
-    let partner = read_pubkey_from_slice(data, &mut cursor)?;
-    let liquidity = read_u128_from_slice(data, &mut cursor)?;
-    let _padding = read_u128_from_slice(data, &mut cursor)?;
-    skip_bytes(data, &mut cursor, U64_BYTES.saturating_mul(4))?; // fee accruals
-    let sqrt_min_price_x64 = read_u128_from_slice(data, &mut cursor)?;
-    let sqrt_max_price_x64 = read_u128_from_slice(data, &mut cursor)?;
-    let sqrt_price_x64 = read_u128_from_slice(data, &mut cursor)?;
-    let activation_point = read_u64_from_slice(data, &mut cursor)?;
-    let activation_type = read_u8_from_slice(data, &mut cursor)?;
-    let pool_status = read_u8_from_slice(data, &mut cursor)?;
-    let token_a_flag = read_u8_from_slice(data, &mut cursor)?;
-    let token_b_flag = read_u8_from_slice(data, &mut cursor)?;
-    let collect_fee_mode = read_u8_from_slice(data, &mut cursor)?;
-    let pool_type = read_u8_from_slice(data, &mut cursor)?;
-    let pool_version = read_u8_from_slice(data, &mut cursor)?;
-    skip_bytes(data, &mut cursor, 1)?; // padding
-    skip_bytes(data, &mut cursor, 32 * 2)?; // fee per liquidity accumulators
-    let permanent_lock_liquidity = read_u128_from_slice(data, &mut cursor)?;
-
-    Some(HydratedPoolMeta {
-        token_a_mint,
-        token_b_mint,
-        token_a_vault,
-        token_b_vault,
-        whitelisted_vault,
-        partner,
-        sqrt_price_x64,
-        liquidity,
-        sqrt_min_price_x64,
-        sqrt_max_price_x64,
-        permanent_lock_liquidity,
-        collect_fee_mode,
-        activation_point,
-        activation_type,
-        pool_status,
-        pool_type,
-        pool_version,
-        token_a_flag,
-        token_b_flag,
-        pool_fees,
-        hydrated_at: Instant::now(),
-        hydrated_slot: 0,
-    })
-}
-
-fn read_pubkey_from_slice(data: &[u8], cursor: &mut usize) -> Option<Pubkey> {
-    let end = cursor.checked_add(PUBKEY_BYTES)?;
-    let slice = data.get(*cursor..end)?;
-    let mut bytes = [0u8; PUBKEY_BYTES];
-    bytes.copy_from_slice(slice);
-    *cursor = end;
-    Some(Pubkey::new_from_array(bytes))
-}
-
-fn read_u64_from_slice(data: &[u8], cursor: &mut usize) -> Option<u64> {
-    let end = cursor.checked_add(U64_BYTES)?;
-    let slice = data.get(*cursor..end)?;
-    let mut bytes = [0u8; U64_BYTES];
-    bytes.copy_from_slice(slice);
-    *cursor = end;
-    Some(u64::from_le_bytes(bytes))
-}
-
-fn read_u128_from_slice(data: &[u8], cursor: &mut usize) -> Option<u128> {
-    let end = cursor.checked_add(U128_BYTES)?;
-    let slice = data.get(*cursor..end)?;
-    let mut bytes = [0u8; U128_BYTES];
-    bytes.copy_from_slice(slice);
-    *cursor = end;
-    Some(u128::from_le_bytes(bytes))
-}
-
-fn read_u32_from_slice(data: &[u8], cursor: &mut usize) -> Option<u32> {
-    let end = cursor.checked_add(4)?;
-    let slice = data.get(*cursor..end)?;
-    let mut bytes = [0u8; 4];
-    bytes.copy_from_slice(slice);
-    *cursor = end;
-    Some(u32::from_le_bytes(bytes))
-}
-
-fn read_u16_from_slice(data: &[u8], cursor: &mut usize) -> Option<u16> {
-    let end = cursor.checked_add(2)?;
-    let slice = data.get(*cursor..end)?;
-    let mut bytes = [0u8; 2];
-    bytes.copy_from_slice(slice);
-    *cursor = end;
-    Some(u16::from_le_bytes(bytes))
-}
-
-fn read_u8_from_slice(data: &[u8], cursor: &mut usize) -> Option<u8> {
-    let byte = *data.get(*cursor)?;
-    *cursor = cursor.checked_add(1)?;
-    Some(byte)
-}
-
-fn read_bytes<const N: usize>(data: &[u8], cursor: &mut usize) -> Option<[u8; N]> {
-    let end = cursor.checked_add(N)?;
-    let slice = data.get(*cursor..end)?;
-    let mut bytes = [0u8; N];
-    bytes.copy_from_slice(slice);
-    *cursor = end;
-    Some(bytes)
-}
-
-fn skip_bytes(data: &[u8], cursor: &mut usize, len: usize) -> Option<()> {
-    let end = cursor.checked_add(len)?;
-    data.get(*cursor..end)?;
-    *cursor = end;
-    Some(())
-}
-
-fn read_base_fee_struct(data: &[u8], cursor: &mut usize) -> Option<CpAmmBaseFeeExtras> {
-    let mut base = CpAmmBaseFeeExtras::default();
-    base.cliff_fee_numerator = read_u64_from_slice(data, cursor)?;
-    base.base_fee_mode = read_u8_from_slice(data, cursor)?;
-    skip_bytes(data, cursor, 5)?; // padding
-    base.first_factor = read_u16_from_slice(data, cursor)?;
-    base.second_factor = read_bytes::<8>(data, cursor)?;
-    base.third_factor = read_u64_from_slice(data, cursor)?;
-    skip_bytes(data, cursor, 8)?; // padding_1
-    Some(base)
-}
-
-fn read_dynamic_fee_struct(data: &[u8], cursor: &mut usize) -> Option<CpAmmDynamicFeeExtras> {
-    let mut dyn_fee = CpAmmDynamicFeeExtras::default();
-    dyn_fee.initialized = read_u8_from_slice(data, cursor)?;
-    skip_bytes(data, cursor, 7)?; // padding
-    dyn_fee.max_volatility_accumulator = read_u32_from_slice(data, cursor)?;
-    dyn_fee.variable_fee_control = read_u32_from_slice(data, cursor)?;
-    dyn_fee.bin_step = read_u16_from_slice(data, cursor)?;
-    dyn_fee.filter_period = read_u16_from_slice(data, cursor)?;
-    dyn_fee.decay_period = read_u16_from_slice(data, cursor)?;
-    dyn_fee.reduction_factor = read_u16_from_slice(data, cursor)?;
-    dyn_fee.last_update_timestamp = read_u64_from_slice(data, cursor)?;
-    dyn_fee.bin_step_u128 = read_u128_from_slice(data, cursor)?;
-    dyn_fee.sqrt_price_reference = read_u128_from_slice(data, cursor)?;
-    dyn_fee.volatility_accumulator = read_u128_from_slice(data, cursor)?;
-    dyn_fee.volatility_reference = read_u128_from_slice(data, cursor)?;
-    Some(dyn_fee)
-}
-
-fn read_pool_fees_struct(data: &[u8], cursor: &mut usize) -> Option<CpAmmPoolFeesExtras> {
-    let mut fees = CpAmmPoolFeesExtras::default();
-    fees.base_fee = read_base_fee_struct(data, cursor)?;
-    fees.protocol_fee_percent = read_u8_from_slice(data, cursor)?;
-    fees.partner_fee_percent = read_u8_from_slice(data, cursor)?;
-    fees.referral_fee_percent = read_u8_from_slice(data, cursor)?;
-    skip_bytes(data, cursor, 5)?; // padding
-    fees.dynamic_fee = read_dynamic_fee_struct(data, cursor)?;
-    skip_bytes(data, cursor, 16)?; // padding_1 (two u64)
-    Some(fees)
-}
-
 #[derive(Debug, Clone)]
 pub struct CpAmmState {
     pub pool: Pubkey,
@@ -2651,57 +1852,6 @@ impl CpAmmState {
             && self.liquidity.is_some()
             && self.sqrt_min_price_x64.is_some()
             && self.sqrt_max_price_x64.is_some()
-    }
-
-    fn meta_ready_for_slot(
-        &self,
-        slot: u64,
-        slot_lag_tolerance: u64,
-        lag_ms_tolerance: u64,
-    ) -> bool {
-        if !self.meta_ready() {
-            return false;
-        }
-        let slot_ready = self
-            .hydrated_meta_slot
-            .map(|hydrated_slot| Self::slot_within_tolerance(hydrated_slot, slot, slot_lag_tolerance))
-            .unwrap_or(false);
-        if slot_ready {
-            return true;
-        }
-        if lag_ms_tolerance == 0 {
-            return false;
-        }
-        self.last_hydrated_at
-            .map(|instant| instant.elapsed().as_millis() as u64 <= lag_ms_tolerance)
-            .unwrap_or(false)
-    }
-
-    fn slot_within_tolerance(hydrated_slot: u64, target_slot: u64, tolerance: u64) -> bool {
-        hydrated_slot >= target_slot
-            || target_slot
-                .saturating_sub(hydrated_slot)
-                <= tolerance
-    }
-
-    fn hydration_lag_slots(&self, slot: u64) -> Option<u64> {
-        self.hydrated_meta_slot
-            .map(|hydrated_slot| slot.saturating_sub(hydrated_slot))
-    }
-
-    fn hydration_lag_ms(&self) -> Option<u64> {
-        self.last_hydrated_at
-            .map(|instant| instant.elapsed().as_millis() as u64)
-    }
-
-    fn hydration_stale(&self, ttl_ms: u64) -> bool {
-        if ttl_ms == 0 {
-            return false;
-        }
-        match self.last_hydrated_at {
-            Some(instant) => instant.elapsed().as_millis() as u64 > ttl_ms,
-            None => true,
-        }
     }
 
     fn has_referral_account(&self) -> bool {
@@ -3630,14 +2780,6 @@ fn parse_pubkey(value: &str) -> Option<Pubkey> {
     Pubkey::from_str(value).ok()
 }
 
-fn optional_pubkey_string(pk: Pubkey) -> Option<String> {
-    if pk == Pubkey::default() {
-        None
-    } else {
-        Some(pk.to_string())
-    }
-}
-
 mod math {
     use super::{BPS_DENOMINATOR, U256};
 
@@ -3816,11 +2958,17 @@ mod math {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::{
-        HydrationStatus, PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness,
-    };
+    use std::time::Duration;
+    use crate::watch::types::{PoolSnapshot, PoolUpdateExtensions, SnapshotFreshness};
     use spl_pod::primitives::{PodU16, PodU64};
     use spl_token_2022::extension::transfer_fee::TransferFee;
+    use once_cell::sync::Lazy;
+
+    const SPL_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+    static SPL_TOKEN_2022_PROGRAM_PUBKEY: Lazy<Pubkey> = Lazy::new(|| {
+        Pubkey::from_str(SPL_TOKEN_2022_PROGRAM_ID)
+            .expect("static spl token 2022 program should be valid")
+    });
 
     fn fixture_transfer_fee(bps: u16, max_fee: u64) -> TokenTransferFee {
         let fee = TransferFee {
@@ -3899,93 +3047,16 @@ mod tests {
 
     #[test]
     fn apply_meta_refreshes_dynamic_fee() {
-        let old_mint = Pubkey::new_unique();
-        let old_mint_string = old_mint.to_string();
-        let mut extras = CpAmmPoolExtras {
-            token_a_mint: Some(old_mint_string.clone()),
-            pool_fees: Some(CpAmmPoolFeesExtras {
-                base_fee: CpAmmBaseFeeExtras {
-                    cliff_fee_numerator: 5,
-                    ..Default::default()
-                },
-                dynamic_fee: CpAmmDynamicFeeExtras {
-                    initialized: 1,
-                    volatility_accumulator: 10,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            hydrated_at: Some(Instant::now()),
-            ..Default::default()
-        };
-
-        let refreshed_pool_fees = CpAmmPoolFeesExtras {
-            base_fee: CpAmmBaseFeeExtras {
-                cliff_fee_numerator: 500,
-                base_fee_mode: BaseFeeModeFlag::RateLimiter as u8,
-                ..Default::default()
-            },
-            dynamic_fee: CpAmmDynamicFeeExtras {
-                initialized: 1,
-                volatility_accumulator: 77,
-                ..Default::default()
-            },
-            protocol_fee_percent: 2,
-            partner_fee_percent: 1,
-            referral_fee_percent: 1,
-        };
-
-        let meta = HydratedPoolMeta {
-            token_a_mint: Pubkey::new_unique(),
-            token_b_mint: Pubkey::new_unique(),
-            token_a_vault: Pubkey::new_unique(),
-            token_b_vault: Pubkey::new_unique(),
-            whitelisted_vault: Pubkey::default(),
-            partner: Pubkey::default(),
-            sqrt_price_x64: 42,
-            liquidity: 500_000,
-            sqrt_min_price_x64: 21,
-            sqrt_max_price_x64: 84,
-            permanent_lock_liquidity: 9,
-            collect_fee_mode: CollectFeeModeFlag::OnlyB as u8,
-            activation_point: 7,
-            activation_type: 0,
-            pool_status: PoolStatusFlag::Enable as u8,
-            pool_type: 0,
-            pool_version: 0,
-            token_a_flag: 1,
-            token_b_flag: 2,
-            pool_fees: refreshed_pool_fees.clone(),
-            hydrated_at: Instant::now(),
-            hydrated_slot: 0,
-        };
-
-        apply_hydrated_meta(&mut extras, &meta, false);
-        let after_no_refresh = extras.pool_fees.as_ref().expect("fees present");
-        assert_eq!(after_no_refresh.dynamic_fee.volatility_accumulator, 10);
-        assert_eq!(
-            extras.token_a_mint.as_deref(),
-            Some(old_mint_string.as_str())
-        );
-
-        let refreshed_mint = meta.token_a_mint.to_string();
-        apply_hydrated_meta(&mut extras, &meta, true);
-        let refreshed = extras.pool_fees.as_ref().expect("fees refreshed");
-        assert_eq!(
-            refreshed.dynamic_fee.volatility_accumulator,
-            refreshed_pool_fees.dynamic_fee.volatility_accumulator
-        );
-        assert_eq!(refreshed.base_fee.cliff_fee_numerator, 500);
-        assert_eq!(
-            extras.token_a_mint.as_deref(),
-            Some(refreshed_mint.as_str())
-        );
         assert!(extras.hydrated_at.is_some());
     }
 
     #[test]
     fn decorate_template_context_sets_token_programs_without_builder() {
-        let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default(), None);
+        let adapter = CpAmmAdapter::new(
+            CpAmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let mut state = fixture_rate_limiter_state();
         state.token_a_program = Some(*SPL_TOKEN_2022_PROGRAM_PUBKEY);
         state.token_b_program = Some(*SPL_TOKEN_PROGRAM_PUBKEY);
@@ -4762,7 +3833,11 @@ mod tests {
 
     #[test]
     fn bidirectional_quotes_generate_snapshot_sides() {
-        let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default(), None);
+        let adapter = CpAmmAdapter::new(
+            CpAmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
         let pool = Pubkey::new_unique();
         let mint_a = Pubkey::new_unique();
         let mint_b = Pubkey::new_unique();
@@ -4827,7 +3902,6 @@ mod tests {
             freshness: SnapshotFreshness::LiveCorecast,
             allow_reserve_backfill: true,
             quotes: None,
-            hydration: HydrationStatus::new(42),
             extensions: PoolUpdateExtensions::default(),
         };
 
@@ -4852,7 +3926,7 @@ mod tests {
         let required_partner = Pubkey::new_unique();
         let mut adapter_config = CpAmmAdapterConfig::default();
         adapter_config.required_partner = Some(required_partner);
-        let adapter = CpAmmAdapter::new(adapter_config, None);
+        let adapter = CpAmmAdapter::new(adapter_config, None, Arc::new(StaticPoolRegistry::new()));
 
         let pool = Pubkey::new_unique();
         let mint_a = Pubkey::new_unique();
@@ -4913,7 +3987,7 @@ mod tests {
 
         adapter.state.insert(pool, state);
         let quote = adapter.quote_exact_in(req).expect("quote produced");
-        assert_eq!(quote.status, QuoteStatus::HydrationPending);
+        assert_eq!(quote.status, QuoteStatus::MissingState);
     }
 
     #[test]
@@ -4921,7 +3995,7 @@ mod tests {
         let required_partner = Pubkey::new_unique();
         let mut adapter_config = CpAmmAdapterConfig::default();
         adapter_config.required_partner = Some(required_partner);
-        let adapter = CpAmmAdapter::new(adapter_config, None);
+        let adapter = CpAmmAdapter::new(adapter_config, None, Arc::new(StaticPoolRegistry::new()));
 
         let pool = Pubkey::new_unique();
         let mint_a = Pubkey::new_unique();
@@ -4990,7 +4064,7 @@ mod tests {
     fn quote_exact_in_reports_price_impact_when_clamped_to_zero() {
         let mut adapter_config = CpAmmAdapterConfig::default();
         adapter_config.max_swap_utilization_bps = 1;
-        let adapter = CpAmmAdapter::new(adapter_config, None);
+        let adapter = CpAmmAdapter::new(adapter_config, None, Arc::new(StaticPoolRegistry::new()));
 
         let pool = Pubkey::new_unique();
         let mint_a = Pubkey::new_unique();
@@ -5056,27 +4130,30 @@ mod tests {
     }
 
     #[test]
-    fn quote_exact_in_reports_stale_state_status() {
-        let mut config = CpAmmAdapterConfig::default();
-        config.hydration_meta_ttl_ms = 1;
-        let adapter = CpAmmAdapter::new(config, None);
+    fn quote_exact_in_requires_metadata() {
+        let adapter = CpAmmAdapter::new(
+            CpAmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
 
         let mut state = fixture_rate_limiter_state();
-        state.last_hydrated_at = Some(Instant::now() - Duration::from_millis(10));
+        state.sqrt_price_x64 = None;
+        state.liquidity = None;
         adapter.state.insert(state.pool, state.clone());
 
         let req = QuoteRequest {
             pool_id: state.pool,
             input_mint: state.token_a_mint,
             output_mint: state.token_b_mint,
-            amount: 1_000,
-            slot: 5,
+            amount: 5_000,
+            slot: 7,
             block_time: None,
             direction: SwapDirection::ExactIn,
         };
 
         let quote = adapter.quote_exact_in(req).expect("quote produced");
-        assert_eq!(quote.status, QuoteStatus::StaleState);
+        assert_eq!(quote.status, QuoteStatus::MissingState);
         assert_eq!(quote.amount_out, 0);
     }
 
@@ -5084,7 +4161,7 @@ mod tests {
     fn quote_exact_in_reports_slot_staleness() {
         let mut config = CpAmmAdapterConfig::default();
         config.stale_slot_threshold = 1;
-        let adapter = CpAmmAdapter::new(config, None);
+        let adapter = CpAmmAdapter::new(config, None, Arc::new(StaticPoolRegistry::new()));
 
         let mut state = fixture_rate_limiter_state();
         state.last_update_slot = 5;
@@ -5109,7 +4186,11 @@ mod tests {
 
     #[test]
     fn quote_exact_out_sets_min_output_amount() {
-        let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default(), None);
+        let adapter = CpAmmAdapter::new(
+            CpAmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
 
         let pool = Pubkey::new_unique();
         let mint_a = Pubkey::new_unique();
@@ -5177,7 +4258,11 @@ mod tests {
 
     #[test]
     fn quote_exact_out_reports_trading_disabled_status() {
-        let adapter = CpAmmAdapter::new(CpAmmAdapterConfig::default(), None);
+        let adapter = CpAmmAdapter::new(
+            CpAmmAdapterConfig::default(),
+            None,
+            Arc::new(StaticPoolRegistry::new()),
+        );
 
         let mut state = fixture_rate_limiter_state();
         state.pool_status = Some(PoolStatusFlag::Disable as u8);
@@ -5204,7 +4289,7 @@ mod tests {
     fn quote_exact_out_reports_time_staleness() {
         let mut config = CpAmmAdapterConfig::default();
         config.stale_after_ms = 1;
-        let adapter = CpAmmAdapter::new(config, None);
+        let adapter = CpAmmAdapter::new(config, None, Arc::new(StaticPoolRegistry::new()));
 
         let mut state = fixture_rate_limiter_state();
         state.last_update_at = Instant::now() - Duration::from_millis(10);

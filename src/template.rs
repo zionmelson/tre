@@ -28,7 +28,6 @@ pub struct TemplateContext {
     pub slippage_tolerance_bps: Option<u16>,
     pub expected_fee_amount: Option<u64>,
     pub partial_fill_remaining: Option<u64>,
-    pub template_ready: bool,
 }
 
 impl Default for TemplateContext {
@@ -58,7 +57,6 @@ impl Default for TemplateContext {
             slippage_tolerance_bps: None,
             expected_fee_amount: None,
             partial_fill_remaining: None,
-            template_ready: false,
         }
     }
 }

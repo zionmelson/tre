@@ -1,155 +1,252 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use tokio::{signal, task};
+use anyhow::{anyhow, Context, Result};
+use tokio::signal;
 
+use crate::adapter_book::AdapterBook;
 use crate::builder::BuilderHandle;
 use crate::bundle::{BundleClient, BundleTracker};
 use crate::config::AppConfig;
-use crate::core::{Lease, SlabPool, SpscRing};
-use crate::hydration::ingest::spawn_ingest_stage;
-use crate::hydration::readiness::{ReadinessPolicy, ReadinessRegistry};
-use crate::hydration::{HydrationService, PoolStore, SnapshotChannel};
+use crate::core::{Lease, RingConsumer, SlabPool, SpscRing};
+use crate::bootstrap::raydium::{resolve_pool_targets, RaydiumBootstrapFetcher};
+use crate::corecast::{spawn_ingest_stage, IngestHandles, PoolStore};
 use crate::notifier::Notifier;
 use crate::planner::types::BundleCandidate;
-use crate::planner::{self, PlannerConfig};
+use crate::planner::{
+    spawn_fast_lane_planner, spawn_graph_service, spawn_submit_stage, PlannerConfig,
+};
 use crate::strategy::StrategyEngine;
-use crate::submission::{self, SubmissionConfig};
+use crate::submission::{spawn_fast_lane_submitter, SubmissionConfig};
+use crate::telemetry;
 
-pub struct ExecutorRuntime {
-    stop: Arc<AtomicBool>,
-    handles: Vec<thread::JoinHandle<Result<()>>>,
+const SHUTDOWN_LOG_TARGET: &str = "runtime";
+
+pub async fn run(config: Arc<AppConfig>) -> Result<()> {
+    telemetry::init_from_env().await?;
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let builder = BuilderHandle::new(config.clone()).context("failed to initialize builder")?;
+    let adapter_book = Arc::new(AdapterBook::new(config.clone()));
+    let pool_store = Arc::new(PoolStore::with_capacity(config.perf.opportunity_slab));
+    let pool_updates = pool_store.subscribe(config.perf.ring_capacity);
+
+    let (graph_handle, graph_thread) = spawn_graph_service(
+        stop.clone(),
+        None,
+        pool_updates,
+        pool_store.view(),
+        PlannerConfig::default(),
+    )
+    .context("failed to spawn graph service")?;
+
+    let bootstrapped_pools = run_bootstrap_phase(config.clone(), adapter_book.clone()).await?;
+    tracing::info!(bootstrapped_pools, "bootstrap phase complete");
+
+    let strategy = Arc::new(
+        StrategyEngine::new(config.clone()).context("failed to initialize strategy engine")?,
+    );
+    let notifier = Arc::new(Notifier::new(strategy, config.clone()));
+
+    let IngestHandles {
+        trade_rx,
+        pool_rx,
+        handle: ingest_thread,
+    } = spawn_ingest_stage(stop.clone(), config.clone(), config.perf.ring_capacity)
+    .context("failed to spawn CoreCast ingest stage")?;
+
+    let planner_ring = SpscRing::with_capacity(config.perf.ring_capacity);
+    let (planner_producer, stage2_consumer) = planner_ring.into_split();
+    let submit_ring = SpscRing::with_capacity(config.perf.ring_capacity);
+    let (stage2_producer, stage3_consumer) = submit_ring.into_split();
+    let bundle_slab = SlabPool::new(config.perf.bundle_slab);
+
+    let planner_handle = spawn_fast_lane_planner(
+        stop.clone(),
+        PlannerConfig::default(),
+        trade_rx,
+        pool_rx,
+        planner_producer,
+        bundle_slab,
+        pool_store.clone(),
+        graph_handle,
+        Some(config.perf.eval_core),
+    )
+    .context("failed to spawn fast-lane planner")?;
+
+    let stage2_handle = spawn_submit_stage(
+        stop.clone(),
+        Some(config.perf.eval_core),
+        stage2_consumer,
+        stage2_producer,
+        builder.clone(),
+    )
+    .context("failed to spawn stage2 submitter")?;
+
+    let (stage3_handle, tracker_handles) = if config.pipeline.dry_run_mode {
+        tracing::warn!(
+            target = SHUTDOWN_LOG_TARGET,
+            "pipeline dry-run mode enabled; bundle submission disabled"
+        );
+        let sink = spawn_dry_run_sink(stop.clone(), stage3_consumer)
+            .context("failed to spawn dry-run submission sink")?;
+        (sink, Vec::new())
+    } else {
+        let auth = builder.auth_signer();
+        let bundle_client = Arc::new(
+            BundleClient::new(config.clone(), auth.clone())
+                .context("failed to initialize bundle client")?,
+        );
+        let (bundle_tracker, tracker_handles) =
+            BundleTracker::spawn(stop.clone(), config.clone(), notifier.clone(), auth)
+                .context("failed to start bundle tracker")?;
+        let submitter = spawn_fast_lane_submitter(
+            stop.clone(),
+            Some(config.perf.submit_core),
+            stage3_consumer,
+            builder.clone(),
+            bundle_client,
+            bundle_tracker,
+            SubmissionConfig::default(),
+        )
+        .context("failed to spawn fast-lane submitter")?;
+        (submitter, tracker_handles)
+    };
+
+    let handles = PipelineHandles {
+        ingest: ingest_thread,
+        planner: planner_handle,
+        graph: graph_thread,
+        stage2: stage2_handle,
+        stage3: stage3_handle,
+        tracker: tracker_handles,
+    };
+
+    tracing::info!(
+        target = SHUTDOWN_LOG_TARGET,
+        "runtime online; press Ctrl-C to exit"
+    );
+    signal::ctrl_c()
+        .await
+        .context("failed to install Ctrl-C handler")?;
+    tracing::info!(
+        target = SHUTDOWN_LOG_TARGET,
+        "shutdown signal received; stopping workers"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    handles.join()?;
+
+    Ok(())
 }
 
-impl ExecutorRuntime {
-    pub fn spawn(config: Arc<AppConfig>) -> Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let readiness_policy = ReadinessPolicy::from_watcher_config(&config.as_ref().watcher);
-        let readiness = ReadinessRegistry::new(readiness_policy);
-        let mut handles = Vec::new();
-
-        let builder = BuilderHandle::new_with_readiness(config.clone(), readiness.clone())?;
-        let strategy = Arc::new(StrategyEngine::new(config.clone())?);
-        let notifier = Arc::new(Notifier::new(strategy, config.clone()));
-
-        let hydration = HydrationService::new(builder.clone(), config.clone(), readiness.clone());
-        let (snapshot_publisher, _) = SnapshotChannel::new().split();
-        handles.push(hydration.spawn_snapshot_worker(stop.clone(), snapshot_publisher)?);
-        handles.push(hydration.spawn_adapter_ingest(stop.clone())?);
-        handles.push(hydration.spawn_pool_maintenance(stop.clone())?);
-
-        let ingest = spawn_ingest_stage(
-            stop.clone(),
-            config.clone(),
-            readiness.clone(),
-            config.watcher.queue_capacity.max(1),
-        )?;
-        handles.push(ingest.handle);
-
-        let pool_store = Arc::new(PoolStore::new());
-        let planner_config = PlannerConfig::default();
-        let updates = pool_store.subscribe(config.watcher.queue_capacity.max(1));
-        let (graph_handle, graph_worker) = planner::spawn_graph_service(
-            stop.clone(),
-            None,
-            updates,
-            pool_store.view(),
-            builder.clone(),
-            planner_config.clone(),
-        )?;
-        handles.push(graph_worker);
-
-        let (planner_tx, planner_rx) =
-            SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
-                .into_split();
-        let bundle_pool = SlabPool::new(config.perf.bundle_slab);
-        let (stage2_tx, stage2_rx) =
-            SpscRing::<Lease<BundleCandidate>>::with_capacity(config.perf.ring_capacity)
-                .into_split();
-
-        handles.push(planner::spawn_fast_lane_planner(
-            stop.clone(),
-            planner_config.clone(),
-            readiness,
-            ingest.trade_rx,
-            ingest.pool_rx,
-            planner_tx,
-            bundle_pool,
-            pool_store.clone(),
-            graph_handle,
-            Some(config.perf.eval_core),
-        )?);
-
-        handles.push(planner::spawn_submit_stage(
-            stop.clone(),
-            Some(config.perf.submit_core),
-            planner_rx,
-            stage2_tx,
-            builder.clone(),
-        )?);
-
-        let bundle_client = Arc::new(BundleClient::new(config.clone(), builder.auth_signer())?);
-        let (tracker, mut tracker_handles) = BundleTracker::spawn(
-            stop.clone(),
-            config.clone(),
-            notifier.clone(),
-            builder.auth_signer(),
-        )?;
-        handles.append(&mut tracker_handles);
-
-        handles.push(submission::spawn_fast_lane_submitter(
-            stop.clone(),
-            Some(config.perf.submit_core),
-            stage2_rx,
-            builder,
-            bundle_client,
-            tracker,
-            SubmissionConfig::default(),
-        )?);
-
-        Ok(Self { stop, handles })
+async fn run_bootstrap_phase(
+    config: Arc<AppConfig>,
+    adapter_book: Arc<AdapterBook>,
+) -> Result<usize> {
+    let endpoints = if !config.bootstrap.rpc_endpoints.is_empty() {
+        config.bootstrap.rpc_endpoints.clone()
+    } else {
+        config.quicknode_rpcs.clone()
+    };
+    if endpoints.is_empty() {
+        tracing::info!(
+            target = "bootstrap",
+            "bootstrap endpoints not configured; relying on CoreCast discovery"
+        );
+        return Ok(0);
     }
 
-    pub fn request_shutdown(&self) {
-        self.stop.store(true, Ordering::SeqCst);
+    let targets = resolve_pool_targets(&config.bootstrap.pool_allowlist)
+        .context("invalid bootstrap pool allowlist entry")?;
+    if targets.is_empty() {
+        tracing::info!(
+            target = "bootstrap",
+            "pool allowlist empty; skipping bootstrap fetch"
+        );
+        return Ok(0);
     }
 
-    pub fn join(self) -> Result<()> {
-        for handle in self.handles {
-            match handle.join() {
-                Ok(result) => result?,
-                Err(panic) => {
-                    return Err(anyhow!("stage thread panicked: {}", describe_panic(panic)))
-                }
-            }
+    let registry = adapter_book.registry();
+    let recorded = tokio::task::spawn_blocking(move || {
+        let fetcher = RaydiumBootstrapFetcher::new(endpoints)?;
+        fetcher.bootstrap(&targets, registry.as_ref())
+    })
+    .await
+    .context("bootstrap worker task panicked")??;
+
+    Ok(recorded)
+}
+
+struct PipelineHandles {
+    ingest: thread::JoinHandle<Result<()>>,
+    planner: thread::JoinHandle<Result<()>>,
+    graph: thread::JoinHandle<Result<()>>,
+    stage2: thread::JoinHandle<Result<()>>,
+    stage3: thread::JoinHandle<Result<()>>,
+    tracker: Vec<thread::JoinHandle<Result<()>>>,
+}
+
+impl PipelineHandles {
+    fn join(self) -> Result<()> {
+        join_thread("ingest", self.ingest)?;
+        join_thread("planner", self.planner)?;
+        join_thread("graph", self.graph)?;
+        join_thread("stage2", self.stage2)?;
+        join_thread("stage3", self.stage3)?;
+        for (idx, handle) in self.tracker.into_iter().enumerate() {
+            join_thread(&format!("tracker_{idx}"), handle)?;
         }
         Ok(())
     }
 }
 
-fn describe_panic(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
-    if let Some(msg) = payload.downcast_ref::<&str>() {
-        msg.to_string()
-    } else if let Some(msg) = payload.downcast_ref::<String>() {
-        msg.clone()
-    } else {
-        "unknown panic".to_string()
+fn join_thread(label: &str, handle: thread::JoinHandle<Result<()>>) -> Result<()> {
+    match handle.join() {
+        Ok(result) => result.with_context(|| format!("{label} thread exited with an error")),
+        Err(payload) => {
+            let message = if let Some(msg) = payload.downcast_ref::<&str>() {
+                (*msg).to_string()
+            } else if let Some(msg) = payload.downcast_ref::<String>() {
+                msg.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            Err(anyhow!("{label} thread panicked: {message}"))
+        }
     }
 }
 
-pub async fn run(config: Arc<AppConfig>) -> Result<()> {
-    let executor = task::spawn_blocking(move || ExecutorRuntime::spawn(config))
-        .await
-        .map_err(|err| anyhow!("executor initialization panicked: {err}"))??;
+fn spawn_dry_run_sink(
+    stop: Arc<AtomicBool>,
+    consumer: RingConsumer<Lease<BundleCandidate>>,
+) -> Result<thread::JoinHandle<Result<()>>> {
+    thread::Builder::new()
+        .name("dry_run_submit".into())
+        .spawn(move || run_dry_run_sink(stop, consumer))
+        .map_err(Into::into)
+}
 
-    signal::ctrl_c().await?;
-    executor.request_shutdown();
-
-    task::spawn_blocking(move || executor.join())
-        .await
-        .map_err(|err| anyhow!("executor shutdown panicked: {err}"))??;
-
+fn run_dry_run_sink(
+    stop: Arc<AtomicBool>,
+    consumer: RingConsumer<Lease<BundleCandidate>>,
+) -> Result<()> {
+    tracing::info!(target = "dry_run", "dry-run submission sink online");
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(lease) = consumer.pop() {
+            tracing::info!(
+                target = "dry_run",
+                seq = lease.seq,
+                edge_bps = lease.estimated_edge_bps,
+                "dry-run dropping bundle candidate"
+            );
+            drop(lease);
+        } else {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    tracing::info!(target = "dry_run", "dry-run submission sink shutting down");
     Ok(())
 }

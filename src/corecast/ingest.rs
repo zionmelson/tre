@@ -12,8 +12,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::corecast::CoreCastClient;
-use crate::hydration::readiness::ReadinessRegistry;
-use crate::hydration::types::{PoolUpdate, TradeUpdate};
+use crate::telemetry::{self, CorecastStreamKind};
+use crate::watch::types::{PoolUpdate, TradeUpdate};
 use crate::token_pair::TokenPair;
 
 pub struct IngestHandles {
@@ -25,7 +25,6 @@ pub struct IngestHandles {
 pub fn spawn_ingest_stage(
     stop: Arc<AtomicBool>,
     config: Arc<AppConfig>,
-    readiness: ReadinessRegistry,
     channel_capacity: usize,
 ) -> Result<IngestHandles> {
     let capacity = channel_capacity.max(1);
@@ -42,7 +41,7 @@ pub fn spawn_ingest_stage(
                 .build()
                 .context("failed to build ingest runtime")?;
             runtime.block_on(async move {
-                IngestWorker::new(stop, client, readiness, allowlist, trade_tx, pool_tx)
+                IngestWorker::new(stop, client, allowlist, trade_tx, pool_tx)
                     .run()
                     .await
             })
@@ -58,7 +57,6 @@ pub fn spawn_ingest_stage(
 struct IngestWorker {
     stop: Arc<AtomicBool>,
     client: CoreCastClient,
-    readiness: ReadinessRegistry,
     allowlist: Arc<HashSet<TokenPair>>,
     trade_tx: Sender<TradeUpdate>,
     pool_tx: Sender<PoolUpdate>,
@@ -68,7 +66,6 @@ impl IngestWorker {
     fn new(
         stop: Arc<AtomicBool>,
         client: CoreCastClient,
-        readiness: ReadinessRegistry,
         allowlist: Arc<HashSet<TokenPair>>,
         trade_tx: Sender<TradeUpdate>,
         pool_tx: Sender<PoolUpdate>,
@@ -76,7 +73,6 @@ impl IngestWorker {
         Self {
             stop,
             client,
-            readiness,
             allowlist,
             trade_tx,
             pool_tx,
@@ -101,6 +97,7 @@ impl IngestWorker {
                 Ok(mut stream) => {
                     info!(target = "ingest", "CoreCast trade stream subscribed");
                     retry = Duration::from_millis(250);
+                    let mut disconnected = false;
                     while !self.stop.load(Ordering::Relaxed) {
                         match stream.next_message().await {
                             Ok(Some(message)) => {
@@ -118,17 +115,25 @@ impl IngestWorker {
                             }
                             Ok(None) => {
                                 warn!(target = "ingest", "trade stream closed by server");
+                                disconnected = true;
                                 break;
                             }
                             Err(status) => {
                                 warn!(target = "ingest", %status, "trade stream error");
+                                disconnected = true;
                                 break;
                             }
                         }
                     }
+                    if disconnected && !self.stop.load(Ordering::Relaxed) {
+                        telemetry::record_corecast_stream_reconnect(CorecastStreamKind::Trade);
+                    }
                 }
                 Err(err) => {
                     warn!(target = "ingest", %err, "failed to subscribe to trade stream");
+                    if !self.stop.load(Ordering::Relaxed) {
+                        telemetry::record_corecast_stream_reconnect(CorecastStreamKind::Trade);
+                    }
                 }
             }
 
@@ -153,6 +158,7 @@ impl IngestWorker {
                 Ok(mut stream) => {
                     info!(target = "ingest", "CoreCast pool stream subscribed");
                     retry = Duration::from_millis(250);
+                    let mut disconnected = false;
                     while !self.stop.load(Ordering::Relaxed) {
                         match stream.next_message().await {
                             Ok(Some(message)) => {
@@ -162,7 +168,6 @@ impl IngestWorker {
                                         &update.base_mint,
                                         &update.quote_mint,
                                     )) {
-                                        self.readiness.record_pool_update(&update);
                                         self.enqueue_pool(update);
                                     }
                                 } else {
@@ -171,17 +176,25 @@ impl IngestWorker {
                             }
                             Ok(None) => {
                                 warn!(target = "ingest", "pool stream closed by server");
+                                disconnected = true;
                                 break;
                             }
                             Err(status) => {
                                 warn!(target = "ingest", %status, "pool stream error");
+                                disconnected = true;
                                 break;
                             }
                         }
                     }
+                    if disconnected && !self.stop.load(Ordering::Relaxed) {
+                        telemetry::record_corecast_stream_reconnect(CorecastStreamKind::Pool);
+                    }
                 }
                 Err(err) => {
                     warn!(target = "ingest", %err, "failed to subscribe to pool stream");
+                    if !self.stop.load(Ordering::Relaxed) {
+                        telemetry::record_corecast_stream_reconnect(CorecastStreamKind::Pool);
+                    }
                 }
             }
 

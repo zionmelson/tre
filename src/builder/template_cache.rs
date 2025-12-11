@@ -2,83 +2,58 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry as DashEntry, DashMap};
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
 use crate::builder::templates::{AccountSpec, SwapMintRole, SwapTemplateDirection};
 use crate::builder::{CpAmmPoolAccounts, LbClmmPoolAccounts, WhirlpoolPoolAccounts};
 use crate::config::AppConfig;
-use crate::hydration::readiness::{ReadinessRegistry, TemplateSignal};
-
-const TEMPLATE_SIGNAL_TTL: Duration = Duration::from_millis(400);
+use crate::telemetry;
 
 #[derive(Clone)]
 pub struct TemplateCache {
-    state: Arc<TemplateCacheState>,
-    readiness: Option<ReadinessRegistry>,
+    inner: Arc<TemplateCacheState>,
 }
 
 struct TemplateCacheState {
-    warm_calls: AtomicU64,
-    last_refresh_unix_ms: AtomicU64,
-    epoch: AtomicU64,
     templates: DashMap<TemplateCacheKey, Arc<InstructionTemplate>>,
+    latest: DashMap<(Pubkey, SwapTemplateDirection), TemplateCacheKey>,
+    template_builds: AtomicU64,
 }
 
 impl TemplateCache {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        Self::new_with_signals(config, None)
-    }
-
-    pub fn with_readiness(config: Arc<AppConfig>, readiness: ReadinessRegistry) -> Self {
-        Self::new_with_signals(config, Some(readiness))
-    }
-
-    fn new_with_signals(config: Arc<AppConfig>, readiness: Option<ReadinessRegistry>) -> Self {
-        let _ = config; // config plumbing will drive template selection later
+        let _ = config;
         Self {
-            state: Arc::new(TemplateCacheState {
-                warm_calls: AtomicU64::new(0),
-                last_refresh_unix_ms: AtomicU64::new(now_millis()),
-                epoch: AtomicU64::new(0),
+            inner: Arc::new(TemplateCacheState {
                 templates: DashMap::new(),
+                latest: DashMap::new(),
+                template_builds: AtomicU64::new(0),
             }),
-            readiness,
         }
     }
 
-    /// Pre-warms instruction templates so Stage 1 can build swap graphs without allocations.
-    pub fn prewarm(&self) {
-        self.state.warm_calls.fetch_add(1, Ordering::Relaxed);
-        self.state
-            .last_refresh_unix_ms
-            .store(now_millis(), Ordering::Relaxed);
-    }
-
-    /// Clears all cached templates and bumps the cache epoch. Returns the new epoch value.
-    pub fn clear(&self) -> u64 {
-        self.state.templates.clear();
-        self.state
-            .last_refresh_unix_ms
-            .store(now_millis(), Ordering::Relaxed);
-        self.state
-            .epoch
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1)
-    }
-
-    /// Inserts or replaces a template and returns the stored Arc handle.
+    /// Inserts a template if it has not been seen before.
     pub fn insert(&self, template: InstructionTemplate) -> Arc<InstructionTemplate> {
         let key = template.key.clone();
-        let handle = Arc::new(template);
-        self.state.templates.insert(key, handle.clone());
-        self.emit_template_signal(handle.as_ref());
-        handle
+        match self.inner.templates.entry(key.clone()) {
+            DashEntry::Vacant(slot) => {
+                self.inner.template_builds.fetch_add(1, Ordering::Relaxed);
+                let arc = Arc::new(template);
+                slot.insert(Arc::clone(&arc));
+                self.inner
+                    .latest
+                    .insert((key.pool_id, key.direction), key);
+                self.record_template_metrics();
+                arc
+            }
+            DashEntry::Occupied(mut entry) => {
+                Arc::clone(entry.get())
+            }
+        }
     }
 
-    /// Loads a batch of templates, returning how many entries were inserted.
     pub fn extend<I>(&self, templates: I) -> usize
     where
         I: IntoIterator<Item = InstructionTemplate>,
@@ -91,62 +66,61 @@ impl TemplateCache {
         count
     }
 
-    /// Retrieves an instruction template for the provided key.
     pub fn get(&self, key: &TemplateCacheKey) -> Option<Arc<InstructionTemplate>> {
-        self.state
+        self.inner
             .templates
             .get(key)
             .map(|entry| Arc::clone(entry.value()))
     }
 
-    /// Returns simple cache stats for observability.
-    pub fn stats(&self) -> TemplateCacheStats {
-        TemplateCacheStats {
-            warm_calls: self.state.warm_calls.load(Ordering::Relaxed),
-            last_refresh_unix_ms: self.state.last_refresh_unix_ms.load(Ordering::Relaxed),
-            template_count: self.state.templates.len() as u64,
-            epoch: self.state.epoch.load(Ordering::Relaxed),
-        }
+    pub fn latest_key(
+        &self,
+        pool_id: &Pubkey,
+        direction: SwapTemplateDirection,
+    ) -> Option<TemplateCacheKey> {
+        self.inner
+            .latest
+            .get(&(*pool_id, direction))
+            .map(|entry| entry.value().clone())
     }
 
-    pub fn epoch(&self) -> u64 {
-        self.state.epoch.load(Ordering::Relaxed)
+    pub fn latest_template(
+        &self,
+        pool_id: &Pubkey,
+        direction: SwapTemplateDirection,
+    ) -> Option<Arc<InstructionTemplate>> {
+        let key = self.latest_key(pool_id, direction)?;
+        self.get(&key)
     }
 
-    fn emit_template_signal(&self, template: &InstructionTemplate) {
-        let Some(readiness) = &self.readiness else {
-            return;
-        };
-        let epoch = self.state.epoch.load(Ordering::Relaxed);
-        let signal = TemplateSignal {
-            pool_id: template.key.pool_id.to_string(),
-            direction: template.key.direction,
-            hydrated_at: template.hydrated_at,
-            ttl: TEMPLATE_SIGNAL_TTL,
-            template_hash: Some(template.template_hash),
-            epoch,
-        };
-        readiness.record_template_signal(signal);
+    pub fn template_count(&self) -> usize {
+        self.inner.templates.len()
     }
-}
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TemplateCacheStats {
-    pub warm_calls: u64,
-    pub last_refresh_unix_ms: u64,
-    pub template_count: u64,
-    pub epoch: u64,
+    fn record_template_metrics(&self) {
+        telemetry::record_template_build();
+        telemetry::record_template_cache_entries(self.template_count());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TemplateCacheKey {
     pub pool_id: Pubkey,
     pub direction: SwapTemplateDirection,
+    pub template_hash: [u8; 32],
 }
 
 impl TemplateCacheKey {
-    pub fn new(pool_id: Pubkey, direction: SwapTemplateDirection) -> Self {
-        Self { pool_id, direction }
+    pub fn new(
+        pool_id: Pubkey,
+        direction: SwapTemplateDirection,
+        template_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            pool_id,
+            direction,
+            template_hash,
+        }
     }
 }
 
@@ -164,7 +138,6 @@ pub struct InstructionTemplate {
     pub alt_handle: Option<AltHandleId>,
     pub alt_accounts: Arc<[Pubkey]>,
     pub metadata: TemplateMetadata,
-    pub hydrated_at: Instant,
 }
 
 impl InstructionTemplate {
@@ -190,7 +163,7 @@ impl InstructionTemplate {
         let patches = field_layout.into_patches();
 
         Self {
-            key: TemplateCacheKey::new(pool_id, direction),
+            key: TemplateCacheKey::new(pool_id, direction, template_hash),
             program_id,
             discriminator,
             accounts: accounts.into(),
@@ -205,7 +178,6 @@ impl InstructionTemplate {
                 account_specs,
                 pool_accounts,
             },
-            hydrated_at: Instant::now(),
         }
     }
 
@@ -231,7 +203,7 @@ impl InstructionTemplate {
         let patches = field_layout.into_patches();
 
         Self {
-            key: TemplateCacheKey::new(pool_id, direction),
+            key: TemplateCacheKey::new(pool_id, direction, template_hash),
             program_id,
             discriminator,
             accounts: accounts.into(),
@@ -246,7 +218,6 @@ impl InstructionTemplate {
                 account_specs,
                 pool_accounts,
             },
-            hydrated_at: Instant::now(),
         }
     }
 
@@ -272,7 +243,7 @@ impl InstructionTemplate {
         let patches = field_layout.into_patches();
 
         Self {
-            key: TemplateCacheKey::new(pool_id, direction),
+            key: TemplateCacheKey::new(pool_id, direction, template_hash),
             program_id,
             discriminator,
             accounts: accounts.into(),
@@ -287,7 +258,6 @@ impl InstructionTemplate {
                 account_specs,
                 pool_accounts,
             },
-            hydrated_at: Instant::now(),
         }
     }
 
@@ -313,7 +283,7 @@ impl InstructionTemplate {
         let patches = field_layout.into_patches();
 
         Self {
-            key: TemplateCacheKey::new(pool_id, direction),
+            key: TemplateCacheKey::new(pool_id, direction, template_hash),
             program_id,
             discriminator,
             accounts: accounts.into(),
@@ -328,35 +298,9 @@ impl InstructionTemplate {
                 account_specs,
                 pool_accounts,
             },
-            hydrated_at: Instant::now(),
         }
     }
 
-    pub fn fresh_until(&self, ttl: Duration) -> Instant {
-        self.hydrated_at + ttl
-    }
-
-    pub fn is_hydrated(&self) -> bool {
-        match &self.metadata {
-            TemplateMetadata::None => true,
-            TemplateMetadata::AmmV3 { pool_accounts, .. } => pool_accounts
-                .as_ref()
-                .map(|accounts| accounts.is_populated())
-                .unwrap_or(false),
-            TemplateMetadata::CpAmm { pool_accounts, .. } => pool_accounts
-                .as_ref()
-                .map(|accounts| accounts.is_populated())
-                .unwrap_or(false),
-            TemplateMetadata::LbClmm { pool_accounts, .. } => pool_accounts
-                .as_ref()
-                .map(|accounts| accounts.is_populated())
-                .unwrap_or(false),
-            TemplateMetadata::Whirlpool { pool_accounts, .. } => pool_accounts
-                .as_ref()
-                .map(|accounts| accounts.is_populated())
-                .unwrap_or(false),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -444,55 +388,6 @@ impl LbClmmPoolAccounts {
             && self.reserve_x.is_some()
             && self.reserve_y.is_some()
             && self.oracle.is_some()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Instant;
-
-    fn empty_amm_v3_template(pool_accounts: Option<AmmV3PoolAccounts>) -> InstructionTemplate {
-        InstructionTemplate {
-            key: TemplateCacheKey::new(Pubkey::new_unique(), SwapTemplateDirection::BaseIn),
-            program_id: Pubkey::new_unique(),
-            discriminator: [0; 8],
-            accounts: Arc::from(Vec::<AccountMeta>::new()),
-            data: Arc::new(Vec::new()),
-            patches: Arc::from(Vec::<TemplatePatch>::new()),
-            cu_budget: 0,
-            tlv_bytes: 0,
-            template_hash: [0; 32],
-            alt_handle: None,
-            alt_accounts: Arc::from(Vec::new()),
-            metadata: TemplateMetadata::AmmV3 {
-                account_specs: &[],
-                pool_accounts,
-            },
-            hydrated_at: Instant::now(),
-        }
-    }
-
-    #[test]
-    fn amm_v3_template_not_hydrated_without_pool_accounts() {
-        let template = empty_amm_v3_template(None);
-        assert!(!template.is_hydrated());
-    }
-
-    #[test]
-    fn amm_v3_template_ready_when_pool_accounts_present() {
-        let pool_accounts = AmmV3PoolAccounts {
-            amm_config: Pubkey::new_unique(),
-            observation_state: Pubkey::new_unique(),
-            mint0: Pubkey::new_unique(),
-            mint1: Pubkey::new_unique(),
-            mint0_program: Pubkey::new_unique(),
-            mint1_program: Pubkey::new_unique(),
-            vault0: Pubkey::new_unique(),
-            vault1: Pubkey::new_unique(),
-        };
-        let template = empty_amm_v3_template(Some(pool_accounts));
-        assert!(template.is_hydrated());
     }
 }
 
@@ -781,10 +676,3 @@ pub struct WhirlpoolTemplateParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct AltHandleId(pub u32);
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default()
-}

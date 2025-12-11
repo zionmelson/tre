@@ -5,7 +5,7 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bincode::serialize;
@@ -15,19 +15,17 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::rent::Rent;
 use solana_sdk::sysvar;
 use solana_system_interface::{instruction as system_instruction, program as system_program};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::builder::templates::SwapTemplateDirection;
 use crate::builder::{
     BuilderHandle, BuilderStage, BundleInstructionPlan, BundleLookupTablePlan, FlashLoanRoutePlan,
 };
 use crate::core::{pin_current_thread, Lease, RingConsumer, RingProducer};
-use crate::telemetry::{self, Stage2PlanEvent};
+use crate::telemetry;
 
-use crate::hydration::types::{PoolQuoteDirection, LB_CLMM_PROGRAM_ID};
-use crate::planner::types::{
-    BundleCandidate, FlashLoanSummary, PlannedInstruction, RouteLegPlan, RoutePlan,
-};
+use crate::watch::types::{PoolQuoteDirection, LB_CLMM_PROGRAM_ID};
+use crate::planner::types::{BundleCandidate, FlashLoanSummary, PlannedInstruction, RouteLegPlan, RoutePlan};
 use crate::template::TemplateContext;
 
 pub fn spawn_submit_stage(
@@ -60,7 +58,7 @@ fn run(
     while !stop.load(Ordering::Relaxed) {
         builder.heartbeat(BuilderStage::SubmitHotPath);
         if let Some(bundle) = consumer.pop() {
-            process_bundle(bundle, &planner, &builder, &producer);
+                process_bundle(bundle, &planner, &builder, &producer);
         } else {
             thread::yield_now();
             thread::sleep(Duration::from_millis(10));
@@ -107,10 +105,6 @@ fn handle_stage2_failure(
     let attempt = bundle.stage2_attempts.saturating_add(1);
     bundle.stage2_attempts = attempt;
     warn!(seq = bundle.seq, attempt, error = %err, ?kind, "stage2 planning failure");
-    match kind {
-        FailureKind::Plan => telemetry::record_stage2_plan_event(Stage2PlanEvent::PlanFailed),
-        FailureKind::Prepare => telemetry::record_stage2_plan_event(Stage2PlanEvent::PrepareFailed),
-    }
     if let Some(plan) = bundle.flash_loan_reservation.take() {
         builder.flash_loan_planner().release_route(&plan);
     }
@@ -138,6 +132,7 @@ fn bundle_instruction_plan_from(ix: &PlannedInstruction) -> BundleInstructionPla
             PoolQuoteDirection::BaseToQuote => SwapTemplateDirection::BaseIn,
             PoolQuoteDirection::QuoteToBase => SwapTemplateDirection::BaseOut,
         },
+        template_hash: ix.template_hash,
         sqrt_price_limit: ix.sqrt_price_limit,
         min_output_amount: ix.min_output_amount,
         limit_price: ix.limit_price,
@@ -358,6 +353,14 @@ struct FlashLoanInstructionPlan {
     borrow_prefix_index: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+struct TipFundingPlan {
+    create_account: Instruction,
+    init_account: Instruction,
+    siphon_instruction: Instruction,
+    close_account: Instruction,
+}
+
 fn flash_loan_summary_from(plan: &FlashLoanRoutePlan) -> FlashLoanSummary {
     FlashLoanSummary {
         plan_id: plan.id,
@@ -370,13 +373,6 @@ fn flash_loan_summary_from(plan: &FlashLoanRoutePlan) -> FlashLoanSummary {
         lending_market: plan.accounts.lending_market.to_string(),
         reserve: plan.accounts.reserve.to_string(),
     }
-}
-
-struct TipFundingPlan {
-    create_account: Instruction,
-    init_account: Instruction,
-    siphon_instruction: Instruction,
-    close_account: Instruction,
 }
 
 const SPL_TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -403,7 +399,6 @@ impl<'a> InstructionPlanner<'a> {
     ) -> anyhow::Result<PlannedRouteInstructions> {
         let mut instructions = Vec::with_capacity(route.legs.len());
         for leg in &route.legs {
-            self.ensure_leg_ready(leg)?;
             let mut context = leg.context.clone();
             let (estimated_output_amount, min_output_amount) = fee_aware_outputs(
                 leg.estimated_output_amount,
@@ -423,6 +418,10 @@ impl<'a> InstructionPlanner<'a> {
             } else {
                 leg.estimated_output_amount
             };
+            let template_hash = match self.builder {
+                Some(builder) => self.template_hash_for_leg(builder, leg)?,
+                None => [0; 32],
+            };
             instructions.push(PlannedInstruction {
                 pool_id: leg.pool_id.clone(),
                 program_id: leg.program_id.clone(),
@@ -435,6 +434,7 @@ impl<'a> InstructionPlanner<'a> {
                 fee_bps: leg.fee_bps,
                 template_fee_bps: leg.template_fee_bps,
                 direction: leg.direction,
+                template_hash,
                 lookup_table: None,
                 sqrt_price_limit: leg.sqrt_price_limit,
                 min_output_amount,
@@ -491,14 +491,6 @@ impl<'a> InstructionPlanner<'a> {
                     ix.pool_id
                 );
             }
-        }
-        Ok(())
-    }
-
-    fn ensure_leg_ready(&self, leg: &RouteLegPlan) -> Result<()> {
-        if !leg.template_ready {
-            telemetry::record_stage2_pool_block(&leg.pool_id);
-            bail!("template not ready for pool {}", leg.pool_id);
         }
         Ok(())
     }
@@ -587,10 +579,9 @@ impl<'a> InstructionPlanner<'a> {
     }
 
     fn warn_missing_lookup_tables(&self, instructions: &[PlannedInstruction]) {
-        let builder = match self.builder {
-            Some(handle) => handle,
-            None => return,
-        };
+        if self.builder.is_none() {
+            return;
+        }
         let missing = instructions
             .iter()
             .filter(|ix| ix.lookup_table.is_none())
@@ -602,6 +593,29 @@ impl<'a> InstructionPlanner<'a> {
                 "missing ALT coverage for planned route"
             );
         }
+    }
+
+    fn template_hash_for_leg(
+        &self,
+        builder: &BuilderHandle,
+        leg: &RouteLegPlan,
+    ) -> anyhow::Result<[u8; 32]> {
+        let pool = Pubkey::from_str(&leg.pool_id)
+            .with_context(|| format!("invalid pool id {}", leg.pool_id))?;
+        let direction = match leg.direction {
+            PoolQuoteDirection::BaseToQuote => SwapTemplateDirection::BaseIn,
+            PoolQuoteDirection::QuoteToBase => SwapTemplateDirection::BaseOut,
+        };
+        let key = builder
+            .template_cache()
+            .latest_key(&pool, direction)
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing template for pool {} direction {:?}",
+                    leg.pool_id, direction
+                )
+            })?;
+        Ok(key.template_hash)
     }
 }
 
@@ -797,7 +811,7 @@ mod tests {
     use crate::builder::{InstructionTemplate, TemplateCacheKey, TemplateMetadata, TemplatePatch};
     use crate::config::AppConfig;
     use crate::core::SlabPool;
-    use crate::hydration::types::{PoolQuoteDirection, TradeUpdate};
+    use crate::watch::types::{PoolQuoteDirection, TradeUpdate};
     use crate::planner::types::{BundleCandidate, Opportunity, RouteLegPlan, RoutePlan};
     use crate::template::TemplateContext;
     use anyhow::anyhow;
@@ -912,7 +926,6 @@ mod tests {
                     limit_price: None,
                     price_impact_limit_bps: None,
                     context: TemplateContext::default(),
-                    template_ready: true,
                 },
                 RouteLegPlan {
                     pool_id: "pool-bc".into(),
@@ -933,7 +946,6 @@ mod tests {
                     limit_price: None,
                     price_impact_limit_bps: None,
                     context: TemplateContext::default(),
-                    template_ready: true,
                 },
             ],
             estimated_final_output_amount: Some(190),
@@ -986,7 +998,6 @@ mod tests {
             limit_price: None,
             price_impact_limit_bps: None,
             context: TemplateContext::default(),
-            template_ready: true,
         };
 
         let route = RoutePlan {
@@ -1034,7 +1045,6 @@ mod tests {
                 limit_price: None,
                 price_impact_limit_bps: None,
                 context: TemplateContext::default(),
-                template_ready: true,
             }],
             estimated_final_output_amount: Some(950_000),
             flash_loan_permitted: false,
@@ -1073,7 +1083,6 @@ mod tests {
             limit_price: None,
             price_impact_limit_bps: None,
             context: ctx,
-            template_ready: true,
         };
 
         let route = RoutePlan {
@@ -1112,7 +1121,6 @@ mod tests {
             alt_handle: None,
             alt_accounts: Arc::from(Vec::new()),
             metadata: TemplateMetadata::None,
-            hydrated_at: Instant::now(),
         };
         builder.template_cache().insert(template);
 
@@ -1136,7 +1144,6 @@ mod tests {
             limit_price: None,
             price_impact_limit_bps: None,
             context: TemplateContext::default(),
-            template_ready: true,
         };
         let route = RoutePlan {
             start_mint: WSOL_MINT_PUBKEY.to_string(),
@@ -1240,7 +1247,7 @@ mod tests {
             buy_amount: 100,
             sell_amount: 50,
         };
-        let opportunity = Opportunity::from_trade(seq, trade, None, None, Some(100.0), None);
+        let opportunity = Opportunity::from_trade(seq, trade, None, None, Some(100.0));
         BundleCandidate::from_opportunity(&opportunity)
     }
 }

@@ -17,9 +17,6 @@ use tracing::{debug, info, warn};
 
 use crate::builder::compute_flash_loan_fee;
 use crate::config::{AppConfig, DEFAULT_PROTOCOL_BORROW_PCT};
-use crate::hydration::types::{
-    CP_AMM_PROGRAM_ID, LB_CLMM_PROGRAM_ID, RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_PROGRAM_ID,
-};
 use crate::planner::graph_manager::ArbitrageOpportunity;
 use crate::planner::types::{BundleCandidate, Opportunity, RoutePlan};
 use crate::telemetry;
@@ -45,6 +42,10 @@ const WALLET_BALANCE_POLL_INTERVAL_SECS: u64 = 5;
 const WALLET_BALANCE_RPC_TIMEOUT_SECS: u64 = 6;
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const MAX_SNAPSHOT_GENERATION_LAG: u64 = 1_024;
+const RAYDIUM_V3_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const CP_AMM_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+const LB_CLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
 static TIP_RECIPIENTS: Lazy<Vec<Pubkey>> = Lazy::new(|| {
     [
@@ -496,7 +497,6 @@ impl StrategyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::types::{PoolQuoteDirection, TradeUpdate, RAYDIUM_V3_PROGRAM_ID};
     use crate::planner::types::{RouteLegPlan, RoutePlan};
     use crate::template::TemplateContext;
 
@@ -506,7 +506,7 @@ mod tests {
     fn opportunity_with(edge_bps: f64, signature: &str, age: Duration) -> Opportunity {
         Opportunity {
             seq: 0,
-            trade: TradeUpdate {
+            trade: crate::watch::types::TradeUpdate {
                 seq: 0,
                 slot: 0,
                 program_id: "program".into(),
@@ -543,13 +543,12 @@ mod tests {
                 fee_bps: 30,
                 template_fee_bps: 30,
                 estimated_slippage_bps: 1.0,
-                direction: PoolQuoteDirection::BaseToQuote,
+                direction: crate::watch::types::PoolQuoteDirection::BaseToQuote,
                 sqrt_price_limit: None,
                 min_output_amount: None,
                 limit_price: None,
                 price_impact_limit_bps: None,
                 context: TemplateContext::default(),
-                template_ready: false,
             }],
             estimated_final_output_amount: Some(TEST_INPUT_LAMPORTS + TEST_PROFIT_LAMPORTS),
             flash_loan_permitted: true,

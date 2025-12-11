@@ -3,7 +3,7 @@ use std::{
     env,
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -22,9 +22,12 @@ use tokio::{runtime::Handle, task::JoinHandle};
 use tracing::{info, warn};
 
 const PROMETHEUS_ENV: &str = "PROMETHEUS_METRICS_ADDR";
-const PROMETHEUS_METRIC_PREFIX_ALLOWLIST: &[&str] =
-    &["hydration_", "watcher_", "fastlane_", "bundle_", "stage2_"];
-const HYDRATION_POOL_PRICE_SCALE: f64 = 1_000_000.0;
+const PROMETHEUS_METRIC_PREFIX_ALLOWLIST: &[&str] = &[
+    "template_",
+    "corecast_",
+    "bundle_",
+    "pool_",
+];
 
 static TELEMETRY: OnceCell<TelemetryState> = OnceCell::new();
 static HTTP_SERVER: OnceCell<Option<JoinHandle<()>>> = OnceCell::new();
@@ -39,55 +42,12 @@ struct TelemetryState {
     execution_tip_multiplier_milli: Gauge,
     bundle_result_latency: Histogram,
     bundle_result_status: Family<BundleResultLabels, Counter>,
-    stage2_plan_events: Family<Stage2PlanLabels, Counter>,
-    stage2_pool_blocks: Family<Stage2PoolLabels, Counter>,
     execution_retry_events: Family<Stage3RetryLabels, Counter>,
-    hydration_template_age_ms: Gauge,
-    hydration_template_cache_entries: Gauge,
-    hydration_flash_routes_prepared: Gauge,
-    hydration_snapshot_overwrites: Counter,
-    hydration_ready_pools: Gauge,
-    hydration_tracked_pools: Gauge,
-    hydration_heartbeat_unix_ms: Gauge,
-    hydration_adapter_ingest: Family<HydrationAdapterLabels, Counter>,
-    hydration_rpc_refresh_success: Family<HydrationAdapterLabels, Counter>,
-    hydration_rpc_refresh_failure: Family<HydrationAdapterLabels, Counter>,
-    hydration_transfer_hook_events: Family<TransferHookEventLabels, Counter>,
-    hydration_pool_price_scaled: Family<HydrationPoolLabels, Gauge>,
-    hydration_pool_ready: Family<HydrationPoolLabels, Gauge>,
-    hydration_pool_slot: Family<HydrationPoolLabels, Gauge>,
-    hydration_pool_base_liquidity: Family<HydrationPoolLabels, Gauge>,
-    hydration_pool_quote_liquidity: Family<HydrationPoolLabels, Gauge>,
-    hydration_pool_initial_latency_ms: Family<HydrationPoolLabels, Gauge>,
-    hydration_component_pending: Family<HydrationComponentLabels, Counter>,
-    hydration_component_lag_ms: Family<HydrationComponentLabels, Gauge>,
-    hydration_component_lag_slots: Family<HydrationComponentLabels, Gauge>,
-    hydration_component_slot_delta: Family<HydrationComponentLabels, Gauge>,
-    hydration_readiness_failures: Family<HydrationReadinessLabels, Counter>,
-    hydration_stage_gauge: Family<HydrationStageLabels, Gauge>,
-    hydration_stale_pools: Counter,
-    hydration_queue_depth_pct: Gauge,
-    hydration_queue_depth_items: Gauge,
-    hydration_queue_drop_events: Counter,
-    hydration_job_scheduled: Family<HydrationWorkerLabels, Counter>,
-    hydration_job_finished: Family<HydrationJobStatusLabels, Counter>,
-    hydration_job_latency_ms: Family<HydrationJobStatusLabels, Histogram>,
-    hydration_job_queue_failures: Family<HydrationQueueFailureLabels, Counter>,
-    hydration_job_backoff_ms: Family<HydrationWorkerLabels, Gauge>,
-    hydration_quote_blocked: Family<HydrationAdapterLabels, Counter>,
-    graph_pool_count: Gauge,
-    graph_cycle_count: Gauge,
-    graph_snapshot_latency: Histogram,
-    watcher_update_age: Family<WatcherUpdateLabels, Histogram>,
-    watcher_cache_size: Gauge,
-    watcher_cycle_pending: Gauge,
-    watcher_update_backlog: Gauge,
-    fastlane_ring_depth_pct: Gauge,
-    fastlane_ring_depth_items: Gauge,
-    fastlane_ring_drop_events: Counter,
-    fastlane_slab_free_pct: Gauge,
-    fastlane_slab_free_slots: Gauge,
-    fastlane_slab_exhaustion_events: Counter,
+    template_build_total: Counter,
+    template_cache_entries: Gauge,
+    corecast_delta_lag_ms: Gauge,
+    corecast_stream_reconnects: Family<CorecastStreamLabels, Counter>,
+    pool_bootstrap_total: Family<PoolBootstrapLabels, Counter>,
 }
 
 impl TelemetryState {
@@ -149,20 +109,6 @@ impl TelemetryState {
             bundle_result_status.clone(),
         );
 
-        let stage2_plan_events = Family::default();
-        registry.register(
-            "stage2_plan_events_total",
-            "Stage2 bundle planning outcomes grouped by event",
-            stage2_plan_events.clone(),
-        );
-
-        let stage2_pool_blocks = Family::default();
-        registry.register(
-            "stage2_pool_blockers_total",
-            "Stage2 readiness blocks grouped by pool id",
-            stage2_pool_blocks.clone(),
-        );
-
         let execution_retry_events = Family::default();
         registry.register(
             "bundle_execution_retry_events_total",
@@ -170,328 +116,39 @@ impl TelemetryState {
             execution_retry_events.clone(),
         );
 
-        let hydration_template_age_ms = Gauge::default();
+        let template_build_total = Counter::default();
         registry.register(
-            "hydration_template_age_ms",
-            "Milliseconds since the template cache last refreshed",
-            hydration_template_age_ms.clone(),
+            "template_build_total",
+            "Instruction templates hydrated since startup",
+            template_build_total.clone(),
         );
 
-        let hydration_template_cache_entries = Gauge::default();
+        let template_cache_entries = Gauge::default();
         registry.register(
-            "hydration_template_cache_entries",
-            "Number of hydrated instruction templates currently cached",
-            hydration_template_cache_entries.clone(),
+            "template_cache_entries",
+            "Active instruction templates currently cached",
+            template_cache_entries.clone(),
         );
 
-        let hydration_flash_routes_prepared = Gauge::default();
+        let corecast_delta_lag_ms = Gauge::default();
         registry.register(
-            "hydration_flash_routes_prepared",
-            "Flash-loan routes currently pre-built by the hydration service",
-            hydration_flash_routes_prepared.clone(),
+            "corecast_delta_lag_ms",
+            "Milliseconds elapsed since the most recent CoreCast delta was applied",
+            corecast_delta_lag_ms.clone(),
         );
 
-        let hydration_snapshot_overwrites = Counter::default();
+        let corecast_stream_reconnects = Family::default();
         registry.register(
-            "hydration_snapshot_overwrites_total",
-            "Count of hydration readiness snapshots overwritten before consumption",
-            hydration_snapshot_overwrites.clone(),
+            "corecast_stream_reconnects_total",
+            "CoreCast stream reconnect attempts grouped by stream type",
+            corecast_stream_reconnects.clone(),
         );
 
-        let hydration_ready_pools = Gauge::default();
+        let pool_bootstrap_total = Family::default();
         registry.register(
-            "hydration_ready_pools",
-            "Count of pools that are fully hydrated with templates and tick arrays",
-            hydration_ready_pools.clone(),
-        );
-
-        let hydration_tracked_pools = Gauge::default();
-        registry.register(
-            "hydration_tracked_pools",
-            "Total pools currently tracked by the watcher",
-            hydration_tracked_pools.clone(),
-        );
-
-        let hydration_heartbeat_unix_ms = Gauge::default();
-        registry.register(
-            "hydration_heartbeat_unix_ms",
-            "Unix timestamp (ms) of the last live hydration snapshot",
-            hydration_heartbeat_unix_ms.clone(),
-        );
-
-        let hydration_adapter_ingest = Family::default();
-        registry.register(
-            "hydration_adapter_ingest_total",
-            "Pool updates successfully applied per protocol adapter",
-            hydration_adapter_ingest.clone(),
-        );
-
-        let hydration_rpc_refresh_success = Family::default();
-        registry.register(
-            "hydration_rpc_refresh_total",
-            "Successful RPC-based pool refresh events grouped by protocol",
-            hydration_rpc_refresh_success.clone(),
-        );
-
-        let hydration_rpc_refresh_failure = Family::default();
-        registry.register(
-            "hydration_rpc_refresh_failure_total",
-            "Failed RPC-based pool refresh events grouped by protocol",
-            hydration_rpc_refresh_failure.clone(),
-        );
-
-        let hydration_transfer_hook_events = Family::default();
-        registry.register(
-            "hydration_transfer_hook_events_total",
-            "Transfer-hook resolver lifecycle events grouped by reason",
-            hydration_transfer_hook_events.clone(),
-        );
-
-        let hydration_pool_price_scaled = Family::default();
-        registry.register(
-            "hydration_pool_price_scaled",
-            "Scaled (1e6) base→quote price for the last observed pool snapshot",
-            hydration_pool_price_scaled.clone(),
-        );
-
-        let hydration_pool_ready = Family::default();
-        registry.register(
-            "hydration_pool_ready",
-            "Boolean readiness flag (1 = hydrated, 0 = warming) for the most recent pool snapshot",
-            hydration_pool_ready.clone(),
-        );
-
-        let hydration_component_pending = Family::default();
-        registry.register(
-            "hydration_component_pending_total",
-            "Pools blocked on specific hydration components grouped by adapter",
-            hydration_component_pending.clone(),
-        );
-
-        let hydration_component_lag_ms = Family::default();
-        registry.register(
-            "hydration_component_lag_ms",
-            "Age in milliseconds of the most recent observation for a pending hydration component",
-            hydration_component_lag_ms.clone(),
-        );
-
-        let hydration_component_lag_slots = Family::default();
-        registry.register(
-            "hydration_component_lag_slots",
-            "Slot delta between the snapshot slot and the latest hydrated component",
-            hydration_component_lag_slots.clone(),
-        );
-
-        let hydration_component_slot_delta = Family::default();
-        registry.register(
-            "hydration_component_slot_delta",
-            "CoreCast ingest slot minus the hydrated component slot (per adapter/component)",
-            hydration_component_slot_delta.clone(),
-        );
-
-        let hydration_readiness_failures = Family::default();
-        registry.register(
-            "hydration_readiness_failures_total",
-            "Pool readiness failures grouped by adapter and reason",
-            hydration_readiness_failures.clone(),
-        );
-
-        let hydration_pool_slot = Family::default();
-        registry.register(
-            "hydration_pool_slot",
-            "Slot of the last observed pool snapshot",
-            hydration_pool_slot.clone(),
-        );
-
-        let hydration_pool_base_liquidity = Family::default();
-        registry.register(
-            "hydration_pool_base_liquidity",
-            "Base-side post balance associated with the most recent pool snapshot",
-            hydration_pool_base_liquidity.clone(),
-        );
-
-        let hydration_pool_quote_liquidity = Family::default();
-        registry.register(
-            "hydration_pool_quote_liquidity",
-            "Quote-side post balance associated with the most recent pool snapshot",
-            hydration_pool_quote_liquidity.clone(),
-        );
-
-        let hydration_pool_initial_latency_ms = Family::default();
-        registry.register(
-            "hydration_pool_initial_latency_ms",
-            "Elapsed milliseconds between pool discovery and its first ready state",
-            hydration_pool_initial_latency_ms.clone(),
-        );
-
-        let hydration_stale_pools = Counter::default();
-        registry.register(
-            "hydration_stale_pool_events_total",
-            "Pool cache entries evicted due to exceeding the freshness budget",
-            hydration_stale_pools.clone(),
-        );
-
-        let hydration_queue_depth_pct = Gauge::default();
-        registry.register(
-            "hydration_queue_depth_pct",
-            "Percentage (0-100) of the hydrator broadcast queue currently occupied",
-            hydration_queue_depth_pct.clone(),
-        );
-
-        let hydration_queue_depth_items = Gauge::default();
-        registry.register(
-            "hydration_queue_depth_items",
-            "Approximate count of pool updates buffered in the hydrator broadcast queue",
-            hydration_queue_depth_items.clone(),
-        );
-
-        let hydration_queue_drop_events = Counter::default();
-        registry.register(
-            "hydration_queue_drop_events_total",
-            "Number of hydrator broadcast updates dropped due to backpressure",
-            hydration_queue_drop_events.clone(),
-        );
-
-        let hydration_job_scheduled = Family::default();
-        registry.register(
-            "hydration_job_scheduled_total",
-            "Async hydrator enqueues grouped by worker name",
-            hydration_job_scheduled.clone(),
-        );
-
-        let hydration_job_finished = Family::default();
-        registry.register(
-            "hydration_job_finished_total",
-            "Async hydrator completions grouped by worker and status",
-            hydration_job_finished.clone(),
-        );
-
-        let hydration_job_latency_ms =
-            Family::new_with_constructor(hydration_job_latency_histogram as fn() -> Histogram);
-        registry.register(
-            "hydration_job_latency_ms",
-            "Observed latency per hydrator worker and status",
-            hydration_job_latency_ms.clone(),
-        );
-
-        let hydration_job_queue_failures = Family::default();
-        registry.register(
-            "hydration_job_queue_failures_total",
-            "Hydrator enqueue failures grouped by worker and reason",
-            hydration_job_queue_failures.clone(),
-        );
-
-        let hydration_job_backoff_ms = Family::default();
-        registry.register(
-            "hydration_job_backoff_ms",
-            "Last applied failure backoff duration per worker",
-            hydration_job_backoff_ms.clone(),
-        );
-
-        let hydration_quote_blocked = Family::default();
-        registry.register(
-            "hydration_quote_blocked_total",
-            "Quotes blocked while awaiting hydration grouped by adapter",
-            hydration_quote_blocked.clone(),
-        );
-
-        let hydration_stage_gauge = Family::default();
-        registry.register(
-            "hydration_stage",
-            "Stage ordinal (0=ingest,1=meta,2=tick_arrays) for each adapter/pool",
-            hydration_stage_gauge.clone(),
-        );
-
-        let graph_pool_count = Gauge::default();
-        registry.register(
-            "graph_pool_count",
-            "Number of pools currently indexed by the graph service",
-            graph_pool_count.clone(),
-        );
-
-        let graph_cycle_count = Gauge::default();
-        registry.register(
-            "graph_cycle_count",
-            "Number of profitable arbitrage cycles currently tracked",
-            graph_cycle_count.clone(),
-        );
-
-        let graph_snapshot_latency = Histogram::new(exponential_buckets(0.05, 2.0, 20));
-        registry.register(
-            "graph_snapshot_latency_ms",
-            "Milliseconds between pool snapshot creation and graph ingestion",
-            graph_snapshot_latency.clone(),
-        );
-
-        let watcher_update_age =
-            Family::new_with_constructor(watcher_update_histogram_constructor as fn() -> Histogram);
-        registry.register(
-            "watcher_update_age_ms",
-            "Milliseconds between hydrator publish and watcher consumption grouped by adapter",
-            watcher_update_age.clone(),
-        );
-
-        let watcher_cache_size = Gauge::default();
-        registry.register(
-            "watcher_cache_entries",
-            "Number of pool snapshots cached by the watcher lane",
-            watcher_cache_size.clone(),
-        );
-
-        let watcher_cycle_pending = Gauge::default();
-        registry.register(
-            "watcher_cycle_scan_pending",
-            "Boolean gauge indicating whether a cycle scan is queued (1 = pending)",
-            watcher_cycle_pending.clone(),
-        );
-
-        let watcher_update_backlog = Gauge::default();
-        registry.register(
-            "watcher_pool_update_backlog_pct",
-            "Percentage (0-100) of the watcher pool-update channel currently filled",
-            watcher_update_backlog.clone(),
-        );
-
-        let fastlane_ring_depth_pct = Gauge::default();
-        registry.register(
-            "fastlane_ring_depth_pct",
-            "Percentage (0-100) of the fast-lane bundle ring currently occupied",
-            fastlane_ring_depth_pct.clone(),
-        );
-
-        let fastlane_ring_depth_items = Gauge::default();
-        registry.register(
-            "fastlane_ring_depth_items",
-            "Number of bundle candidates currently buffered in the fast-lane ring",
-            fastlane_ring_depth_items.clone(),
-        );
-
-        let fastlane_ring_drop_events = Counter::default();
-        registry.register(
-            "fastlane_ring_drop_events_total",
-            "Total bundle candidates dropped because the fast-lane ring was saturated",
-            fastlane_ring_drop_events.clone(),
-        );
-
-        let fastlane_slab_free_pct = Gauge::default();
-        registry.register(
-            "fastlane_slab_free_pct",
-            "Percentage (0-100) of the fast-lane bundle slab slots currently available",
-            fastlane_slab_free_pct.clone(),
-        );
-
-        let fastlane_slab_free_slots = Gauge::default();
-        registry.register(
-            "fastlane_slab_free_slots",
-            "Number of free bundle slots remaining in the fast-lane slab pool",
-            fastlane_slab_free_slots.clone(),
-        );
-
-        let fastlane_slab_exhaustion_events = Counter::default();
-        registry.register(
-            "fastlane_slab_exhaustion_events_total",
-            "Total bundle candidates dropped because the fast-lane slab pool was exhausted",
-            fastlane_slab_exhaustion_events.clone(),
+            "pool_bootstrap_total",
+            "One-time pool bootstrap results grouped by status",
+            pool_bootstrap_total.clone(),
         );
 
         Self {
@@ -504,55 +161,12 @@ impl TelemetryState {
             execution_tip_multiplier_milli,
             bundle_result_latency,
             bundle_result_status,
-            stage2_plan_events,
-            stage2_pool_blocks,
             execution_retry_events,
-            hydration_template_age_ms,
-            hydration_template_cache_entries,
-            hydration_flash_routes_prepared,
-            hydration_snapshot_overwrites,
-            hydration_ready_pools,
-            hydration_tracked_pools,
-            hydration_heartbeat_unix_ms,
-            hydration_adapter_ingest,
-            hydration_rpc_refresh_success,
-            hydration_rpc_refresh_failure,
-            hydration_transfer_hook_events,
-            hydration_pool_price_scaled,
-            hydration_pool_ready,
-            hydration_component_pending,
-            hydration_component_lag_ms,
-            hydration_component_lag_slots,
-            hydration_component_slot_delta,
-            hydration_readiness_failures,
-            hydration_pool_slot,
-            hydration_pool_base_liquidity,
-            hydration_pool_quote_liquidity,
-            hydration_pool_initial_latency_ms,
-            hydration_stale_pools,
-            hydration_queue_depth_pct,
-            hydration_queue_depth_items,
-            hydration_queue_drop_events,
-            hydration_job_scheduled,
-            hydration_job_finished,
-            hydration_job_latency_ms,
-            hydration_job_queue_failures,
-            hydration_job_backoff_ms,
-            hydration_quote_blocked,
-            hydration_stage_gauge,
-            graph_pool_count,
-            graph_cycle_count,
-            graph_snapshot_latency,
-            watcher_update_age,
-            watcher_cache_size,
-            watcher_cycle_pending,
-            watcher_update_backlog,
-            fastlane_ring_depth_pct,
-            fastlane_ring_depth_items,
-            fastlane_ring_drop_events,
-            fastlane_slab_free_pct,
-            fastlane_slab_free_slots,
-            fastlane_slab_exhaustion_events,
+            template_build_total,
+            template_cache_entries,
+            corecast_delta_lag_ms,
+            corecast_stream_reconnects,
+            pool_bootstrap_total,
         }
     }
 }
@@ -624,7 +238,7 @@ fn encode_filtered_metrics(registry: &Registry) -> Result<String, std::fmt::Erro
     Ok(filter_metrics_by_prefix(&buffer))
 }
 
-// Trims the encoded output down to hydration/watcher metrics so Prometheus stays uncluttered.
+// Exports only the allowlisted metric prefixes so Prometheus stays focused on runtime-critical data.
 fn filter_metrics_by_prefix(input: &str) -> String {
     let mut filtered = String::new();
     let mut keep_current_block = false;
@@ -672,14 +286,6 @@ fn should_export_metric(metric_name: &str) -> bool {
         .any(|prefix| metric_name.starts_with(prefix))
 }
 
-fn hydration_job_latency_histogram() -> Histogram {
-    Histogram::new(exponential_buckets(0.25, 2.0, 20))
-}
-
-fn watcher_update_histogram_constructor() -> Histogram {
-    Histogram::new(exponential_buckets(0.1, 2.0, 20))
-}
-
 pub fn snapshot_metrics() -> Option<String> {
     TELEMETRY
         .get()
@@ -694,163 +300,10 @@ pub fn record_detection_latency(duration: Duration) {
     }
 }
 
-pub fn record_stage3_latency(duration: Duration) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .execution_latency
-            .observe(duration.as_secs_f64() * 1_000.0);
-    }
-}
-
-pub fn record_tip_multiplier(multiplier: f64) {
-    if let Some(state) = TELEMETRY.get() {
-        if multiplier.is_finite() {
-            let scaled = (multiplier * 1_000.0).round();
-            let clamped = scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
-            state.execution_tip_multiplier_milli.set(clamped);
-        }
-    }
-}
-
-pub enum Stage3SubmissionStatus {
-    Success,
     Failure,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct Stage3StatusLabels {
-    status: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct BundleResultLabels {
-    status: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct Stage3RetryLabels {
-    event: &'static str,
-    reason: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct Stage2PlanLabels {
-    event: &'static str,
-    reason: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct Stage2PoolLabels {
-    pool_id: String,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct HydrationAdapterLabels {
-    adapter: String,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct HydrationWorkerLabels {
-    worker: String,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct HydrationJobStatusLabels {
-    worker: String,
-    status: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct HydrationQueueFailureLabels {
-    worker: String,
-    reason: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct HydrationPoolLabels {
-    program: String,
-    pool: String,
-    base_mint: String,
-    quote_mint: String,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct HydrationComponentLabels {
-    adapter: String,
-    component: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct HydrationReadinessLabels {
-    adapter: String,
-    reason: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct HydrationStageLabels {
-    adapter: String,
-    pool: String,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct TransferHookEventLabels {
-    event: &'static str,
-    reason: &'static str,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug, EncodeLabelSet)]
-struct WatcherUpdateLabels {
-    adapter: String,
-}
-
-pub enum Stage3RetryEvent {
-    RetryQueued(Stage3RetryReason),
-    RetryFlushed,
-    RetriesExhausted(Stage3RetryReason),
-    FailureRecorded(Stage3RetryReason),
-}
-
-pub enum Stage2PlanEvent {
-    PlanFailed,
-    PrepareFailed,
-}
-
-pub enum TransferHookEvent {
-    ResolveSuccess,
-    ResolveFailure(TransferHookFailureReason),
-}
-
-#[derive(Clone, Copy)]
-pub enum TransferHookFailureReason {
-    MintOwnerLookup,
-    ValidationAccountMissing,
-    AccountFetch,
-    ExtraAccountBuild,
-}
-
-#[derive(Clone, Copy)]
-pub enum HydrationJobStatus {
-    Success,
-    Failure,
-}
-
-impl Stage2PlanEvent {
-    fn event(&self) -> &'static str {
-        "failure"
-    }
-
-    fn reason(&self) -> &'static str {
-        match self {
-            Stage2PlanEvent::PlanFailed => "plan_failed",
-            Stage2PlanEvent::PrepareFailed => "prepare_failed",
-        }
-    }
-}
-
-impl TransferHookEvent {
-    fn event(&self) -> &'static str {
-        "resolve"
-    }
 
     fn reason(&self) -> &'static str {
         match self {
@@ -871,15 +324,6 @@ impl TransferHookFailureReason {
     }
 }
 
-impl HydrationJobStatus {
-    fn label(&self) -> &'static str {
-        match self {
-            HydrationJobStatus::Success => "success",
-            HydrationJobStatus::Failure => "failure",
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub enum Stage3RetryReason {
     Context,
@@ -893,6 +337,36 @@ impl Stage3RetryReason {
             Stage3RetryReason::Context => "context",
             Stage3RetryReason::Sign => "sign",
             Stage3RetryReason::Submit => "submit",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum CorecastStreamKind {
+    Pool,
+    Trade,
+}
+
+impl CorecastStreamKind {
+    fn label(&self) -> &'static str {
+        match self {
+            CorecastStreamKind::Pool => "pool",
+            CorecastStreamKind::Trade => "trade",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum PoolBootstrapStatus {
+    Success,
+    Failure,
+}
+
+impl PoolBootstrapStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            PoolBootstrapStatus::Success => "success",
+            PoolBootstrapStatus::Failure => "failure",
         }
     }
 }
@@ -927,13 +401,51 @@ pub fn record_stage3_retry_event(event: Stage3RetryEvent) {
     }
 }
 
-pub fn record_stage2_plan_event(event: Stage2PlanEvent) {
+pub fn record_corecast_delta_lag(lag: Duration) {
     if let Some(state) = TELEMETRY.get() {
-        let labels = Stage2PlanLabels {
-            event: event.event(),
-            reason: event.reason(),
+        let millis = lag.as_secs_f64() * 1_000.0;
+        state.corecast_delta_lag_ms.set(millis.round() as i64);
+    }
+}
+
+pub fn record_corecast_stream_reconnect(kind: CorecastStreamKind) {
+    if let Some(state) = TELEMETRY.get() {
+        let labels = CorecastStreamLabels {
+            stream: kind.label(),
         };
-        state.stage2_plan_events.get_or_create(&labels).inc();
+        state
+            .corecast_stream_reconnects
+            .get_or_create(&labels)
+            .inc();
+    }
+}
+
+pub fn record_pool_bootstrap(status: PoolBootstrapStatus, count: u64) {
+    if count == 0 {
+        return;
+    }
+    if let Some(state) = TELEMETRY.get() {
+        let labels = PoolBootstrapLabels {
+            status: status.label(),
+        };
+        let counter = state.pool_bootstrap_total.get_or_create(&labels);
+        for _ in 0..count {
+            counter.inc();
+        }
+    }
+}
+
+pub fn record_template_build() {
+    if let Some(state) = TELEMETRY.get() {
+        state.template_build_total.inc();
+    }
+}
+
+pub fn record_template_cache_entries(entry_count: usize) {
+    if let Some(state) = TELEMETRY.get() {
+        state
+            .template_cache_entries
+            .set(clamp_u64_to_i64(entry_count as u64));
     }
 }
 
@@ -965,450 +477,12 @@ pub fn record_stage3_outcome(
     }
 }
 
-pub fn record_hydration_template_refresh(last_refresh_unix_ms: u64) {
-    if let Some(state) = TELEMETRY.get() {
-        if let Some(age_ms) = age_since_unix_ms(last_refresh_unix_ms) {
-            state
-                .hydration_template_age_ms
-                .set(clamp_u64_to_i64(age_ms));
-        }
-    }
-}
-
-pub fn record_hydration_template_count(template_count: u64) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .hydration_template_cache_entries
-            .set(clamp_u64_to_i64(template_count));
-    }
-}
-
-pub fn record_hydration_flash_routes(prepared_routes: u64) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .hydration_flash_routes_prepared
-            .set(clamp_u64_to_i64(prepared_routes));
-    }
-}
-
-pub fn record_hydration_snapshot_overwrite() {
-    if let Some(state) = TELEMETRY.get() {
-        state.hydration_snapshot_overwrites.inc();
-    }
-}
-
-pub fn record_hydration_pool_counts(ready_pools: usize, tracked_pools: usize) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .hydration_ready_pools
-            .set(clamp_u64_to_i64(ready_pools as u64));
-        state
-            .hydration_tracked_pools
-            .set(clamp_u64_to_i64(tracked_pools as u64));
-    }
-}
-
-pub fn record_hydration_heartbeat(unix_ms: u64) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .hydration_heartbeat_unix_ms
-            .set(clamp_u64_to_i64(unix_ms));
-    }
-}
-
-pub fn record_graph_pool_count(count: usize) {
-    if let Some(state) = TELEMETRY.get() {
-        state.graph_pool_count.set(clamp_u64_to_i64(count as u64));
-    }
-}
-
-pub fn record_graph_cycle_count(count: usize) {
-    if let Some(state) = TELEMETRY.get() {
-        state.graph_cycle_count.set(clamp_u64_to_i64(count as u64));
-    }
-}
-
-pub fn record_graph_snapshot_latency(latency: Duration) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .graph_snapshot_latency
-            .observe(latency.as_secs_f64() * 1_000.0);
-    }
-}
-
-pub fn record_hydration_adapter_ingest(adapter: &str) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationAdapterLabels {
-            adapter: adapter.to_string(),
-        };
-        state.hydration_adapter_ingest.get_or_create(&labels).inc();
-    }
-}
-
-pub fn record_hydration_rpc_refresh(adapter: &str) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationAdapterLabels {
-            adapter: adapter.to_string(),
-        };
-        state
-            .hydration_rpc_refresh_success
-            .get_or_create(&labels)
-            .inc();
-    }
-}
-
-pub fn record_hydration_rpc_refresh_failure(adapter: &str) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationAdapterLabels {
-            adapter: adapter.to_string(),
-        };
-        state
-            .hydration_rpc_refresh_failure
-            .get_or_create(&labels)
-            .inc();
-    }
-}
-
-pub fn record_hydration_component_pending(
-    adapter: &str,
-    component: &'static str,
-    lag_ms: Option<u64>,
-    lag_slots: Option<u64>,
-) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationComponentLabels {
-            adapter: adapter.to_string(),
-            component,
-        };
-        state
-            .hydration_component_pending
-            .get_or_create(&labels)
-            .inc();
-        if let Some(ms) = lag_ms {
-            state
-                .hydration_component_lag_ms
-                .get_or_create(&labels)
-                .set(clamp_u64_to_i64(ms));
-        }
-        if let Some(slots) = lag_slots {
-            state
-                .hydration_component_lag_slots
-                .get_or_create(&labels)
-                .set(clamp_u64_to_i64(slots));
-        }
-    }
-}
-
-pub fn record_hydration_component_slot_delta(adapter: &str, component: &'static str, delta: u64) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationComponentLabels {
-            adapter: adapter.to_string(),
-            component,
-        };
-        state
-            .hydration_component_slot_delta
-            .get_or_create(&labels)
-            .set(clamp_u64_to_i64(delta));
-    }
-}
-
-pub fn record_hydration_readiness_failure(adapter: &str, reason: &'static str) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationReadinessLabels {
-            adapter: adapter.to_string(),
-            reason,
-        };
-        state
-            .hydration_readiness_failures
-            .get_or_create(&labels)
-            .inc();
-    }
-}
-
-pub fn record_hydration_job_scheduled(worker: &str) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationWorkerLabels {
-            worker: worker.to_string(),
-        };
-        state.hydration_job_scheduled.get_or_create(&labels).inc();
-    }
-}
-
-pub fn record_hydration_job_queue_failure(worker: &str, reason: &'static str) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationQueueFailureLabels {
-            worker: worker.to_string(),
-            reason,
-        };
-        state
-            .hydration_job_queue_failures
-            .get_or_create(&labels)
-            .inc();
-    }
-}
-
-pub fn record_hydration_job_finished(worker: &str, status: HydrationJobStatus, latency: Duration) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationJobStatusLabels {
-            worker: worker.to_string(),
-            status: status.label(),
-        };
-        state.hydration_job_finished.get_or_create(&labels).inc();
-        state
-            .hydration_job_latency_ms
-            .get_or_create(&labels)
-            .observe(latency.as_secs_f64() * 1_000.0);
-    }
-}
-
-pub fn record_hydration_job_backoff(worker: &str, delay: Duration) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationWorkerLabels {
-            worker: worker.to_string(),
-        };
-        state
-            .hydration_job_backoff_ms
-            .get_or_create(&labels)
-            .set(clamp_u64_to_i64(delay.as_millis() as u64));
-    }
-}
-
-pub fn record_hydration_quote_blocked(adapter: &str) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationAdapterLabels {
-            adapter: adapter.to_string(),
-        };
-        state.hydration_quote_blocked.get_or_create(&labels).inc();
-    }
-}
-
-pub fn record_hydration_stage(adapter: &str, pool: &str, stage: u64) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationStageLabels {
-            adapter: adapter.to_string(),
-            pool: pool.to_string(),
-        };
-        state
-            .hydration_stage_gauge
-            .get_or_create(&labels)
-            .set(clamp_u64_to_i64(stage));
-    }
-}
-
 pub fn record_transfer_hook_event(event: TransferHookEvent) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = TransferHookEventLabels {
-            event: event.event(),
-            reason: event.reason(),
-        };
-        state
-            .hydration_transfer_hook_events
-            .get_or_create(&labels)
-            .inc();
-    }
+    let _ = event.event();
+    let _ = event.reason();
 }
-
-pub fn record_hydration_pool_snapshot(
-    program_id: &str,
-    pool_id: &str,
-    base_mint: &str,
-    quote_mint: &str,
-    slot: u64,
-    price: f64,
-    base_liquidity: u128,
-    quote_liquidity: u128,
-    ready: bool,
-) {
-    if program_id.is_empty() || pool_id.is_empty() {
-        return;
-    }
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationPoolLabels {
-            program: program_id.to_string(),
-            pool: pool_id.to_string(),
-            base_mint: base_mint.to_string(),
-            quote_mint: quote_mint.to_string(),
-        };
-        state
-            .hydration_pool_slot
-            .get_or_create(&labels)
-            .set(clamp_u64_to_i64(slot));
-        state
-            .hydration_pool_ready
-            .get_or_create(&labels)
-            .set(if ready { 1 } else { 0 });
-        if price.is_finite() && price > 0.0 {
-            let scaled = (price * HYDRATION_POOL_PRICE_SCALE).round();
-            let clamped = scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
-            state
-                .hydration_pool_price_scaled
-                .get_or_create(&labels)
-                .set(clamped);
-        }
-        state
-            .hydration_pool_base_liquidity
-            .get_or_create(&labels)
-            .set(clamp_u128_to_i64(base_liquidity));
-        state
-            .hydration_pool_quote_liquidity
-            .get_or_create(&labels)
-            .set(clamp_u128_to_i64(quote_liquidity));
-    }
-}
-
-pub fn record_hydration_initial_latency(
-    program_id: &str,
-    pool_id: &str,
-    base_mint: &str,
-    quote_mint: &str,
-    latency_ms: u64,
-) {
-    if program_id.is_empty() || pool_id.is_empty() {
-        return;
-    }
-    if let Some(state) = TELEMETRY.get() {
-        let labels = HydrationPoolLabels {
-            program: program_id.to_string(),
-            pool: pool_id.to_string(),
-            base_mint: base_mint.to_string(),
-            quote_mint: quote_mint.to_string(),
-        };
-        state
-            .hydration_pool_initial_latency_ms
-            .get_or_create(&labels)
-            .set(clamp_u64_to_i64(latency_ms));
-    }
-}
-
-pub fn record_hydration_stale_pools(evicted: u64) {
-    if evicted == 0 {
-        return;
-    }
-    if let Some(state) = TELEMETRY.get() {
-        state.hydration_stale_pools.inc_by(evicted);
-    }
-}
-
-pub fn record_hydration_queue_depth(len: usize, capacity: usize) {
-    if let Some(state) = TELEMETRY.get() {
-        let pct = if capacity == 0 {
-            0.0
-        } else {
-            (len as f64 / capacity as f64 * 100.0).clamp(0.0, 100.0)
-        };
-        state.hydration_queue_depth_pct.set(pct.round() as i64);
-        state
-            .hydration_queue_depth_items
-            .set(clamp_u64_to_i64(len as u64));
-    }
-}
-
-pub fn record_hydration_queue_drop() {
-    if let Some(state) = TELEMETRY.get() {
-        state.hydration_queue_drop_events.inc();
-    }
-}
-
-pub fn record_watcher_update_age(adapter: &str, latency: Duration) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = WatcherUpdateLabels {
-            adapter: adapter.to_string(),
-        };
-        state
-            .watcher_update_age
-            .get_or_create(&labels)
-            .observe(latency.as_secs_f64() * 1_000.0);
-    }
-}
-
-pub fn record_watcher_cache_depth(cache_len: usize) {
-    if let Some(state) = TELEMETRY.get() {
-        state
-            .watcher_cache_size
-            .set(clamp_u64_to_i64(cache_len as u64));
-    }
-}
-
-pub fn record_watcher_cycle_pending(pending: bool) {
-    if let Some(state) = TELEMETRY.get() {
-        state.watcher_cycle_pending.set(if pending { 1 } else { 0 });
-    }
-}
-
-pub fn record_watcher_update_backlog(len: usize, capacity: usize) {
-    if let Some(state) = TELEMETRY.get() {
-        let pct = if capacity == 0 {
-            0.0
-        } else {
-            (len as f64 / capacity as f64 * 100.0).clamp(0.0, 100.0)
-        };
-        state.watcher_update_backlog.set(pct.round() as i64);
-    }
-}
-
-pub fn record_fastlane_ring_depth(len: usize, capacity: usize) {
-    if let Some(state) = TELEMETRY.get() {
-        let pct = if capacity == 0 {
-            0.0
-        } else {
-            (len as f64 / capacity as f64 * 100.0).clamp(0.0, 100.0)
-        };
-        state.fastlane_ring_depth_pct.set(pct.round() as i64);
-        state
-            .fastlane_ring_depth_items
-            .set(clamp_u64_to_i64(len as u64));
-    }
-}
-
-pub fn record_fastlane_ring_drop() {
-    if let Some(state) = TELEMETRY.get() {
-        state.fastlane_ring_drop_events.inc();
-    }
-}
-
-pub fn record_fastlane_slab_capacity(free_slots: usize, capacity: usize) {
-    if let Some(state) = TELEMETRY.get() {
-        let pct = if capacity == 0 {
-            0.0
-        } else {
-            (free_slots as f64 / capacity as f64 * 100.0).clamp(0.0, 100.0)
-        };
-        state.fastlane_slab_free_pct.set(pct.round() as i64);
-        state
-            .fastlane_slab_free_slots
-            .set(clamp_u64_to_i64(free_slots as u64));
-    }
-}
-
-pub fn record_fastlane_slab_exhaustion() {
-    if let Some(state) = TELEMETRY.get() {
-        state.fastlane_slab_exhaustion_events.inc();
-    }
-}
-
 fn clamp_u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
-}
-
-fn clamp_u128_to_i64(value: u128) -> i64 {
-    if value > i64::MAX as u128 {
-        i64::MAX
-    } else {
-        value as i64
-    }
-}
-
-fn age_since_unix_ms(last_refresh_unix_ms: u64) -> Option<u64> {
-    if last_refresh_unix_ms == 0 {
-        return None;
-    }
-    let now_ms = unix_timestamp_millis()?;
-    now_ms.checked_sub(last_refresh_unix_ms)
-}
-
-fn unix_timestamp_millis() -> Option<u64> {
-    let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-    u64::try_from(duration.as_millis()).ok()
 }
 
 fn bundle_id_hash(bundle_id: &str) -> Option<i64> {
@@ -1459,24 +533,15 @@ pub fn record_bundle_result(status: BundleResultStatus, latency: Duration) {
     }
 }
 
-pub fn record_stage2_pool_block(pool_id: &str) {
-    if let Some(state) = TELEMETRY.get() {
-        let labels = Stage2PoolLabels {
-            pool_id: pool_id.to_string(),
-        };
-        state.stage2_pool_blocks.get_or_create(&labels).inc();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::filter_metrics_by_prefix;
 
     #[test]
     fn filters_non_allowlisted_metrics() {
-        let input = "# HELP hydration_queue_depth_pct Hydration queue depth\n# TYPE hydration_queue_depth_pct gauge\nhydration_queue_depth_pct 42\n\n# HELP bundle_detection_latency_ms Stage 2 latency\n# TYPE bundle_detection_latency_ms histogram\nbundle_detection_latency_ms_bucket{le=\"0.1\"} 0\n";
+        let input = "# HELP corecast_delta_lag_ms CoreCast delta lag\n# TYPE corecast_delta_lag_ms gauge\ncorecast_delta_lag_ms 42\n\n# HELP bundle_detection_latency_ms Stage 2 latency\n# TYPE bundle_detection_latency_ms histogram\nbundle_detection_latency_ms_bucket{le=\"0.1\"} 0\n";
         let filtered = filter_metrics_by_prefix(input);
-        assert!(filtered.contains("hydration_queue_depth_pct 42"));
+        assert!(filtered.contains("corecast_delta_lag_ms 42"));
         assert!(!filtered.contains("bundle_detection_latency_ms"));
     }
 }

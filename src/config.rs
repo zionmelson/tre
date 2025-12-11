@@ -21,7 +21,6 @@ const ENV_JITO_TIP_STREAM_URL: &str = "TRE_JITO_TIP_STREAM_URL";
 const ENV_JITO_AUCTION_STREAM_URL: &str = "TRE_JITO_AUCTION_STREAM_URL";
 const ENV_JITO_CA_PEM: &str = "TRE_JITO_CA_PEM";
 const ENV_QUICKNODE_RPCS: &str = "TRE_QUICKNODE_RPCS";
-const ENV_HYDRATION_ONLY_MODE: &str = "TRE_HYDRATION_ONLY_MODE";
 const ENV_DRY_RUN_MODE: &str = "TRE_DRY_RUN_MODE";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,7 +53,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub pipeline: PipelineConfig,
     #[serde(default)]
-    pub watcher: WatcherConfig,
+    pub bootstrap: BootstrapConfig,
     #[serde(default)]
     pub alt_manager: AltManagerConfig,
     #[serde(default, deserialize_with = "deserialize_optional_path")]
@@ -136,12 +135,6 @@ impl AppConfig {
             .unwrap_or_else(|| self.quicknode_rpcs.clone())
     }
 
-    pub fn protocol_hydration_retry_ms(&self, protocol: &str) -> Option<u64> {
-        self.protocols
-            .get(protocol)
-            .and_then(|entry| entry.hydration_retry_ms)
-    }
-
     pub fn protocol_max_utilization_bps(&self, protocol: &str) -> Option<u64> {
         self.protocols
             .get(protocol)
@@ -154,52 +147,10 @@ impl AppConfig {
             .and_then(|entry| entry.max_price_impact_bps)
     }
 
-    pub fn protocol_pool_backoff_ms(&self, protocol: &str) -> Option<u64> {
-        self.protocols
-            .get(protocol)
-            .and_then(|entry| entry.pool_failure_backoff_ms)
-    }
-
-    pub fn protocol_tick_array_backoff_ms(&self, protocol: &str) -> Option<u64> {
-        self.protocols
-            .get(protocol)
-            .and_then(|entry| entry.tick_array_backoff_ms)
-    }
-
-    pub fn protocol_hydration_slot_lag_tolerance(&self, protocol: &str) -> Option<u64> {
-        self.protocols
-            .get(protocol)
-            .and_then(|entry| entry.hydration_slot_lag_tolerance)
-    }
-
-    pub fn protocol_hydration_lag_ms_tolerance(&self, protocol: &str) -> Option<u64> {
-        self.protocols
-            .get(protocol)
-            .and_then(|entry| entry.hydration_lag_ms_tolerance)
-    }
-
-    pub fn protocol_max_pool_failures(&self, protocol: &str) -> Option<u32> {
-        self.protocols
-            .get(protocol)
-            .and_then(|entry| entry.max_pool_failures)
-    }
-
-    pub fn protocol_max_tick_array_failures(&self, protocol: &str) -> Option<u32> {
-        self.protocols
-            .get(protocol)
-            .and_then(|entry| entry.max_tick_array_failures)
-    }
-
     pub fn protocol_prefer_exact_out_quotes(&self, protocol: &str) -> Option<bool> {
         self.protocols
             .get(protocol)
             .and_then(|entry| entry.prefer_exact_out_quotes)
-    }
-
-    pub fn protocol_oracle_hydration_enabled(&self, protocol: &str) -> Option<bool> {
-        self.protocols
-            .get(protocol)
-            .and_then(|entry| entry.oracle_hydration_enabled)
     }
 
     pub fn protocol_borrow_pct(&self, protocol: &str) -> f64 {
@@ -450,9 +401,6 @@ impl AppConfig {
         if let Some(list) = env_list(ENV_QUICKNODE_RPCS) {
             self.quicknode_rpcs = list;
         }
-        if let Some(enabled) = env_bool(ENV_HYDRATION_ONLY_MODE) {
-            self.pipeline.hydration_only_mode = enabled;
-        }
         if let Some(enabled) = env_bool(ENV_DRY_RUN_MODE) {
             self.pipeline.dry_run_mode = enabled;
         }
@@ -572,30 +520,33 @@ pub struct PerfTuning {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PipelineConfig {
-    pub hydration_only_mode: bool,
     pub dry_run_mode: bool,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            hydration_only_mode: false,
             dry_run_mode: false,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
-pub struct WatcherConfig {
-    pub max_tracked_pools: usize,
-    pub min_ready_pools: usize,
-    pub initial_ready_timeout_ms: u64,
-    pub pool_stale_ttl_ms: Option<u64>,
-    pub pool_stale_slot_lag: Option<u64>,
-    pub pool_stale_sweep_ms: u64,
-    pub queue_capacity: usize,
-    pub queue_drop_policy: QueueDropPolicy,
+pub struct BootstrapConfig {
+    pub rpc_endpoints: Vec<String>,
+    pub pool_allowlist: Vec<BootstrapPoolEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum BootstrapPoolEntry {
+    Pool(String),
+    Detailed {
+        pool: String,
+        #[serde(default)]
+        tick_arrays: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -614,34 +565,6 @@ impl Default for AltManagerConfig {
     }
 }
 
-impl Default for WatcherConfig {
-    fn default() -> Self {
-        Self {
-            max_tracked_pools: 256,
-            min_ready_pools: 3,
-            initial_ready_timeout_ms: 5_000,
-            pool_stale_ttl_ms: Some(1_000),
-            pool_stale_slot_lag: None,
-            pool_stale_sweep_ms: 250,
-            queue_capacity: 1_024,
-            queue_drop_policy: QueueDropPolicy::DropNewest,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueDropPolicy {
-    DropNewest,
-    DropSubscriber,
-}
-
-impl Default for QueueDropPolicy {
-    fn default() -> Self {
-        QueueDropPolicy::DropNewest
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SubmissionTrackingConfig {
@@ -652,6 +575,7 @@ pub struct SubmissionTrackingConfig {
     pub status_poll_interval_secs: u64,
     pub status_poll_batch_size: usize,
     pub status_poll_timeout_secs: u64,
+    pub max_bundle_slot_lag: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -662,31 +586,15 @@ pub struct ProtocolConfig {
     #[serde(default)]
     pub rpc_endpoints: Vec<String>,
     #[serde(default)]
-    pub hydration_retry_ms: Option<u64>,
-    #[serde(default)]
     pub max_utilization_bps: Option<u64>,
     #[serde(default)]
     pub max_price_impact_bps: Option<u16>,
-    #[serde(default)]
-    pub pool_failure_backoff_ms: Option<u64>,
-    #[serde(default)]
-    pub tick_array_backoff_ms: Option<u64>,
-    #[serde(default)]
-    pub hydration_slot_lag_tolerance: Option<u64>,
-    #[serde(default)]
-    pub hydration_lag_ms_tolerance: Option<u64>,
-    #[serde(default)]
-    pub max_pool_failures: Option<u32>,
-    #[serde(default)]
-    pub max_tick_array_failures: Option<u32>,
     #[serde(default)]
     pub borrow_pct: Option<f64>,
     #[serde(default)]
     pub prefer_exact_out_quotes: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_pubkey")]
     pub required_partner: Option<Pubkey>,
-    #[serde(default)]
-    pub oracle_hydration_enabled: Option<bool>,
 }
 
 impl ProtocolConfig {
@@ -700,19 +608,11 @@ impl Default for ProtocolConfig {
         Self {
             enabled: true,
             rpc_endpoints: Vec::new(),
-            hydration_retry_ms: None,
             max_utilization_bps: None,
             max_price_impact_bps: None,
-            pool_failure_backoff_ms: None,
-            tick_array_backoff_ms: None,
-            hydration_slot_lag_tolerance: None,
-            hydration_lag_ms_tolerance: None,
-            max_pool_failures: None,
-            max_tick_array_failures: None,
             borrow_pct: None,
             prefer_exact_out_quotes: None,
             required_partner: None,
-            oracle_hydration_enabled: None,
         }
     }
 }
@@ -786,6 +686,7 @@ impl Default for SubmissionTrackingConfig {
             status_poll_interval_secs: 5,
             status_poll_batch_size: 32,
             status_poll_timeout_secs: 2,
+            max_bundle_slot_lag: Some(32),
         }
     }
 }

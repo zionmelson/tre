@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{self, Stdout};
@@ -18,9 +17,6 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use reqwest::blocking::Client;
 use tracing::{info, warn};
-use tre_arb_bot::hydration::types::{
-    CP_AMM_PROGRAM_ID, LB_CLMM_PROGRAM_ID, RAYDIUM_V3_PROGRAM_ID, WHIRLPOOL_PROGRAM_ID,
-};
 
 const DEFAULT_METRICS_URL: &str = "http://127.0.0.1:9898/metrics";
 const DEFAULT_REFRESH_MS: u64 = 1_000;
@@ -29,14 +25,7 @@ const PANEL_ENV: &str = "TRE_DASHBOARD_PANELS";
 const HISTORY_ENV: &str = "TRE_DASHBOARD_HISTORY";
 const INPUT_POLL_MS: u64 = 50;
 const MAX_PANEL_COLUMNS: u16 = 3;
-const INITIAL_LATENCY_ROW_LIMIT: usize = 6;
-const PROTOCOL_LATENCY_POOL_ROW_LIMIT: usize = 8;
-const NAMED_PROTOCOLS: &[(&str, &str)] = &[
-    (RAYDIUM_V3_PROGRAM_ID, "Raydium v3"),
-    (CP_AMM_PROGRAM_ID, "CP AMM"),
-    (LB_CLMM_PROGRAM_ID, "LB CLMM"),
-    (WHIRLPOOL_PROGRAM_ID, "Whirlpool"),
-];
+const BUNDLE_HISTORY_LIMIT: usize = 12;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -67,7 +56,6 @@ fn main() -> Result<()> {
         panels = ?panels,
         "dashboard online"
     );
-
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
@@ -138,6 +126,7 @@ fn run_dashboard_loop(
         }
 
         let now = Instant::now();
+        state.refresh_bundle_events(&metrics, now);
         let panels = build_panels(&metrics, panel_kinds, state, now);
         let current_view = state.view();
         let error_snapshot = last_error.as_deref();
@@ -176,7 +165,7 @@ fn parse_metrics(body: &str) -> MetricMap {
             continue;
         }
         let value = match value_part.parse::<f64>() {
-            Ok(val) => val,
+            Ok(value) => value,
             Err(_) => continue,
         };
         let (name, labels) = if let Some(start) = metric_part.find('{') {
@@ -218,6 +207,11 @@ fn parse_labels(block: &str) -> HashMap<String, String> {
 struct DashboardState {
     history: MetricHistory,
     counters: HashMap<String, CounterSample>,
+    counter_totals: HashMap<String, f64>,
+    bundle_events: VecDeque<BundleEvent>,
+    last_bundle_hash: Option<i64>,
+    last_bundle_hint: Option<String>,
+    last_bundle_tip: Option<u64>,
     view: DashboardView,
 }
 
@@ -226,7 +220,12 @@ impl DashboardState {
         Self {
             history: MetricHistory::new(history_len),
             counters: HashMap::new(),
-            view: DashboardView::Summary,
+            counter_totals: HashMap::new(),
+            bundle_events: VecDeque::new(),
+            last_bundle_hash: None,
+            last_bundle_hint: None,
+            last_bundle_tip: None,
+            view: DashboardView::Bootstrap,
         }
     }
 
@@ -277,21 +276,126 @@ impl DashboardState {
     fn previous_view(&mut self) {
         self.view = self.view.previous();
     }
+
+    fn refresh_bundle_events(&mut self, metrics: &MetricMap, now: Instant) {
+        if let Some(hash) = gauge_value(metrics, "bundle_execution_last_bundle_hash", &[]) {
+            if hash.is_finite() {
+                let hashed = hash.round() as i64;
+                if Some(hashed) != self.last_bundle_hash {
+                    self.last_bundle_hash = Some(hashed);
+                    self.last_bundle_hint = Some(format_bundle_hash_hint(hashed));
+                }
+            }
+        }
+        if let Some(tip) = gauge_value(metrics, "bundle_execution_tip_lamports", &[]) {
+            if tip.is_finite() && tip >= 0.0 {
+                self.last_bundle_tip = Some(tip.round() as u64);
+            }
+        }
+
+        self.record_bundle_attempt_events(metrics, now);
+        self.record_bundle_result_events(metrics, now);
+    }
+
+    fn counter_delta_by_key(&mut self, key: &str, current: f64) -> u64 {
+        if !current.is_finite() {
+            return 0;
+        }
+        let entry = self
+            .counter_totals
+            .entry(key.to_string())
+            .or_insert(current);
+        let delta = (current - *entry).max(0.0);
+        *entry = current;
+        delta.round().max(0.0) as u64
+    }
+
+    fn record_bundle_attempt_events(&mut self, metrics: &MetricMap, now: Instant) {
+        let Some(samples) = metrics.get("bundle_execution_attempts_total") else {
+            return;
+        };
+        for sample in samples {
+            let Some(status) = sample.labels.get("status").map(String::as_str) else {
+                continue;
+            };
+            let key = metric_key("bundle_execution_attempts_total", &sample.labels);
+            let delta = self.counter_delta_by_key(&key, sample.value);
+            if delta == 0 {
+                continue;
+            }
+            match status {
+                "success" => self.append_bundle_events(BundleEventKind::Stage3Success, delta, now),
+                "failure" => self.append_bundle_events(BundleEventKind::Stage3Failure, delta, now),
+                _ => {}
+            }
+        }
+    }
+
+    fn record_bundle_result_events(&mut self, metrics: &MetricMap, now: Instant) {
+        let Some(samples) = metrics.get("bundle_result_events_total") else {
+            return;
+        };
+        for sample in samples {
+            let Some(status) = sample.labels.get("status").map(String::as_str) else {
+                continue;
+            };
+            let key = metric_key("bundle_result_events_total", &sample.labels);
+            let delta = self.counter_delta_by_key(&key, sample.value);
+            if delta == 0 {
+                continue;
+            }
+            let kind = match status {
+                "accepted" => Some(BundleEventKind::Accepted),
+                "rejected" => Some(BundleEventKind::Rejected),
+                "expired" => Some(BundleEventKind::Expired),
+                "dropped" => Some(BundleEventKind::Dropped),
+                "auction_won" => Some(BundleEventKind::AuctionWon),
+                "auction_lost" => Some(BundleEventKind::AuctionLost),
+                "processed" => Some(BundleEventKind::Processed),
+                "finalized" => Some(BundleEventKind::Finalized),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                self.append_bundle_events(kind, delta, now);
+            }
+        }
+    }
+
+    fn append_bundle_events(&mut self, kind: BundleEventKind, count: u64, now: Instant) {
+        for _ in 0..count {
+            let tip_detail = if matches!(kind, BundleEventKind::Stage3Success) {
+                self.last_bundle_tip
+                    .map(|lamports| format!("{:.4} SOL", lamports as f64 / 1_000_000_000.0))
+            } else {
+                None
+            };
+            let event = BundleEvent {
+                timestamp: now,
+                kind,
+                bundle_id: self.last_bundle_hint.clone(),
+                detail: tip_detail.clone(),
+            };
+            self.bundle_events.push_back(event);
+            while self.bundle_events.len() > BUNDLE_HISTORY_LIMIT {
+                self.bundle_events.pop_front();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashboardView {
-    Summary,
-    HydrationLatency,
+    Bootstrap,
+    Bundles,
 }
 
 impl DashboardView {
-    const ALL: [DashboardView; 2] = [DashboardView::Summary, DashboardView::HydrationLatency];
+    const ALL: [DashboardView; 2] = [DashboardView::Bootstrap, DashboardView::Bundles];
 
     fn label(self) -> &'static str {
         match self {
-            DashboardView::Summary => "Ops",
-            DashboardView::HydrationLatency => "Hydration",
+            DashboardView::Bootstrap => "Bootstrap",
+            DashboardView::Bundles => "Bundles",
         }
     }
 
@@ -326,6 +430,45 @@ struct CounterSample {
 struct MetricHistory {
     capacity: usize,
     series: HashMap<String, VecDeque<f64>>,
+}
+
+#[derive(Clone, Debug)]
+struct BundleEvent {
+    timestamp: Instant,
+    kind: BundleEventKind,
+    bundle_id: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BundleEventKind {
+    Stage3Success,
+    Stage3Failure,
+    Accepted,
+    Rejected,
+    Expired,
+    Dropped,
+    AuctionWon,
+    AuctionLost,
+    Processed,
+    Finalized,
+}
+
+impl BundleEventKind {
+    fn label(self) -> &'static str {
+        match self {
+            BundleEventKind::Stage3Success => "submitted",
+            BundleEventKind::Stage3Failure => "failed",
+            BundleEventKind::Accepted => "accepted",
+            BundleEventKind::Rejected => "rejected",
+            BundleEventKind::Expired => "expired",
+            BundleEventKind::Dropped => "dropped",
+            BundleEventKind::AuctionWon => "auction_won",
+            BundleEventKind::AuctionLost => "auction_lost",
+            BundleEventKind::Processed => "processed",
+            BundleEventKind::Finalized => "finalized",
+        }
+    }
 }
 
 impl MetricHistory {
@@ -392,7 +535,7 @@ impl PanelKind {
 
 struct Panel {
     title: String,
-    rows: Vec<PanelRow>,
+    rows: Vec<PanelEntry>,
 }
 
 impl Panel {
@@ -404,10 +547,31 @@ impl Panel {
     }
 
     fn push(&mut self, label: impl Into<String>, value: impl Into<String>, spark: Option<String>) {
-        self.rows.push(PanelRow {
+        self.push_styled(
+            label,
+            value,
+            spark,
+            Style::default().fg(Color::Gray),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+
+    fn push_styled(
+        &mut self,
+        label: impl Into<String>,
+        value: impl Into<String>,
+        spark: Option<String>,
+        label_style: Style,
+        value_style: Style,
+    ) {
+        self.rows.push(PanelEntry::Stat {
             label: label.into(),
             value: value.into(),
             spark,
+            label_style,
+            value_style,
         });
     }
 
@@ -416,10 +580,14 @@ impl Panel {
     }
 }
 
-struct PanelRow {
-    label: String,
-    value: String,
-    spark: Option<String>,
+enum PanelEntry {
+    Stat {
+        label: String,
+        value: String,
+        spark: Option<String>,
+        label_style: Style,
+        value_style: Style,
+    },
 }
 
 fn build_panels(
@@ -429,12 +597,12 @@ fn build_panels(
     now: Instant,
 ) -> Vec<Panel> {
     match state.view() {
-        DashboardView::Summary => build_summary_panels(metrics, kinds, state, now),
-        DashboardView::HydrationLatency => build_protocol_latency_panels(metrics),
+        DashboardView::Bootstrap => build_bootstrap_panels(metrics, kinds, state, now),
+        DashboardView::Bundles => build_bundle_panels(metrics, state, now),
     }
 }
 
-fn build_summary_panels(
+fn build_bootstrap_panels(
     metrics: &MetricMap,
     kinds: &[PanelKind],
     state: &mut DashboardState,
@@ -444,7 +612,7 @@ fn build_summary_panels(
     for kind in kinds {
         match kind {
             PanelKind::Readiness => {
-                if let Some(panel) = build_readiness_panel(metrics, state) {
+                if let Some(panel) = build_bootstrap_panel(metrics, state, now) {
                     output.push(panel);
                 }
             }
@@ -454,7 +622,7 @@ fn build_summary_panels(
                 }
             }
             PanelKind::Rpc => {
-                if let Some(panel) = build_rpc_panel(metrics, state, now) {
+                if let Some(panel) = build_corecast_panel(metrics, state, now) {
                     output.push(panel);
                 }
             }
@@ -552,32 +720,34 @@ fn view_tabs_line(view: DashboardView) -> Line<'static> {
             spans.push(Span::raw("  "));
         }
     }
-    spans.push(Span::raw("   Tab/Shift+Tab  or  1/2"));
+    spans.push(Span::raw("   Tab/Shift+Tab  or  1-4"));
     Line::from(spans)
 }
 
 fn panel_widget(panel: &Panel) -> Paragraph<'static> {
     let mut lines = Vec::new();
-    for row in &panel.rows {
-        let mut spans = Vec::new();
-        spans.push(Span::styled(
-            format!("{:<18}", row.label),
-            Style::default().fg(Color::Gray),
-        ));
-        spans.push(Span::styled(
-            format!("{:>12}", row.value),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-        if let Some(spark) = &row.spark {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                spark.clone(),
-                Style::default().fg(Color::LightBlue),
-            ));
+    for entry in &panel.rows {
+        match entry {
+            PanelEntry::Stat {
+                label,
+                value,
+                spark,
+                label_style,
+                value_style,
+            } => {
+                let mut spans = Vec::new();
+                spans.push(Span::styled(format!("{:<18}", label), label_style.clone()));
+                spans.push(Span::styled(format!("{:>12}", value), value_style.clone()));
+                if let Some(spark) = spark {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        spark.clone(),
+                        Style::default().fg(Color::LightBlue),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
         }
-        lines.push(Line::from(spans));
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -654,8 +824,8 @@ fn wait_for_next_tick(
                     match key.code {
                         KeyCode::Tab | KeyCode::Right => state.next_view(),
                         KeyCode::BackTab | KeyCode::Left => state.previous_view(),
-                        KeyCode::Char('1') => state.set_view(DashboardView::Summary),
-                        KeyCode::Char('2') => state.set_view(DashboardView::HydrationLatency),
+                        KeyCode::Char('1') => state.set_view(DashboardView::Bootstrap),
+                        KeyCode::Char('2') => state.set_view(DashboardView::Bundles),
                         _ => {}
                     }
                 }
@@ -686,53 +856,27 @@ fn human_duration(delta: Duration) -> String {
     }
 }
 
-fn build_readiness_panel(metrics: &MetricMap, state: &mut DashboardState) -> Option<Panel> {
-    let mut panel = Panel::new("Readiness");
-    if let Some(ready) = gauge_value(metrics, "hydration_ready_pools", &[]) {
-        let spark = state.record_history("readiness.ready", ready);
-        panel.push("Ready pools", format_count(ready), spark);
+fn build_planner_panel(
+    metrics: &MetricMap,
+    state: &mut DashboardState,
+    now: Instant,
+) -> Option<Panel> {
+    let mut panel = Panel::new("Planner");
+    if let Some(rate) = counter_rate(metrics, state, now, "bundle_execution_attempts_total") {
+        panel.push("Stage3 attempts/min", format_rate_per_min(rate), None);
     }
-    if let (Some(tracked), Some(ready)) = (
-        gauge_value(metrics, "hydration_tracked_pools", &[]),
-        gauge_value(metrics, "hydration_ready_pools", &[]),
-    ) {
-        let warming = (tracked - ready).max(0.0);
-        let spark = state.record_history("readiness.warming", warming);
-        panel.push("Warming pools", format_count(warming), spark);
+    if let Some(rate) = counter_rate(metrics, state, now, "bundle_execution_retry_events_total") {
+        panel.push("Stage3 retries/min", format_rate_per_min(rate), None);
     }
-    if let Some(entries) = gauge_value(metrics, "hydration_template_cache_entries", &[]) {
-        panel.push("Template cache entries", format_count(entries), None);
-    }
-    if let Some(age) = gauge_value(metrics, "hydration_template_age_ms", &[]) {
-        let spark = state.record_history("readiness.template_age", age);
-        panel.push("Template age", format_duration_ms(age), spark);
-    }
-    if let Some(items) = gauge_value(metrics, "hydration_queue_depth_items", &[]) {
-        let pct = gauge_value(metrics, "hydration_queue_depth_pct", &[]).unwrap_or(0.0);
-        let spark = state.record_history("readiness.queue_items", items);
+    if let Some(multiplier) = gauge_value(metrics, "bundle_execution_tip_multiplier_milli", &[]) {
         panel.push(
-            "Hydrator queue",
-            format!("{} items ({:.0}%)", format_count(items), pct),
-            spark,
-        );
-    }
-    if let Some(summary) = component_lag_summary(metrics, "hydration_component_lag_ms", "component")
-    {
-        panel.push("Hydration lag (ms)", summary, None);
-    }
-    if let Some((total, entries)) = initial_latency_entries(metrics, INITIAL_LATENCY_ROW_LIMIT) {
-        panel.push(
-            "Initial hydration",
-            format!("{} pools", format_count(total as f64)),
+            "Tip multiplier",
+            format!("{:.3}x", multiplier / 1_000.0),
             None,
         );
-        for (pool_label, latency_ms) in entries {
-            panel.push(
-                format!("↳ {}", pool_label),
-                format_duration_ms(latency_ms),
-                None,
-            );
-        }
+    }
+    if let Some(tip) = gauge_value(metrics, "bundle_execution_tip_lamports", &[]) {
+        panel.push("Latest tip", format_sol_from_lamports(tip), None);
     }
 
     if panel.is_empty() {
@@ -742,12 +886,27 @@ fn build_readiness_panel(metrics: &MetricMap, state: &mut DashboardState) -> Opt
     }
 }
 
-fn build_planner_panel(
+fn build_bundle_panels(
+    metrics: &MetricMap,
+    state: &mut DashboardState,
+    now: Instant,
+) -> Vec<Panel> {
+    let mut panels = Vec::new();
+    if let Some(panel) = build_bundle_pipeline_panel(metrics, state, now) {
+        panels.push(panel);
+    }
+    if let Some(panel) = build_bundle_history_panel(state, now) {
+        panels.push(panel);
+    }
+    panels
+}
+
+fn build_bundle_pipeline_panel(
     metrics: &MetricMap,
     state: &mut DashboardState,
     now: Instant,
 ) -> Option<Panel> {
-    let mut panel = Panel::new("Planner / Submission");
+    let mut panel = Panel::new("Bundle Pipeline");
     let success = counter_rate_for_label(
         metrics,
         state,
@@ -827,27 +986,6 @@ fn build_planner_panel(
         );
     }
 
-    if let Some(depth) = gauge_value(metrics, "fastlane_ring_depth_items", &[]) {
-        let spark = state.record_history("planner.ring_depth", depth);
-        let pct = gauge_value(metrics, "fastlane_ring_depth_pct", &[]).unwrap_or(0.0);
-        panel.push(
-            "Ring depth",
-            format!("{} items ({:.0}%)", format_count(depth), pct),
-            spark,
-        );
-    }
-    if let Some(drop_rate) = counter_rate(metrics, state, now, "fastlane_ring_drop_events_total") {
-        panel.push("Ring drops", format_rate_per_min(drop_rate), None);
-    }
-    if let Some(free_pct) = gauge_value(metrics, "fastlane_slab_free_pct", &[]) {
-        let free_slots = gauge_value(metrics, "fastlane_slab_free_slots", &[]).unwrap_or(0.0);
-        panel.push(
-            "Slab capacity",
-            format!("{:.0}% free ({} slots)", free_pct, format_count(free_slots)),
-            None,
-        );
-    }
-
     if panel.is_empty() {
         None
     } else {
@@ -855,28 +993,31 @@ fn build_planner_panel(
     }
 }
 
-fn build_rpc_panel(metrics: &MetricMap, state: &mut DashboardState, now: Instant) -> Option<Panel> {
-    let mut panel = Panel::new("RPC / CoreCast");
-    if let Some(rate) = counter_rate(metrics, state, now, "hydration_adapter_ingest_total") {
-        panel.push("CoreCast ingest", format_rate_per_min(rate), None);
+fn build_corecast_panel(
+    metrics: &MetricMap,
+    state: &mut DashboardState,
+    _now: Instant,
+) -> Option<Panel> {
+    let mut panel = Panel::new("CoreCast");
+    if let Some(lag) = gauge_value(metrics, "corecast_delta_lag_ms", &[]) {
+        let spark = state.record_history("corecast.delta_lag_ms", lag);
+        panel.push("Delta lag", format!("{:.0} ms", lag), spark);
     }
-    if let Some(rate) = counter_rate(metrics, state, now, "hydration_rpc_refresh_failure_total") {
-        panel.push("RPC refresh failures", format_rate_per_min(rate), None);
+    if let Some(pool_reconnects) = counter_value_for_label(
+        metrics,
+        "corecast_stream_reconnects_total",
+        "stream",
+        "pool",
+    ) {
+        panel.push("Pool reconnects", format_count(pool_reconnects), None);
     }
-    if let Some(rate) = counter_rate(metrics, state, now, "hydration_rpc_refresh_total") {
-        panel.push("RPC refresh", format_rate_per_min(rate), None);
-    }
-    if let Some(rate) = counter_rate(metrics, state, now, "hydration_job_queue_failures_total") {
-        panel.push("Queue failures", format_rate_per_min(rate), None);
-    }
-    if let Some(backlog) = gauge_value(metrics, "watcher_update_backlog", &[]) {
-        let spark = state.record_history("rpc.backlog", backlog);
-        panel.push("Watcher backlog", format_count(backlog), spark);
-    }
-    if let Some(summary) =
-        component_lag_summary(metrics, "hydration_component_slot_delta", "component")
-    {
-        panel.push("Slot lag (slots)", summary, None);
+    if let Some(trade_reconnects) = counter_value_for_label(
+        metrics,
+        "corecast_stream_reconnects_total",
+        "stream",
+        "trade",
+    ) {
+        panel.push("Trade reconnects", format_count(trade_reconnects), None);
     }
 
     if panel.is_empty() {
@@ -936,6 +1077,19 @@ fn counter_rate_for_label(
     None
 }
 
+fn counter_value_for_label(
+    metrics: &MetricMap,
+    metric: &str,
+    label: &str,
+    value: &str,
+) -> Option<f64> {
+    let samples = metrics.get(metric)?;
+    samples
+        .iter()
+        .find(|sample| sample.labels.get(label).map(String::as_str) == Some(value))
+        .map(|sample| sample.value)
+}
+
 fn filters_match(labels: &HashMap<String, String>, filters: &[(&str, &str)]) -> bool {
     filters
         .iter()
@@ -962,175 +1116,61 @@ fn metric_key(metric: &str, labels: &HashMap<String, String>) -> String {
     key
 }
 
-fn component_lag_summary(metrics: &MetricMap, metric: &str, label_key: &str) -> Option<String> {
-    let samples = metrics.get(metric)?;
-    let mut aggregates: HashMap<String, f64> = HashMap::new();
-    for sample in samples {
-        if let Some(label) = sample.labels.get(label_key) {
-            if sample.value.is_finite() {
-                aggregates
-                    .entry(label.clone())
-                    .and_modify(|v| *v = v.max(sample.value))
-                    .or_insert(sample.value);
-            }
-        }
-    }
-    if aggregates.is_empty() {
-        return None;
-    }
-    let mut entries: Vec<_> = aggregates.into_iter().collect();
-    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    let summary = entries
-        .into_iter()
-        .take(3)
-        .map(|(label, value)| format!("{}:{:.0}", label, value))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(summary)
-}
-
-fn initial_latency_entries(
+fn build_bootstrap_panel(
     metrics: &MetricMap,
-    limit: usize,
-) -> Option<(usize, Vec<(String, f64)>)> {
-    if limit == 0 {
+    state: &mut DashboardState,
+    now: Instant,
+) -> Option<Panel> {
+    let mut panel = Panel::new("Readiness");
+    if let Some(cache) = gauge_value(metrics, "template_cache_entries", &[]) {
+        let spark = state.record_history("bootstrap.templates", cache);
+        panel.push("Templates cached", format_count(cache), spark);
+    }
+    if let Some(rate) = counter_rate(metrics, state, now, "template_build_total") {
+        panel.push("Template builds/min", format_rate_per_min(rate), None);
+    }
+    if let Some(success) = counter_value_for_label(
+        metrics,
+        "pool_bootstrap_total",
+        "status",
+        "success",
+    ) {
+        panel.push("Bootstrap success", format_count(success), None);
+    }
+    if let Some(failure) = counter_value_for_label(
+        metrics,
+        "pool_bootstrap_total",
+        "status",
+        "failure",
+    ) {
+        panel.push("Bootstrap failures", format_count(failure), None);
+    }
+    if panel.is_empty() {
+        None
+    } else {
+        Some(panel)
+    }
+}
+fn build_bundle_history_panel(state: &DashboardState, now: Instant) -> Option<Panel> {
+    if state.bundle_events.is_empty() {
         return None;
     }
-    let samples = metrics.get("hydration_pool_initial_latency_ms")?;
-    let mut per_pool: HashMap<String, f64> = HashMap::new();
-    for sample in samples {
-        if !sample.value.is_finite() {
-            continue;
+    let mut panel = Panel::new("Bundle History");
+    for event in state.bundle_events.iter().rev().take(BUNDLE_HISTORY_LIMIT) {
+        let age = now.saturating_duration_since(event.timestamp);
+        let label = format!("{} · {}", human_duration(age), event.kind.label());
+        let id = event
+            .bundle_id
+            .as_deref()
+            .map(|id| short_pubkey(id))
+            .unwrap_or_else(|| "n/a".to_string());
+        let mut value = id;
+        if let Some(detail) = &event.detail {
+            value.push_str(&format!(" · {detail}"));
         }
-        if let Some(pool) = sample.labels.get("pool") {
-            per_pool.insert(pool.clone(), sample.value);
-        }
+        panel.push(label, value, None);
     }
-    if per_pool.is_empty() {
-        return None;
-    }
-    let total = per_pool.len();
-    let mut entries: Vec<_> = per_pool.into_iter().collect();
-    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    entries.truncate(limit);
-    let rows = entries
-        .into_iter()
-        .map(|(pool, latency)| (short_pubkey(&pool), latency))
-        .collect();
-    Some((total, rows))
-}
-
-fn build_protocol_latency_panels(metrics: &MetricMap) -> Vec<Panel> {
-    let mut buckets = collect_protocol_latency(metrics);
-    let mut panels = Vec::new();
-
-    for (program, label) in NAMED_PROTOCOLS {
-        let entries = buckets.remove(*program).unwrap_or_default();
-        panels.push(protocol_latency_panel(label, entries));
-    }
-
-    if !buckets.is_empty() {
-        let mut combined = HashMap::new();
-        for (_, entries) in buckets.drain() {
-            combined.extend(entries);
-        }
-        panels.push(protocol_latency_panel("Other", combined));
-    }
-
-    if panels.is_empty() {
-        panels.push(protocol_latency_panel("Hydration", HashMap::new()));
-    }
-
-    panels
-}
-
-fn collect_protocol_latency(metrics: &MetricMap) -> HashMap<String, HashMap<String, f64>> {
-    let mut buckets: HashMap<String, HashMap<String, f64>> = HashMap::new();
-    let Some(samples) = metrics.get("hydration_pool_initial_latency_ms") else {
-        return buckets;
-    };
-    for sample in samples {
-        let Some(program) = sample.labels.get("program").cloned() else {
-            continue;
-        };
-        let Some(pool) = sample.labels.get("pool").cloned() else {
-            continue;
-        };
-        let latency = sample.value;
-        if !latency.is_finite() || latency < 0.0 {
-            continue;
-        }
-        buckets
-            .entry(program)
-            .or_insert_with(HashMap::new)
-            .insert(pool, latency);
-    }
-    buckets
-}
-
-fn protocol_latency_panel(label: &str, entries: HashMap<String, f64>) -> Panel {
-    let mut panel = Panel::new(&format!("Hydration Latency · {label}"));
-    let pool_count = entries.len();
-    panel.push("Pools observed", format_count(pool_count as f64), None);
-    if pool_count == 0 {
-        return panel;
-    }
-
-    let mut latencies: Vec<f64> = entries.values().copied().collect();
-    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let median_ms = percentile_from_sorted(&latencies, 0.5);
-    let p95_ms = percentile_from_sorted(&latencies, 0.95);
-    let mean_ms = latencies.iter().copied().sum::<f64>() / pool_count as f64;
-    panel.push(
-        "Median | p95",
-        format!(
-            "{} | {}",
-            format_duration_ms(median_ms),
-            format_duration_ms(p95_ms)
-        ),
-        None,
-    );
-    panel.push("Average", format_duration_ms(mean_ms), None);
-
-    let mut ranked: Vec<_> = entries.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    for (idx, (pool, latency)) in ranked
-        .into_iter()
-        .take(PROTOCOL_LATENCY_POOL_ROW_LIMIT)
-        .enumerate()
-    {
-        panel.push(
-            format!("{:>2}. {}", idx + 1, short_pubkey(&pool)),
-            format_duration_ms(latency),
-            None,
-        );
-    }
-    if pool_count > PROTOCOL_LATENCY_POOL_ROW_LIMIT {
-        panel.push(
-            "More pools",
-            format_count((pool_count - PROTOCOL_LATENCY_POOL_ROW_LIMIT) as f64),
-            None,
-        );
-    }
-    panel
-}
-
-fn percentile_from_sorted(values: &[f64], quantile: f64) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    if values.len() == 1 {
-        return values[0];
-    }
-    let clamped = quantile.clamp(0.0, 1.0);
-    let position = clamped * ((values.len() - 1) as f64);
-    let lower = position.floor() as usize;
-    let upper = position.ceil() as usize;
-    if lower == upper {
-        return values[lower];
-    }
-    let weight = position - lower as f64;
-    values[lower] * (1.0 - weight) + values[upper] * weight
+    Some(panel)
 }
 
 fn short_pubkey(value: &str) -> String {
@@ -1188,10 +1228,11 @@ fn format_rate_per_min(rate_per_sec: f64) -> String {
     format!("{:.2}/min", rate_per_sec * 60.0)
 }
 
-fn format_duration_ms(ms: f64) -> String {
-    if ms >= 1_000.0 {
-        format!("{:.2}s", ms / 1_000.0)
-    } else {
-        format!("{:.0}ms", ms)
-    }
+fn format_sol_from_lamports(lamports: f64) -> String {
+    format!("{:.4} SOL", lamports / 1_000_000_000.0)
+}
+
+fn format_bundle_hash_hint(hash: i64) -> String {
+    let value = hash as u64;
+    format!("0x{value:016X}")
 }
