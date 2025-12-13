@@ -1,9 +1,0 @@
-[package]
-name = "solend"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
-description = "Minimal Solend helpers for flash-loan instructions."
-
-[dependencies]
-solana-sdk = "3"
