@@ -1,46 +1,46 @@
 {
+  "corecast": {
+    "address": "corecast.bitquery.io",
+    "authorization": "ory_at_qIIU-Aztys6PVE02iK28x34o1TClSKfMGlW-Cj8pPog.miGOHTaT58yxqEBMzPO-Wq-OTw7RdoTc2CT_OpZiwbE",
+    "cache": {
+      "warm_capacity": 32,
+      "channel_capacity": 512
+    },
+    "ca_pem": "certs/corecast_ca.pem"
+  },
+  "quicknode_rpcs": [
+    "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
+    "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
+    "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
+  ],
   "wallets": {
     "auth": {
-      "path": "/home/ubuntu/cain/wallets/jito-auth.json"
+      "path": "/Users/ye/cain/wallets/jito-auth.json"
     },
     "payer": {
-      "path": "/home/ubuntu/cain/wallets/jito-payer.json"
+      "path": "/Users/ye/cain/wallets/jito-payer.json"
     }
   },
   "jito": {
     "endpoints": ["https://ny.mainnet.block-engine.jito.wtf"],
     "ca_pem": "certs/jito_block_engine_ca.pem",
     "tip_floor_url": "https://bundles.jito.wtf/api/v1/bundles/tip_floor",
-    "tip_stream_url": "wss://bundles.jito.wtf/api/v1/bundles/tip_stream"
+    "tip_stream_url": "wss://bundles.jito.wtf/api/v1/bundles/tip_stream",
+    "auth": {
+      "endpoint": "https://ny.mainnet.block-engine.jito.wtf"
+    }
   },
-  "alerts": {
-    "environment": "local-dev",
-    "webhook_url": null
+  "planner": {
+    "min_profit_lamports": 1,
+    "max_hops": 3,
+    "emit_plan_memos": false,
+    "max_queue_depth": 4096
   },
-  "submission": {
-    "pending_ttl_secs": 240,
-    "sweep_interval_secs": 15,
-    "result_stream_backoff_ms": 500,
-    "auction_stream_backoff_ms": 1500
-  },
-  "pipeline": {
-    "dry_run_mode": false
-  },
-  "bootstrap": {
-    "rpc_endpoints": [
-      "https://api.mainnet-beta.solana.com"
-    ],
-    "pool_allowlist": []
-  },
-  "bam_validator_csv": "bam_validators.csv",
   "tokens": {
     "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
     "TRUMP": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
-    "MET": "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
-    "ZEC": "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
     "WETH": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
-    "WBTC": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
     "mSOL": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
     "JTO": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
     "JUP": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
@@ -50,27 +50,11 @@
     "USDC": "Abfr3JkVvwA4ax6EJD9GRtupwmgYyDxjC5CoqN7fFaL1",
     "USDT": "F23dwj9LDHERujDB21Mhrk948qoeMVzhusBd9kYbjjcq",
     "TRUMP": "GgQ7QZW514kCHeiiNcuS6gGsRYo7Wnq2tkM1JTFyzd6x",
-    "MET": "4cLM1saJ3dAKUQUT54dSDz4HXBPd5eSuNz5urobti7bc",
-    "ZEC": "EJ7iNdUC4ic11eDFRySTb3HeYpFjHWrV9a8gYyB6uMMv",
     "WETH": "9Y112DKRiy4rqFybVroBMe57tzDHSaBTJaVfVvR22fAc",
-    "WBTC": "9gMpBvW1eQZfGb8QVQVChiQ9fx8L6e4tYTKZcTTLwQz",
     "mSOL": "8GH6oBA72ae6itiBrQcqQxMRZfHGpx3pRoGR5kFnsxQC",
     "JTO": "5cKXffn59mpkPxLoXjAto9z4P8XG3J6NPqByimAqrC5n",
     "JUP": "AL8xH5GWwiafCUWSETrjYf3ut4VJEAgHX4LyhDbWgvLE",
     "WSOL": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
-  },
-  "host_fee_accounts": {
-    "USDC": "86c98kDpXLJQbyEwSfyhien97zVkWkDKBxbL8XfAq9SN",
-    "USDT": "2MVsCGsaX3kG1sGumDqWqVZ8NeGcZTbMCU345NyMzJFn",
-    "TRUMP": "HX2CPauKHKvQuEV3PdWXnRYe9XksSYkkPLERT9yXksDi",
-    "MET": "Cgg1Z9pwvWa4ryQMxmAbjpxLrE8cDFTtnVs5v4bD6BCx",
-    "ZEC": "GN7Kp3bSCE7GPTNN7BRcSAz46k7RfqCrTbJxRkgYqM8X",
-    "WETH": "CBqXQsUu8vK6zR7Lvt98s4Ukuuz7fVM1GLcom7oAcMt6",
-    "WBTC": "ji1n2Z5SUepzHFuMucHmJNqbtArjAakPkSt1t3pScv6",
-    "mSOL": "5RvSBjG4bHGLW2KjZn9Ppc3Ym5nc1H3LWHBXwSrB799",
-    "JTO": "AQSFBz5oYwoniDWxVdsE1HchCJ75JJwwJESECAQ3pauL",
-    "JUP": "ymvCdyh3EqrTJM6iodGuLT3KU7EAfP1hXDty5gx1kcT",
-    "WSOL": "8EjvD86dv55Qgp7jxX1ZN5TQUWbkifdp1cMC9YgXYBFH"
   },
   "token_pairs": [
     [
@@ -83,19 +67,7 @@
     ],
     [
       "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL"
-    ],
-    [
-      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS"
-    ],
-    [
-      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
-    ],
-    [
-      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
     ],
     [
       "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
@@ -103,59 +75,11 @@
     ],
     [
       "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-      "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL"
-    ],
-    [
-      "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-      "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS"
-    ],
-    [
-      "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-      "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
-    ],
-    [
-      "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-      "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
-    ],
-    [
-      "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
-      "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL"
-    ],
-    [
-      "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
-      "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS"
-    ],
-    [
-      "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
       "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
     ],
     [
       "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
-      "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
-    ],
-    [
-      "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
-      "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS"
-    ],
-    [
-      "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
       "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
-    ],
-    [
-      "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
-      "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
-    ],
-    [
-      "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
-      "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
-    ],
-    [
-      "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
-      "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
-    ],
-    [
-      "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
-      "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
     ],
     [
       "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -194,30 +118,6 @@
       "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
     ],
     [
-      "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
-      "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
-    ],
-    [
-      "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
-      "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"
-    ],
-    [
-      "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
-      "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
-    ],
-    [
-      "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
-      "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
-    ],
-    [
-      "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
-      "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"
-    ],
-    [
-      "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
-      "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
-    ],
-    [
       "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
       "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
     ],
@@ -227,18 +127,6 @@
     ],
     [
       "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
-      "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
-    ],
-    [
-      "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
-      "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
-    ],
-    [
-      "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
-      "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"
-    ],
-    [
-      "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
       "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
     ],
     [
@@ -261,7 +149,7 @@
     "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
     "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
   ],
-  "flash_loans": {
+  "solend_flash_loans": {
     "WSOL": {
       "program_id": "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
       "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
@@ -408,75 +296,27 @@
         "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
         "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
       ]
-    }
-  },
-  "quicknode_rpcs": [
-    "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
-    "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
-    "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
-  ],
-  "protocols": {
-    "raydium_v3": {
-      "rpc_endpoints": [
-        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
-        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
-        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
-      ]
     },
-    "cp_amm": {
-      "rpc_endpoints": [
-        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
-        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
-        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
-      ]
-    },
-    "lb_clmm": {
-      "rpc_endpoints": [
-        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
-        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
-        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
-      ]
-    },
-    "whirlpool": {
-      "enabled": true,
-      "rpc_endpoints": [
-        "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
-        "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
-        "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
+    "TRUMP": {
+      "program_id": "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
+      "lending_market": "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY",
+      "reserve": "FbmGHM3dT8jicwLYSNY8eKmyKAzqd6s81x5i4AHSgVhd",
+      "reserve_liquidity_mint": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+      "borrow": {
+        "reserve_liquidity_supply": "69khDpj7ZuLc5C3dG7x76ZnTa639HChEkoKKDMaqqv9x"
+      },
+      "repay": {
+        "reserve_liquidity_supply": "69khDpj7ZuLc5C3dG7x76ZnTa639HChEkoKKDMaqqv9x",
+        "reserve_liquidity_fee_receiver": "FAAzkhEx8i98bW6JJXcZdC4oPFWw21yH4LT9GdK798AK",
+        "host_fee_receiver": "FrGB9HC1vEjUhWbUqfQkdKCuuU58bL843AZPQ21LWudu"
+      },
+      "receiver_program_allowlist": [
+        "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+        "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
       ]
     }
-  },
-  "corecast": {
-    "address": "corecast.bitquery.io",
-    "authorization": "ory_at_qIIU-Aztys6PVE02iK28x34o1TClSKfMGlW-Cj8pPog.miGOHTaT58yxqEBMzPO-Wq-OTw7RdoTc2CT_OpZiwbE",
-    "cache": {
-      "warm_capacity": 32,
-      "channel_capacity": 512
-    }
-  },
-  "perf": {
-    "ingest_core": 0,
-    "eval_core": 1,
-    "submit_core": 2,
-    "ring_capacity": 2048,
-    "opportunity_slab": 4096,
-    "bundle_slab": 1024
-  },
-  "alt_manager": {
-    "create_onchain": true,
-    "max_tables_per_pool": 1
-  },
-  "strategy": {
-    "min_edge_bps": 1.0,
-    "min_profit_lamports": 100000,
-    "min_tip_lamports": 75000,
-    "max_tip_lamports": 25000000,
-    "tip_profit_share_bps": 1500,
-    "tip_floor_markup_bps": 4000,
-    "tip_floor_fallback_lamports": 75000,
-    "tip_floor_min_lamports": 75000,
-    "tip_congestion_target_latency_ms": 400,
-    "tip_congestion_max_multiplier": 10.0,
-    "tip_congestion_expired_weight_bps": 8000
   }
 }

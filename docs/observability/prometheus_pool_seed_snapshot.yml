@@ -1,0 +1,52 @@
+groups:
+  - name: tre-pool-seeds
+    interval: 1m
+    rules:
+      - alert: TrePoolSeedSnapshotStale
+        expr: max_over_time(planner_seed_snapshot_age_secs{job="tre"}[5m]) > 21600
+        for: 10m
+        labels:
+          service: tre
+          severity: warning
+        annotations:
+          summary: "tre pool seed snapshot is stale"
+          description: |-
+            planner_seed_snapshot_age_secs is {{ $value }} seconds for {{ $labels.instance }} (threshold 6h).
+            Refresh the pool seed snapshot or verify CoreCast ingest.
+          runbook: docs/observability/grafana_pool_seed_snapshot.json
+      - alert: TrePoolSeedSnapshotMissing
+        expr: absent(planner_seed_snapshot_age_secs{job="tre"}) == 1
+        for: 5m
+        labels:
+          service: tre
+          severity: critical
+        annotations:
+          summary: "tre pool seed snapshot metric missing"
+          description: |-
+            Prometheus stopped receiving planner_seed_snapshot_age_secs from {{ $labels.instance | default "any instance" }}.
+            Check the metrics exporter or scrape configuration.
+
+      - alert: TreSeedInferenceDegraded
+        expr: sum(increase(planner_seed_inference_total{job="tre",status=~"trusted_mismatch|pair_blocked|curve_unknown|program_unknown|ambiguous_accounts|insufficient_accounts"}[15m])) > 5
+        for: 5m
+        labels:
+          service: tre
+          severity: warning
+        annotations:
+          summary: "tre seed inference is error-prone"
+          description: |-
+            Seed inference produced {{ $value }} problematic outcomes in the last 15m. Inspect planner logs and Grafana seed panels.
+          runbook: docs/observability/grafana_pool_seed_snapshot.json
+
+      - alert: TreSeedMismatchDetected
+        expr: increase(planner_seed_mismatch_total{job="tre"}[15m]) > 0
+        for: 1m
+        labels:
+          service: tre
+          severity: critical
+        annotations:
+          summary: "tre detected pool seed mismatches"
+          description: |-
+            planner_seed_mismatch_total incremented for {{ $labels.field | default "unknown field" }} within the last 15m.
+            Compare trusted pool seeds against live trade inference; consider refreshing the snapshot or blocking the pool.
+          runbook: docs/observability/grafana_pool_seed_snapshot.json

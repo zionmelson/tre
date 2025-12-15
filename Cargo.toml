@@ -7,6 +7,9 @@ description = "Ultra-light Solana arbitrage executor focused on latency-sensitiv
 license = "Apache-2.0"
 repository = "https://github.com/ye/tre"
 
+[workspace]
+members = [".", "solend"]
+
 [dependencies]
 anyhow = "1"
 bytes = "1"
@@ -22,14 +25,15 @@ prost = "0.13"
 prost-types = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12", "std"] }
 rustls-pemfile = "1"
 solana-sdk = "3"
 solana-client = "3"
 solana-commitment-config = "3"
-solana-address-lookup-table-interface = { version = "3", features = ["bincode"] }
+solana-address-lookup-table-interface = { version = "3", features = ["bincode", "bytemuck"] }
 solana-compute-budget-interface = "3"
-solana-system-interface = { version = "3", features = ["alloc", "bincode"] }
+solana-packet = "3"
+solana-system-interface = { version = "3", features = ["bincode"] }
 bs58 = "0.5"
 base64 = "0.22"
 url = "2"
@@ -49,9 +53,11 @@ uint = "0.9"
 sha2 = "0.10"
 prometheus-client = "0.22"
 csv = "1"
+rand = "0.8"
 solend = { path = "solend" }
 ratatui = "0.26"
 crossterm = "0.27"
+spl-memo = "4"
 spl-token-2022 = "8"
 spl-transfer-hook-interface = "0.10"
 spl-tlv-account-resolution = "0.10"
@@ -67,6 +73,7 @@ sha2 = "0.10"
 [features]
 default = ["native-metrics"]
 native-metrics = []
+corecast_block_time = []
 
 [profile.release]
 codegen-units = 1

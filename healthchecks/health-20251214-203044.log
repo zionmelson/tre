@@ -1,0 +1,10 @@
+[run_release] Limiting run to 360s
+    Finished `release` profile [optimized] target(s) in 0.91s
+     Running `target/release/tre-arb-bot --config ./config.json --metrics-bind '127.0.0.1:9899'`
+2025-12-15T01:30:45.877549Z DEBUG received auth challenge pubkey=3Vh9TvRjBLZWySurQbVUbSJhDQiKqc1fon2vb6GzPbV3 challenge=gG8smLGj2
+Error: connect jito block engine
+
+Caused by:
+    status: PermissionDenied, message: "The supplied challenge was not found.", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "server": "jito-block-engine", "x-request-received-at": "2025-12-15T01:30:45.938Z", "content-length": "0", "date": "Mon, 15 Dec 2025 01:30:45 GMT", "x-envoy-upstream-service-time": "0"} }
+curl: (7) Failed to connect to 127.0.0.1 port 9899 after 0 ms: Couldn't connect to server
+[run_release] Warning: failed to scrape metrics from http://127.0.0.1:9899/metrics

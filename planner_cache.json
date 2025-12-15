@@ -1,0 +1,23 @@
+{
+  "raydium": [],
+  "orca": [
+    {
+      "pool": "4Ui9QdDNuUaAGqCPcDSp191QrixLzQiLxJ1Gnqvz3szP",
+      "tick_arrays": [],
+      "cached_at_unix": 1765760449,
+      "a_to_b": true
+    },
+    {
+      "pool": "4Ui9QdDNuUaAGqCPcDSp191QrixLzQiLxJ1Gnqvz3szP",
+      "tick_arrays": [],
+      "cached_at_unix": 1765760449,
+      "a_to_b": false
+    },
+    {
+      "pool": "HMCXMLDoNFky1PgqiyU47D7J3TRNyqeynhBX8fupp4Q8",
+      "tick_arrays": [],
+      "cached_at_unix": 1765760449,
+      "a_to_b": true
+    }
+  ]
+}
