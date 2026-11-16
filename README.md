@@ -1,4 +1,7 @@
-# tre Arbitrage Executor
+# AI GENERATED CODE DO NOT WASTE TIME READING
+
+
+## tre Arbitrage Executor
 
 `tre` is an ultra-low-latency Solana arbitrage executor that ingests Bitquery CoreCast market data, detects deterministic opportunities, and expresses them as Solend flash-loan bundles submitted through the Jito Block Engine. This README gives a practical overview for building, configuring, and operating the binary. For deep architectural details, see `docs/architecture.md`.
 
