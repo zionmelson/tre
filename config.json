@@ -1,26 +1,13 @@
 {
   "corecast": {
     "address": "corecast.bitquery.io",
-    "authorization": "ory_at_qIIU-Aztys6PVE02iK28x34o1TClSKfMGlW-Cj8pPog.miGOHTaT58yxqEBMzPO-Wq-OTw7RdoTc2CT_OpZiwbE",
     "cache": {
       "warm_capacity": 32,
       "channel_capacity": 512
     },
     "ca_pem": "certs/corecast_ca.pem"
   },
-  "quicknode_rpcs": [
-    "https://virulent-falling-dew.solana-mainnet.quiknode.pro/a1e8ef59e674a8fddcf6eaa79f437d878cbf139f/",
-    "https://small-light-arrow.solana-mainnet.quiknode.pro/c753bf5de3c67713b218bc05b4de185067a317d6/",
-    "https://cosmopolitan-winter-owl.solana-mainnet.quiknode.pro/98fcd93359b459858807147031f70e519d0b9f6a/"
-  ],
-  "wallets": {
-    "auth": {
-      "path": "/Users/ye/cain/wallets/jito-auth.json"
-    },
-    "payer": {
-      "path": "/Users/ye/cain/wallets/jito-payer.json"
-    }
-  },
+
   "jito": {
     "endpoints": ["https://ny.mainnet.block-engine.jito.wtf"],
     "ca_pem": "certs/jito_block_engine_ca.pem",
